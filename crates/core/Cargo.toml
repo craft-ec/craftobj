@@ -12,6 +12,9 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+libp2p = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

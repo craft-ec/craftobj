@@ -4,6 +4,7 @@
 //! content-addressed distributed storage with erasure coding.
 
 pub mod economics;
+pub mod signing;
 
 use craftec_erasure::ErasureConfig;
 use serde::{Deserialize, Serialize};

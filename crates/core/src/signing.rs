@@ -57,14 +57,8 @@ pub fn peer_id_to_ed25519_pubkey(peer_id: &libp2p::PeerId) -> Option<[u8; 32]> {
     // libp2p identity multihash: code 0x00 (identity), then protobuf-encoded PublicKey
     // The protobuf is: field 1 (KeyType) = 1 (Ed25519), field 2 (Data) = 32 bytes
     // We use libp2p's own parsing instead of doing it manually
-    use libp2p::identity::PublicKey;
-    // Try to extract from the PeerId using libp2p's API
-    // PeerId stores an identity multihash of the public key protobuf
-    // For ed25519, the key is inlined in the PeerId
+    // Decode the multihash manually to extract the ed25519 public key.
     let _ = multihash; // suppress warning
-
-    // Unfortunately libp2p doesn't expose a direct PeerId -> PublicKey extraction in all versions.
-    // We'll decode the multihash manually.
     // PeerId bytes = multihash(identity, protobuf(PublicKey))
     // identity multihash: varint(0x00) + varint(len) + data
     let bytes = peer_id.to_bytes();

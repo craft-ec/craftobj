@@ -96,7 +96,7 @@ pub async fn run_daemon(
     let store = Arc::new(Mutex::new(datacraft_store::FsStore::new(&data_dir)?));
 
     // Build swarm
-    let (mut swarm, local_peer_id) = build_swarm(keypair, network_config).await
+    let (mut swarm, local_peer_id) = build_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
     info!("DataCraft node started: {}", local_peer_id);
 
@@ -111,10 +111,18 @@ pub async fn run_daemon(
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
 
     // Create and register DataCraft protocol
-    let protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
+    let mut protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
+
+    // Extract ed25519 signing key from libp2p keypair for receipt signing
+    if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {
+        let secret_bytes = ed25519_kp.secret();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(secret_bytes.as_ref().try_into().expect("ed25519 secret is 32 bytes"));
+        protocol.set_signing_key(signing_key);
+        debug!("Configured protocol with ed25519 signing key for TransferReceipts");
+    }
+
     let (incoming_streams, coord_streams) = protocol.register(&mut swarm)
         .map_err(|e| format!("Failed to register DataCraft protocol: {}", e))?;
-    let protocol = Arc::new(protocol);
 
     // Subscribe to gossipsub topics
     if let Err(e) = swarm
@@ -145,6 +153,11 @@ pub async fn run_daemon(
         crate::receipt_store::PersistentReceiptStore::new(receipts_path)
             .expect("failed to open receipt store"),
     ));
+
+    // Wire persistent receipt store into the protocol handler
+    protocol.set_persistent_receipt_store(receipt_store.clone());
+
+    let protocol = Arc::new(protocol);
 
     let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone()));
 

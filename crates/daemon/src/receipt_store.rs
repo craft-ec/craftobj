@@ -22,6 +22,7 @@ pub enum ReceiptEntry {
 
 /// Persistent, append-only receipt store with in-memory indices.
 pub struct PersistentReceiptStore {
+    #[allow(dead_code)]
     path: PathBuf,
     file: BufWriter<File>,
     storage_receipts: Vec<StorageReceipt>,
@@ -112,17 +113,17 @@ impl PersistentReceiptStore {
         let mut hasher = Sha256::new();
         match entry {
             ReceiptEntry::Storage(r) => {
-                hasher.update(&r.content_id.0);
+                hasher.update(r.content_id.0);
                 hasher.update(r.shard_index.to_le_bytes());
-                hasher.update(&r.storage_node);
-                hasher.update(&r.challenger);
+                hasher.update(r.storage_node);
+                hasher.update(r.challenger);
                 hasher.update(r.timestamp.to_le_bytes());
             }
             ReceiptEntry::Transfer(r) => {
-                hasher.update(&r.content_id.0);
+                hasher.update(r.content_id.0);
                 hasher.update(r.shard_index.to_le_bytes());
-                hasher.update(&r.server_node);
-                hasher.update(&r.requester);
+                hasher.update(r.server_node);
+                hasher.update(r.requester);
                 hasher.update(r.timestamp.to_le_bytes());
             }
         }

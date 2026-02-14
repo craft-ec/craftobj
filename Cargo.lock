@@ -648,7 +648,10 @@ version = "0.1.0"
 dependencies = [
  "craftec-core",
  "craftec-erasure",
+ "ed25519-dalek",
  "hex",
+ "libp2p",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2",
@@ -671,6 +674,7 @@ dependencies = [
  "datacraft-routing",
  "datacraft-store",
  "datacraft-transfer",
+ "ed25519-dalek",
  "futures",
  "hex",
  "libp2p",
