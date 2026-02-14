@@ -5,7 +5,7 @@
 //! at arbitrary shard indices, increasing availability without duplication.
 
 use craftec_erasure::ErasureCoder;
-use datacraft_core::{ChunkManifest, ContentId, DataCraftError, Result};
+use datacraft_core::{ChunkManifest, DataCraftError, Result};
 use datacraft_store::FsStore;
 use tracing::{debug, info};
 
@@ -133,8 +133,7 @@ pub fn generate_parity_shard_from_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use craftec_erasure::ErasureConfig;
-    use datacraft_core::default_erasure_config;
+    use datacraft_core::{ContentId, default_erasure_config};
     use std::path::PathBuf;
 
     fn test_dir() -> PathBuf {

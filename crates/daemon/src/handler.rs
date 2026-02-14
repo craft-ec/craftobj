@@ -268,6 +268,141 @@ impl DataCraftHandler {
         Ok(Value::Object(result))
     }
 
+    /// Extend a CID by generating a new parity shard.
+    async fn handle_extend(&self, params: Option<Value>) -> Result<Value, String> {
+        let cid = extract_cid(params)?;
+        let command_tx = self.command_tx.as_ref().ok_or("no network available")?;
+
+        // 1. Get manifest (local or DHT)
+        let manifest = {
+            let client = self.client.lock().await;
+            match client.store().get_manifest(&cid) {
+                Ok(m) => m,
+                Err(_) => {
+                    drop(client);
+                    let (tx, rx) = oneshot::channel();
+                    command_tx.send(DataCraftCommand::GetManifest { content_id: cid, reply_tx: tx })
+                        .map_err(|e| e.to_string())?;
+                    rx.await.map_err(|e| e.to_string())??
+                }
+            }
+        };
+
+        // 2. Resolve providers
+        let (tx, rx) = oneshot::channel();
+        command_tx.send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
+            .map_err(|e| e.to_string())?;
+        let providers = rx.await.map_err(|e| e.to_string())??;
+
+        if providers.is_empty() {
+            return Err("no providers found for CID".into());
+        }
+
+        // 3. Query all providers for max shard index
+        let mut global_max: Option<u8> = None;
+        {
+            let client = self.client.lock().await;
+            if let Some(local_max) = client.store().max_shard_index_for_content(&cid) {
+                global_max = Some(local_max);
+            }
+        }
+
+        for &provider in &providers {
+            let (tx, rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::QueryMaxShardIndex {
+                peer_id: provider,
+                content_id: cid,
+                reply_tx: tx,
+            }).map_err(|e| e.to_string())?;
+
+            match rx.await {
+                Ok(Ok(Some(idx))) => {
+                    global_max = Some(global_max.map_or(idx, |m| m.max(idx)));
+                }
+                _ => {}
+            }
+        }
+
+        // 4. Claim next index
+        let k = manifest.k as u8;
+        let initial_total = (manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards) as u8;
+        let target_index = match global_max {
+            Some(max) => max.checked_add(1).ok_or("shard index overflow")?,
+            None => initial_total,
+        };
+
+        if target_index < k {
+            return Err(format!("target index {} < k={}", target_index, k));
+        }
+
+        debug!("Extending {} with parity shard at index {}", cid, target_index);
+
+        // 5. Ensure we have k data shards locally
+        {
+            let client = self.client.lock().await;
+            let store = client.store();
+            let mut missing = Vec::new();
+            for i in 0..manifest.k {
+                for chunk_idx in 0..manifest.chunk_count as u32 {
+                    if store.get_shard(&cid, chunk_idx, i as u8).is_err() {
+                        missing.push((chunk_idx, i as u8));
+                    }
+                }
+            }
+            drop(client);
+
+            for (chunk_idx, shard_idx) in missing {
+                let mut fetched = false;
+                for &provider in &providers {
+                    let (tx, rx) = oneshot::channel();
+                    command_tx.send(DataCraftCommand::RequestShard {
+                        peer_id: provider,
+                        content_id: cid,
+                        chunk_index: chunk_idx,
+                        shard_index: shard_idx,
+                        local_public_key: [0u8; 32],
+                        reply_tx: tx,
+                    }).map_err(|e| e.to_string())?;
+                    if let Ok(Ok(data)) = rx.await {
+                        let client = self.client.lock().await;
+                        client.store().put_shard(&cid, chunk_idx, shard_idx, &data)
+                            .map_err(|e| e.to_string())?;
+                        fetched = true;
+                        break;
+                    }
+                }
+                if !fetched {
+                    return Err(format!("failed to fetch data shard {}/{}", chunk_idx, shard_idx));
+                }
+            }
+        }
+
+        // 6. Generate parity shards + store
+        {
+            let client = self.client.lock().await;
+            datacraft_client::extension::extend_content(client.store(), &manifest, target_index)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // 7. Announce as provider
+        {
+            let (tx, rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::AnnounceProvider {
+                content_id: cid,
+                manifest: manifest.clone(),
+                reply_tx: tx,
+            }).map_err(|e| e.to_string())?;
+            let _ = rx.await;
+        }
+
+        debug!("Extended {} with parity shard index {}", cid, target_index);
+
+        Ok(serde_json::json!({
+            "cid": cid.to_hex(),
+            "shard_index": target_index,
+        }))
+    }
+
     /// Fetch missing shards from remote peers using P2P transfer.
     async fn fetch_missing_shards_from_peers(
         &self,
@@ -364,6 +499,7 @@ impl IpcHandler for DataCraftHandler {
                 "list" => self.handle_list().await,
                 "status" => self.handle_status().await,
                 "peers" => self.handle_peers().await,
+                "extend" => self.handle_extend(params).await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })

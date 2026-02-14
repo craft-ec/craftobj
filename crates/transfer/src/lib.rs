@@ -286,6 +286,85 @@ mod tests {
         assert_eq!(len, 0);
     }
 
+    #[test]
+    fn test_encode_decode_receipt() {
+        let receipt = TransferReceipt {
+            content_id: ContentId::from_bytes(b"receipt test"),
+            server_node: [1u8; 32],
+            requester: [2u8; 32],
+            shard_index: 3,
+            bytes_served: 16384,
+            timestamp: 1700000000,
+            signature: vec![0xAA, 0xBB, 0xCC],
+        };
+
+        let encoded = encode_receipt(&receipt).unwrap();
+        // Verify header
+        assert_eq!(&encoded[0..4], &WIRE_MAGIC);
+        assert_eq!(encoded[4], WireMessageType::Receipt as u8);
+
+        let decoded = decode_receipt(&encoded).unwrap();
+        assert_eq!(decoded.content_id, receipt.content_id);
+        assert_eq!(decoded.server_node, receipt.server_node);
+        assert_eq!(decoded.requester, receipt.requester);
+        assert_eq!(decoded.shard_index, 3);
+        assert_eq!(decoded.bytes_served, 16384);
+        assert_eq!(decoded.timestamp, 1700000000);
+        assert_eq!(decoded.signature, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_decode_receipt_too_short() {
+        assert!(decode_receipt(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn test_decode_receipt_bad_magic() {
+        let mut buf = vec![0u8; 20];
+        buf[0..4].copy_from_slice(b"XXXX");
+        assert!(decode_receipt(&buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_receipt_wrong_type() {
+        let mut buf = vec![0u8; 20];
+        buf[0..4].copy_from_slice(&WIRE_MAGIC);
+        buf[4] = WireMessageType::ShardRequest as u8; // wrong type
+        assert!(decode_receipt(&buf).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_read_receipt_roundtrip() {
+        use tokio::io::duplex;
+
+        let receipt = TransferReceipt {
+            content_id: ContentId::from_bytes(b"stream receipt"),
+            server_node: [5u8; 32],
+            requester: [6u8; 32],
+            shard_index: 1,
+            bytes_served: 65536,
+            timestamp: 1700000001,
+            signature: vec![0xDE, 0xAD],
+        };
+
+        let (mut client, mut server) = duplex(4096);
+
+        let receipt_clone = receipt.clone();
+        let writer = tokio::spawn(async move {
+            write_receipt(&mut client, &receipt_clone).await.unwrap();
+        });
+
+        let reader = tokio::spawn(async move {
+            read_receipt(&mut server).await.unwrap()
+        });
+
+        writer.await.unwrap();
+        let read_back = reader.await.unwrap();
+        assert_eq!(read_back.content_id, receipt.content_id);
+        assert_eq!(read_back.bytes_served, 65536);
+        assert_eq!(read_back.signature, vec![0xDE, 0xAD]);
+    }
+
     #[tokio::test]
     async fn test_request_response_roundtrip() {
         use tokio::io::duplex;

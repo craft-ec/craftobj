@@ -659,6 +659,7 @@ dependencies = [
 name = "datacraft-daemon"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "craftec-app",
  "craftec-erasure",
  "craftec-ipc",

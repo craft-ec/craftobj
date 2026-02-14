@@ -313,6 +313,22 @@ async fn handle_command(
             
             let _ = reply_tx.send(result);
         }
+        
+        DataCraftCommand::QueryMaxShardIndex { peer_id, content_id, reply_tx } => {
+            debug!("Querying max shard index for {} from {}", content_id, peer_id);
+            
+            let result = protocol
+                .query_max_shard_index(swarm.behaviour_mut(), peer_id, &content_id)
+                .await;
+            
+            let _ = reply_tx.send(result);
+        }
+        
+        DataCraftCommand::Extend { content_id: _, reply_tx } => {
+            // The extend flow is orchestrated by the handler, not here.
+            warn!("Extend command received in swarm loop — should be orchestrated by handler");
+            let _ = reply_tx.send(Err("Extend should be orchestrated by the IPC handler".into()));
+        }
     }
 }
 
@@ -446,5 +462,24 @@ async fn handle_protocol_events(
                 }
             }
         }
+    }
+}
+
+/// Handle incoming shard coordination streams from peers.
+async fn handle_incoming_coord_streams(
+    mut incoming: libp2p_stream::IncomingStreams,
+    protocol: Arc<DataCraftProtocol>,
+) {
+    use futures::StreamExt;
+
+    info!("Starting incoming shard coordination streams handler");
+
+    while let Some((peer, stream)) = incoming.next().await {
+        debug!("Received incoming shard-coord stream from peer: {}", peer);
+
+        let protocol_clone = protocol.clone();
+        tokio::spawn(async move {
+            protocol_clone.handle_incoming_coord_stream(stream).await;
+        });
     }
 }
