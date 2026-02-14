@@ -25,8 +25,11 @@ crates/
 ## Current State
 
 - **P2P pipeline working**: Publish → DHT announce → DHT resolve → libp2p-stream transfer → fetch complete
-- **34 tests passing**, build + clippy clean
-- **Economics layer not implemented**: StorageReceipt struct exists but is never generated on transfer. No capability announcement, no pool/subscription logic, no free/paid distinction.
+- **119 tests passing**, build + clippy clean
+- **Capability announcements wired**: Nodes subscribe to gossipsub topic, broadcast capabilities periodically (every 5 min), track peer capabilities in memory
+- **TransferReceipts generated on shard transfers**: Requester signs receipt with ed25519 key after receiving shard data, sends back to server. Server verifies signature and stores in PersistentReceiptStore (append-only binary file with in-memory indices, dedup, CID/node/time queries)
+- **Signing module active**: `crates/core/src/signing.rs` provides `sign_transfer_receipt`, `verify_transfer_receipt`, `peer_id_to_ed25519_pubkey`
+- **Not yet implemented**: StorageReceipt generation (requires PDP challenger), pool/subscription logic, free/paid distinction, settlement
 
 ## Key Design Decisions (from recent discussions)
 
