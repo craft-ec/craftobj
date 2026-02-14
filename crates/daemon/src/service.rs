@@ -2,13 +2,15 @@
 //!
 //! Manages the libp2p swarm, IPC server, and content operations.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use craftec_ipc::IpcServer;
 use craftec_network::{build_swarm, NetworkConfig};
 use datacraft_client::DataCraftClient;
+use datacraft_core::{ContentId, ChunkManifest};
 use libp2p::identity::Keypair;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::commands::DataCraftCommand;
@@ -61,6 +63,20 @@ fn dirs_home() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Tracks pending DHT requests from IPC commands.
+#[derive(Debug)]
+enum PendingRequest {
+    ResolveProviders {
+        reply_tx: oneshot::Sender<Result<Vec<libp2p::PeerId>, String>>,
+    },
+    GetManifest {
+        reply_tx: oneshot::Sender<Result<ChunkManifest, String>>,
+    },
+}
+
+/// Global pending requests tracker.
+type PendingRequests = Arc<Mutex<HashMap<ContentId, PendingRequest>>>;
+
 /// Run the DataCraft daemon.
 ///
 /// This starts the libp2p swarm and IPC server, then blocks until shutdown.
@@ -86,6 +102,9 @@ pub async fn run_daemon(
     
     // Create command channel for IPC → swarm communication
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<DataCraftCommand>();
+    
+    // Create pending requests tracker for DHT operations
+    let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
 
     // Create and register DataCraft protocol
     let protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
@@ -114,7 +133,7 @@ pub async fn run_daemon(
                 error!("IPC server error: {}", e);
             }
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -133,6 +152,7 @@ async fn drive_swarm(
     swarm: &mut craftec_network::CraftSwarm,
     protocol: Arc<DataCraftProtocol>,
     command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
+    pending_requests: PendingRequests,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -163,7 +183,7 @@ async fn drive_swarm(
             // Handle commands from IPC handler
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
-                    handle_command(swarm, &protocol, cmd).await;
+                    handle_command(swarm, &protocol, cmd, pending_requests.clone()).await;
                 }
             }
         }
@@ -175,6 +195,7 @@ async fn handle_command(
     swarm: &mut craftec_network::CraftSwarm,
     protocol: &DataCraftProtocol,
     command: DataCraftCommand,
+    pending_requests: PendingRequests,
 ) {
     match command {
         DataCraftCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
@@ -202,19 +223,33 @@ async fn handle_command(
         DataCraftCommand::ResolveProviders { content_id, reply_tx } => {
             debug!("Handling resolve providers command for {}", content_id);
             
-            let result = protocol.resolve_providers(swarm.behaviour_mut(), &content_id).await;
-            
-            // For now, just return empty list - we'll wire up the actual response in Milestone 2
-            let _ = reply_tx.send(result.map_err(|e| e.to_string()).map(|_| vec![]));
+            match protocol.resolve_providers(swarm.behaviour_mut(), &content_id).await {
+                Ok(()) => {
+                    // Store the reply channel to respond when DHT query completes
+                    let mut pending = pending_requests.lock().await;
+                    pending.insert(content_id, PendingRequest::ResolveProviders { reply_tx });
+                    debug!("Started DHT provider resolution for {}", content_id);
+                }
+                Err(e) => {
+                    let _ = reply_tx.send(Err(format!("Failed to start provider resolution: {}", e)));
+                }
+            }
         }
         
         DataCraftCommand::GetManifest { content_id, reply_tx } => {
             debug!("Handling get manifest command for {}", content_id);
             
-            let _result = protocol.get_manifest(swarm.behaviour_mut(), &content_id).await;
-            
-            // For now, return error - we'll wire up the actual response in Milestone 2
-            let _ = reply_tx.send(Err("GetManifest not fully implemented yet".to_string()));
+            match protocol.get_manifest(swarm.behaviour_mut(), &content_id).await {
+                Ok(()) => {
+                    // Store the reply channel to respond when DHT query completes
+                    let mut pending = pending_requests.lock().await;
+                    pending.insert(content_id, PendingRequest::GetManifest { reply_tx });
+                    debug!("Started DHT manifest retrieval for {}", content_id);
+                }
+                Err(e) => {
+                    let _ = reply_tx.send(Err(format!("Failed to start manifest retrieval: {}", e)));
+                }
+            }
         }
     }
 }
@@ -240,21 +275,52 @@ async fn handle_incoming_streams(
 }
 
 /// Handle protocol events (DHT query results, etc.).
-async fn handle_protocol_events(event_rx: &mut mpsc::UnboundedReceiver<DataCraftEvent>) {
+async fn handle_protocol_events(
+    event_rx: &mut mpsc::UnboundedReceiver<DataCraftEvent>,
+    pending_requests: PendingRequests,
+) {
     info!("Starting protocol events handler");
     
     while let Some(event) = event_rx.recv().await {
         match event {
             DataCraftEvent::ProvidersResolved { content_id, providers } => {
                 info!("Found {} providers for {}", providers.len(), content_id);
-                // TODO: Use these providers for fetching in Milestone 3
+                
+                // Find and respond to the waiting request
+                let mut pending = pending_requests.lock().await;
+                if let Some(PendingRequest::ResolveProviders { reply_tx }) = pending.remove(&content_id) {
+                    let _ = reply_tx.send(Ok(providers));
+                    debug!("Responded to provider resolution request for {}", content_id);
+                }
             }
+            
             DataCraftEvent::ManifestRetrieved { content_id, manifest } => {
                 info!("Retrieved manifest for {} ({} chunks)", content_id, manifest.chunk_count);
-                // TODO: Use this manifest for fetching in Milestone 3
+                
+                // Find and respond to the waiting request
+                let mut pending = pending_requests.lock().await;
+                if let Some(PendingRequest::GetManifest { reply_tx }) = pending.remove(&content_id) {
+                    let _ = reply_tx.send(Ok(manifest));
+                    debug!("Responded to manifest retrieval request for {}", content_id);
+                }
             }
+            
             DataCraftEvent::DhtError { content_id, error } => {
                 warn!("DHT error for {}: {}", content_id, error);
+                
+                // Find and respond to any waiting request with error
+                let mut pending = pending_requests.lock().await;
+                if let Some(pending_request) = pending.remove(&content_id) {
+                    match pending_request {
+                        PendingRequest::ResolveProviders { reply_tx } => {
+                            let _ = reply_tx.send(Err(error));
+                        }
+                        PendingRequest::GetManifest { reply_tx } => {
+                            let _ = reply_tx.send(Err(error));
+                        }
+                    }
+                    debug!("Responded to DHT request with error for {}", content_id);
+                }
             }
         }
     }
