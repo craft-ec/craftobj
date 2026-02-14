@@ -660,6 +660,7 @@ dependencies = [
  "datacraft-routing",
  "datacraft-store",
  "datacraft-transfer",
+ "futures",
  "hex",
  "libp2p",
  "libp2p-stream",

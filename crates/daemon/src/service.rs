@@ -8,10 +8,12 @@ use craftec_ipc::IpcServer;
 use craftec_network::{build_swarm, NetworkConfig};
 use datacraft_client::DataCraftClient;
 use libp2p::identity::Keypair;
-use tokio::sync::Mutex;
-use tracing::{error, info};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, error, info, warn};
 
+use crate::commands::DataCraftCommand;
 use crate::handler::DataCraftHandler;
+use crate::protocol::{DataCraftProtocol, DataCraftEvent};
 
 /// Default socket path for the DataCraft daemon.
 pub fn default_socket_path() -> String {
@@ -68,16 +70,30 @@ pub async fn run_daemon(
     socket_path: String,
     network_config: NetworkConfig,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Build client
+    // Build client and shared store
     let client = DataCraftClient::new(&data_dir)?;
     let client = Arc::new(Mutex::new(client));
+    
+    let store = Arc::new(Mutex::new(datacraft_store::FsStore::new(&data_dir)?));
 
     // Build swarm
     let (mut swarm, local_peer_id) = build_swarm(keypair, network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
     info!("DataCraft node started: {}", local_peer_id);
 
-    // Subscribe to status topics
+    // Create event channel for protocol communication
+    let (protocol_event_tx, mut protocol_event_rx) = mpsc::unbounded_channel::<DataCraftEvent>();
+    
+    // Create command channel for IPC → swarm communication
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<DataCraftCommand>();
+
+    // Create and register DataCraft protocol
+    let protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
+    let incoming_streams = protocol.register(&mut swarm)
+        .map_err(|e| format!("Failed to register DataCraft protocol: {}", e))?;
+    let protocol = Arc::new(protocol);
+
+    // Subscribe to gossipsub topics
     if let Err(e) = swarm
         .behaviour_mut()
         .subscribe_topic(datacraft_core::NODE_STATUS_TOPIC)
@@ -85,21 +101,27 @@ pub async fn run_daemon(
         error!("Failed to subscribe to node status: {:?}", e);
     }
 
-    // Start IPC server
+    // Start IPC server with enhanced handler
     let ipc_server = IpcServer::new(&socket_path);
-    let handler = Arc::new(DataCraftHandler::new(client.clone()));
+    let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx));
 
     info!("Starting IPC server on {}", socket_path);
 
-    // Run swarm event loop and IPC server concurrently
+    // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
             if let Err(e) = result {
                 error!("IPC server error: {}", e);
             }
         }
-        _ = drive_swarm(&mut swarm) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx) => {
             info!("Swarm event loop ended");
+        }
+        _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
+            info!("Incoming streams handler ended");
+        }
+        _ = handle_protocol_events(&mut protocol_event_rx) => {
+            info!("Protocol events handler ended");
         }
     }
 
@@ -107,25 +129,133 @@ pub async fn run_daemon(
 }
 
 /// Drive the swarm event loop.
-async fn drive_swarm(swarm: &mut craftec_network::CraftSwarm) {
+async fn drive_swarm(
+    swarm: &mut craftec_network::CraftSwarm,
+    protocol: Arc<DataCraftProtocol>,
+    command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
+) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
 
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                info!("Listening on {}", address);
+        tokio::select! {
+            // Handle swarm events
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        info!("Listening on {}", address);
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        info!("Connected to {}", peer_id);
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        info!("Disconnected from {}", peer_id);
+                    }
+                    SwarmEvent::Behaviour(event) => {
+                        debug!("Behaviour event: {:?}", event);
+                        // Pass events to our protocol handler
+                        protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
+                    }
+                    _ => {}
+                }
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                info!("Connected to {}", peer_id);
+            
+            // Handle commands from IPC handler
+            command = command_rx.recv() => {
+                if let Some(cmd) = command {
+                    handle_command(swarm, &protocol, cmd).await;
+                }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                info!("Disconnected from {}", peer_id);
+        }
+    }
+}
+
+/// Handle a command from the IPC handler.
+async fn handle_command(
+    swarm: &mut craftec_network::CraftSwarm,
+    protocol: &DataCraftProtocol,
+    command: DataCraftCommand,
+) {
+    match command {
+        DataCraftCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
+            debug!("Handling announce provider command for {}", content_id);
+            
+            // Get the local peer ID
+            let local_peer_id = *swarm.local_peer_id();
+            
+            let result = async {
+                // First announce as provider
+                protocol.announce_provider(swarm.behaviour_mut(), &content_id).await
+                    .map_err(|e| format!("Failed to announce provider: {}", e))?;
+                
+                // Then publish the manifest
+                protocol.publish_manifest(swarm.behaviour_mut(), &manifest, &local_peer_id).await
+                    .map_err(|e| format!("Failed to publish manifest: {}", e))?;
+                
+                debug!("Successfully started DHT operations for {}", content_id);
+                Ok(())
+            }.await;
+            
+            let _ = reply_tx.send(result);
+        }
+        
+        DataCraftCommand::ResolveProviders { content_id, reply_tx } => {
+            debug!("Handling resolve providers command for {}", content_id);
+            
+            let result = protocol.resolve_providers(swarm.behaviour_mut(), &content_id).await;
+            
+            // For now, just return empty list - we'll wire up the actual response in Milestone 2
+            let _ = reply_tx.send(result.map_err(|e| e.to_string()).map(|_| vec![]));
+        }
+        
+        DataCraftCommand::GetManifest { content_id, reply_tx } => {
+            debug!("Handling get manifest command for {}", content_id);
+            
+            let _result = protocol.get_manifest(swarm.behaviour_mut(), &content_id).await;
+            
+            // For now, return error - we'll wire up the actual response in Milestone 2
+            let _ = reply_tx.send(Err("GetManifest not fully implemented yet".to_string()));
+        }
+    }
+}
+
+/// Handle incoming transfer streams from peers.
+async fn handle_incoming_streams(
+    mut incoming_streams: libp2p_stream::IncomingStreams,
+    protocol: Arc<DataCraftProtocol>,
+) {
+    use futures::StreamExt;
+
+    info!("Starting incoming streams handler");
+    
+    while let Some((peer, stream)) = incoming_streams.next().await {
+        debug!("Received incoming stream from peer: {}", peer);
+        
+        // Spawn a task to handle this stream
+        let protocol_clone = protocol.clone();
+        tokio::spawn(async move {
+            protocol_clone.handle_incoming_stream(stream).await;
+        });
+    }
+}
+
+/// Handle protocol events (DHT query results, etc.).
+async fn handle_protocol_events(event_rx: &mut mpsc::UnboundedReceiver<DataCraftEvent>) {
+    info!("Starting protocol events handler");
+    
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            DataCraftEvent::ProvidersResolved { content_id, providers } => {
+                info!("Found {} providers for {}", providers.len(), content_id);
+                // TODO: Use these providers for fetching in Milestone 3
             }
-            SwarmEvent::Behaviour(event) => {
-                tracing::trace!("Behaviour event: {:?}", event);
+            DataCraftEvent::ManifestRetrieved { content_id, manifest } => {
+                info!("Retrieved manifest for {} ({} chunks)", content_id, manifest.chunk_count);
+                // TODO: Use this manifest for fetching in Milestone 3
             }
-            _ => {}
+            DataCraftEvent::DhtError { content_id, error } => {
+                warn!("DHT error for {}: {}", content_id, error);
+            }
         }
     }
 }

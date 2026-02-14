@@ -23,6 +23,7 @@ craftec-network = { workspace = true }
 libp2p = { workspace = true }
 libp2p-stream = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

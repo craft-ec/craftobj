@@ -11,17 +11,39 @@ use craftec_ipc::server::IpcHandler;
 use datacraft_client::DataCraftClient;
 use datacraft_core::PublishOptions;
 use serde_json::Value;
-use tokio::sync::Mutex;
-use tracing::debug;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{debug, warn};
 
-/// DataCraft IPC handler wrapping a DataCraftClient.
+use crate::commands::DataCraftCommand;
+use crate::protocol::DataCraftProtocol;
+
+/// DataCraft IPC handler wrapping a DataCraftClient and protocol.
 pub struct DataCraftHandler {
     client: Arc<Mutex<DataCraftClient>>,
+    _protocol: Option<Arc<DataCraftProtocol>>,
+    command_tx: Option<mpsc::UnboundedSender<DataCraftCommand>>,
 }
 
 impl DataCraftHandler {
-    pub fn new(client: Arc<Mutex<DataCraftClient>>) -> Self {
-        Self { client }
+    pub fn new(
+        client: Arc<Mutex<DataCraftClient>>,
+        protocol: Arc<DataCraftProtocol>,
+        command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    ) -> Self {
+        Self { 
+            client, 
+            _protocol: Some(protocol),
+            command_tx: Some(command_tx),
+        }
+    }
+
+    /// Create handler without protocol (for testing).
+    pub fn new_without_protocol(client: Arc<Mutex<DataCraftClient>>) -> Self {
+        Self { 
+            client, 
+            _protocol: None,
+            command_tx: None,
+        }
     }
 
     async fn handle_publish(&self, params: Option<Value>) -> Result<Value, String> {
@@ -44,6 +66,45 @@ impl DataCraftHandler {
         let result = client
             .publish(&PathBuf::from(path), &options)
             .map_err(|e| e.to_string())?;
+        
+        // Get the manifest for DHT announcement
+        let manifest = client
+            .store()
+            .get_manifest(&result.content_id)
+            .map_err(|e| format!("Failed to get manifest: {}", e))?;
+        
+        drop(client); // Release the lock
+
+        // Announce to DHT after successful publish (Milestone 1)
+        if let Some(ref command_tx) = self.command_tx {
+            debug!("Announcing {} to DHT", result.content_id);
+            
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let command = DataCraftCommand::AnnounceProvider {
+                content_id: result.content_id,
+                manifest,
+                reply_tx,
+            };
+            
+            if let Err(e) = command_tx.send(command) {
+                warn!("Failed to send announce command: {}", e);
+            } else {
+                // Wait for the announcement to complete
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        debug!("Successfully announced {} to DHT", result.content_id);
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Failed to announce {} to DHT: {}", result.content_id, e);
+                    }
+                    Err(e) => {
+                        warn!("DHT announcement reply channel closed: {}", e);
+                    }
+                }
+            }
+        } else {
+            debug!("Published {} (no DHT announcement - running without network)", result.content_id);
+        }
 
         let mut response = serde_json::json!({
             "cid": result.content_id.to_hex(),
