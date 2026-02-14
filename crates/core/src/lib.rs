@@ -3,6 +3,8 @@
 //! Content types and protocol primitives for DataCraft:
 //! content-addressed distributed storage with erasure coding.
 
+pub mod economics;
+
 use craftec_erasure::ErasureConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
