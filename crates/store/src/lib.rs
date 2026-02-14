@@ -171,6 +171,48 @@ impl FsStore {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+
+    /// Return the maximum shard index stored locally for a given content/chunk pair.
+    /// Returns `None` if no shards are stored for this chunk.
+    pub fn max_shard_index(&self, content_id: &ContentId, chunk_index: u32) -> Option<u8> {
+        let chunk_dir = self
+            .data_dir
+            .join("chunks")
+            .join(content_id.to_hex())
+            .join(chunk_index.to_string());
+        if !chunk_dir.exists() {
+            return None;
+        }
+        let mut max: Option<u8> = None;
+        if let Ok(entries) = std::fs::read_dir(&chunk_dir) {
+            for entry in entries.flatten() {
+                if let Ok(idx) = entry.file_name().to_string_lossy().parse::<u8>() {
+                    max = Some(max.map_or(idx, |m: u8| m.max(idx)));
+                }
+            }
+        }
+        max
+    }
+
+    /// Return the maximum shard index across all chunks for a content ID.
+    /// Returns `None` if no shards exist.
+    pub fn max_shard_index_for_content(&self, content_id: &ContentId) -> Option<u8> {
+        let cid_dir = self.data_dir.join("chunks").join(content_id.to_hex());
+        if !cid_dir.exists() {
+            return None;
+        }
+        let mut global_max: Option<u8> = None;
+        if let Ok(entries) = std::fs::read_dir(&cid_dir) {
+            for entry in entries.flatten() {
+                if let Ok(chunk_idx) = entry.file_name().to_string_lossy().parse::<u32>() {
+                    if let Some(m) = self.max_shard_index(content_id, chunk_idx) {
+                        global_max = Some(global_max.map_or(m, |g: u8| g.max(m)));
+                    }
+                }
+            }
+        }
+        global_max
+    }
 }
 
 /// Manages pinned content IDs.

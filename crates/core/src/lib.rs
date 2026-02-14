@@ -183,6 +183,12 @@ pub const TRANSFER_PROTOCOL: &str = "/datacraft/transfer/1.0.0";
 /// Manifest exchange protocol ID.
 pub const MANIFEST_PROTOCOL: &str = "/datacraft/manifest/1.0.0";
 
+/// PDP (Proof of Data Possession) protocol ID.
+pub const PDP_PROTOCOL: &str = "/datacraft/pdp/1.0.0";
+
+/// Shard coordination protocol ID (direct streams for index negotiation).
+pub const SHARD_COORD_PROTOCOL: &str = "/datacraft/shard-coord/1.0.0";
+
 /// DHT key prefix for content providers.
 pub const PROVIDERS_DHT_PREFIX: &str = "/datacraft/providers/";
 
@@ -263,6 +269,8 @@ pub enum WireMessageType {
     ManifestRequest = 2,
     /// Response with manifest data.
     ManifestResponse = 3,
+    /// TransferReceipt sent by requester after receiving a shard.
+    Receipt = 4,
 }
 
 impl WireMessageType {
@@ -272,6 +280,7 @@ impl WireMessageType {
             1 => Some(Self::ShardResponse),
             2 => Some(Self::ManifestRequest),
             3 => Some(Self::ManifestResponse),
+            4 => Some(Self::Receipt),
             _ => None,
         }
     }

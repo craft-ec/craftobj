@@ -304,6 +304,7 @@ impl DataCraftHandler {
                         content_id: *content_id,
                         chunk_index: chunk_idx_u32,
                         shard_index: shard_idx as u8,
+                        local_public_key: [0u8; 32], // TODO: use actual node keypair public key
                         reply_tx,
                     };
                     

@@ -31,10 +31,23 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         chunk_index: u32,
         shard_index: u8,
+        /// Requester's public key (for signing TransferReceipts).
+        local_public_key: [u8; 32],
         reply_tx: oneshot::Sender<Result<Vec<u8>, String>>,
     },
     /// Publish a capability announcement via gossipsub.
     PublishCapabilities {
         capabilities: Vec<DataCraftCapability>,
+    },
+    /// Query a peer for their max shard index for a CID.
+    QueryMaxShardIndex {
+        peer_id: PeerId,
+        content_id: ContentId,
+        reply_tx: oneshot::Sender<Result<Option<u8>, String>>,
+    },
+    /// Extend a CID: fetch k shards, coordinate index, generate new parity, store + announce.
+    Extend {
+        content_id: ContentId,
+        reply_tx: oneshot::Sender<Result<u8, String>>,
     },
 }

@@ -11,7 +11,7 @@
 //! ```
 
 use datacraft_core::{
-    ContentId, DataCraftError, Result, WireMessageType, WireStatus, WIRE_MAGIC,
+    ContentId, DataCraftError, Result, TransferReceipt, WireMessageType, WireStatus, WIRE_MAGIC,
 };
 use datacraft_store::FsStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +67,89 @@ pub fn encode_response(status: WireStatus, payload: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(payload);
     buf
+}
+
+/// Encode a TransferReceipt into wire format.
+///
+/// Wire format: [magic:4][type:1(Receipt=4)][len:4 BE][bincode receipt]
+pub fn encode_receipt(receipt: &TransferReceipt) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(receipt).map_err(|e| {
+        DataCraftError::TransferError(format!("serialize receipt: {}", e))
+    })?;
+    let mut buf = Vec::with_capacity(4 + 1 + 4 + payload.len());
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::Receipt as u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&payload);
+    Ok(buf)
+}
+
+/// Decode a TransferReceipt from wire format.
+///
+/// Expects: [magic:4][type:1(Receipt=4)][len:4 BE][bincode receipt]
+pub fn decode_receipt(buf: &[u8]) -> Result<TransferReceipt> {
+    if buf.len() < 9 {
+        return Err(DataCraftError::TransferError("receipt frame too short".into()));
+    }
+    if buf[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic in receipt".into()));
+    }
+    if buf[4] != WireMessageType::Receipt as u8 {
+        return Err(DataCraftError::TransferError(format!(
+            "expected Receipt type, got {}",
+            buf[4]
+        )));
+    }
+    let payload_len = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
+    if buf.len() < 9 + payload_len {
+        return Err(DataCraftError::TransferError("receipt payload truncated".into()));
+    }
+    let receipt: TransferReceipt = bincode::deserialize(&buf[9..9 + payload_len]).map_err(|e| {
+        DataCraftError::TransferError(format!("deserialize receipt: {}", e))
+    })?;
+    Ok(receipt)
+}
+
+/// Read a TransferReceipt from an async stream.
+pub async fn read_receipt<S>(stream: &mut S) -> Result<TransferReceipt>
+where
+    S: AsyncReadExt + Unpin,
+{
+    // Read header: magic(4) + type(1) + len(4) = 9 bytes
+    let mut header = [0u8; 9];
+    stream.read_exact(&mut header).await.map_err(|e| {
+        DataCraftError::TransferError(format!("read receipt header: {}", e))
+    })?;
+    if header[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic in receipt".into()));
+    }
+    if header[4] != WireMessageType::Receipt as u8 {
+        return Err(DataCraftError::TransferError(format!(
+            "expected Receipt type, got {}",
+            header[4]
+        )));
+    }
+    let payload_len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    let mut payload = vec![0u8; payload_len];
+    stream.read_exact(&mut payload).await.map_err(|e| {
+        DataCraftError::TransferError(format!("read receipt payload: {}", e))
+    })?;
+    let receipt: TransferReceipt = bincode::deserialize(&payload).map_err(|e| {
+        DataCraftError::TransferError(format!("deserialize receipt: {}", e))
+    })?;
+    Ok(receipt)
+}
+
+/// Write a TransferReceipt to an async stream.
+pub async fn write_receipt<S>(stream: &mut S, receipt: &TransferReceipt) -> Result<()>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let encoded = encode_receipt(receipt)?;
+    stream.write_all(&encoded).await.map_err(|e| {
+        DataCraftError::TransferError(format!("write receipt: {}", e))
+    })?;
+    Ok(())
 }
 
 /// Handle an incoming shard request: read from local store and respond.

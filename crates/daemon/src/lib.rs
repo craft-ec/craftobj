@@ -7,5 +7,6 @@
 
 pub mod commands;
 pub mod handler;
+pub mod pdp;
 pub mod protocol;
 pub mod service;

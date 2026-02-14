@@ -8,6 +8,8 @@
 //! - `fetch(cid, dest)` → resolve → download manifest → download shards → decode → verify → write
 //! - `pin(cid)` / `unpin(cid)` / `list()` / `status()`
 
+pub mod extension;
+
 use std::path::{Path, PathBuf};
 
 use craftec_erasure::ErasureCoder;

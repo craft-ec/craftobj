@@ -112,7 +112,7 @@ pub async fn run_daemon(
 
     // Create and register DataCraft protocol
     let protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
-    let incoming_streams = protocol.register(&mut swarm)
+    let (incoming_streams, coord_streams) = protocol.register(&mut swarm)
         .map_err(|e| format!("Failed to register DataCraft protocol: {}", e))?;
     let protocol = Arc::new(protocol);
 
@@ -154,6 +154,9 @@ pub async fn run_daemon(
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
             info!("Incoming streams handler ended");
+        }
+        _ = handle_incoming_coord_streams(coord_streams, protocol.clone()) => {
+            info!("Incoming coord streams handler ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone()) => {
             info!("Protocol events handler ended");
@@ -301,11 +304,11 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::RequestShard { peer_id, content_id, chunk_index, shard_index, reply_tx } => {
+        DataCraftCommand::RequestShard { peer_id, content_id, chunk_index, shard_index, local_public_key, reply_tx } => {
             debug!("Handling request shard command: {}/{}/{} from {}", content_id, chunk_index, shard_index, peer_id);
             
             let result = protocol
-                .request_shard_from_peer(swarm.behaviour_mut(), peer_id, &content_id, chunk_index, shard_index)
+                .request_shard_from_peer(swarm.behaviour_mut(), peer_id, &content_id, chunk_index, shard_index, &local_public_key)
                 .await;
             
             let _ = reply_tx.send(result);
