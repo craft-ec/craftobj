@@ -10,4 +10,5 @@ pub mod handler;
 pub mod health;
 pub mod pdp;
 pub mod protocol;
+pub mod receipt_store;
 pub mod service;
