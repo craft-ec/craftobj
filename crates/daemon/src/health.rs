@@ -6,10 +6,10 @@
 use datacraft_core::{ChunkManifest, ContentId, StorageReceipt};
 use datacraft_store::FsStore;
 use libp2p::PeerId;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::pdp::{
-    PdpResponse, compute_proof_hash, create_storage_receipt, verify_pdp_response,
+    PdpResponse, create_storage_receipt, verify_pdp_response,
 };
 
 // ---------------------------------------------------------------------------
@@ -352,6 +352,7 @@ pub fn run_challenger_duty_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdp::compute_proof_hash;
     use datacraft_core::{default_erasure_config, ContentId};
 
     #[test]
