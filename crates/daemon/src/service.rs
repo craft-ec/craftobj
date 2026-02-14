@@ -105,6 +105,7 @@ pub async fn run_daemon(
     
     // Create command channel for IPC → swarm communication
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<DataCraftCommand>();
+    let command_tx_for_caps = command_tx.clone();
     
     // Create pending requests tracker for DHT operations
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
@@ -134,9 +135,12 @@ pub async fn run_daemon(
 
     // Start IPC server with enhanced handler
     let ipc_server = IpcServer::new(&socket_path);
-    let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx));
+    let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone()));
 
     info!("Starting IPC server on {}", socket_path);
+
+    // Own capabilities (default: Storage + Client)
+    let own_capabilities = vec![DataCraftCapability::Storage, DataCraftCapability::Client];
 
     // Run all components concurrently
     tokio::select! {
@@ -145,7 +149,7 @@ pub async fn run_daemon(
                 error!("IPC server error: {}", e);
             }
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -153,6 +157,9 @@ pub async fn run_daemon(
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone()) => {
             info!("Protocol events handler ended");
+        }
+        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps) => {
+            info!("Capability announcement loop ended");
         }
     }
 
@@ -165,6 +172,7 @@ async fn drive_swarm(
     protocol: Arc<DataCraftProtocol>,
     command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
     pending_requests: PendingRequests,
+    peer_capabilities: PeerCapabilities,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -185,6 +193,8 @@ async fn drive_swarm(
                     }
                     SwarmEvent::Behaviour(event) => {
                         debug!("Behaviour event: {:?}", event);
+                        // Try to extract gossipsub capability announcements before passing through
+                        handle_gossipsub_capability(&event, &peer_capabilities).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -264,6 +274,33 @@ async fn handle_command(
             }
         }
         
+        DataCraftCommand::PublishCapabilities { capabilities } => {
+            let local_peer_id = *swarm.local_peer_id();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let announcement = CapabilityAnnouncement {
+                peer_id: local_peer_id.to_bytes(),
+                capabilities,
+                timestamp,
+                signature: vec![], // TODO: sign with node keypair
+            };
+            match serde_json::to_vec(&announcement) {
+                Ok(data) => {
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .publish_to_topic(datacraft_core::CAPABILITIES_TOPIC, data)
+                    {
+                        debug!("Failed to publish capabilities: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize capability announcement: {}", e);
+                }
+            }
+        }
+        
         DataCraftCommand::RequestShard { peer_id, content_id, chunk_index, shard_index, reply_tx } => {
             debug!("Handling request shard command: {}/{}/{} from {}", content_id, chunk_index, shard_index, peer_id);
             
@@ -273,6 +310,67 @@ async fn handle_command(
             
             let _ = reply_tx.send(result);
         }
+    }
+}
+
+/// Handle gossipsub capability announcement messages.
+async fn handle_gossipsub_capability(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+    peer_capabilities: &PeerCapabilities,
+) {
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    use libp2p::gossipsub;
+
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        message, ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::CAPABILITIES_TOPIC {
+            match serde_json::from_slice::<CapabilityAnnouncement>(&message.data) {
+                Ok(ann) => {
+                    if let Ok(peer_id) = libp2p::PeerId::from_bytes(&ann.peer_id) {
+                        debug!(
+                            "Received capability announcement from {}: {:?}",
+                            peer_id, ann.capabilities
+                        );
+                        let mut caps = peer_capabilities.lock().await;
+                        // Only update if newer
+                        let dominated = caps
+                            .get(&peer_id)
+                            .map(|(_, ts)| *ts < ann.timestamp)
+                            .unwrap_or(true);
+                        if dominated {
+                            caps.insert(peer_id, (ann.capabilities, ann.timestamp));
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to parse capability announcement: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Periodically publish own capabilities via gossipsub.
+async fn announce_capabilities_periodically(
+    _local_peer_id: &libp2p::PeerId,
+    capabilities: Vec<DataCraftCapability>,
+    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+) {
+    use std::time::Duration;
+
+    // Initial delay before first announcement
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+    loop {
+        interval.tick().await;
+        debug!("Publishing capability announcement");
+        let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
+            capabilities: capabilities.clone(),
+        });
     }
 }
 

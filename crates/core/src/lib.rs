@@ -51,23 +51,26 @@ pub struct ChunkId {
     pub index: u32,
 }
 
-/// Manifest describing how a content item is chunked and erasure-encoded.
+/// Immutable manifest describing how to reconstruct content from erasure-coded shards.
+///
+/// This is a **recipe** — it defines reconstruction parameters but does NOT track
+/// shard count or shard locations. The DHT tracks who holds shards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkManifest {
     /// Content ID (hash of original data, or ciphertext if encrypted).
     pub content_id: ContentId,
-    /// Total size in bytes of the original content.
-    pub total_size: u64,
-    /// Number of chunks the content was split into.
-    pub chunk_count: u32,
-    /// Chunk size in bytes (last chunk may be smaller).
+    /// Final verification hash (SHA-256 of the content bytes).
+    pub content_hash: [u8; 32],
+    /// Number of data shards needed for reconstruction.
+    pub k: usize,
+    /// Chunk size in bytes (all chunks are this size; last chunk is zero-padded).
     pub chunk_size: usize,
+    /// Number of chunks the content was split into.
+    pub chunk_count: usize,
     /// Erasure coding parameters used.
     pub erasure_config: ErasureConfig,
-    /// Whether the content is encrypted.
-    pub encrypted: bool,
-    /// Per-chunk information: sizes of each chunk before erasure encoding.
-    pub chunk_sizes: Vec<usize>,
+    /// Total size in bytes of the original content (needed for truncation after decode).
+    pub content_size: u64,
 }
 
 /// Options for publishing content.
@@ -547,18 +550,21 @@ mod tests {
 
     #[test]
     fn test_chunk_manifest_serde() {
+        let cid = ContentId::from_bytes(b"test");
         let manifest = ChunkManifest {
-            content_id: ContentId::from_bytes(b"test"),
-            total_size: 1024,
-            chunk_count: 1,
+            content_id: cid,
+            content_hash: cid.0,
+            k: 4,
             chunk_size: 65536,
+            chunk_count: 1,
             erasure_config: default_erasure_config(),
-            encrypted: false,
-            chunk_sizes: vec![1024],
+            content_size: 1024,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: ChunkManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, manifest.content_id);
-        assert_eq!(parsed.total_size, 1024);
+        assert_eq!(parsed.content_hash, cid.0);
+        assert_eq!(parsed.k, 4);
+        assert_eq!(parsed.content_size, 1024);
     }
 }

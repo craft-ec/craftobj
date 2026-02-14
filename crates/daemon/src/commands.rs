@@ -2,7 +2,7 @@
 //!
 //! Commands sent from IPC handler to the swarm event loop for DHT operations.
 
-use datacraft_core::{ContentId, ChunkManifest};
+use datacraft_core::{ContentId, ChunkManifest, DataCraftCapability};
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
@@ -32,5 +32,9 @@ pub enum DataCraftCommand {
         chunk_index: u32,
         shard_index: u8,
         reply_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// Publish a capability announcement via gossipsub.
+    PublishCapabilities {
+        capabilities: Vec<DataCraftCapability>,
     },
 }

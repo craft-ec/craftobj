@@ -17,11 +17,18 @@ use tracing::{debug, warn};
 use crate::commands::DataCraftCommand;
 use crate::protocol::DataCraftProtocol;
 
+use datacraft_core::DataCraftCapability;
+use std::collections::HashMap;
+
+/// Peer capability tracker type alias.
+type PeerCapabilities = Arc<Mutex<HashMap<libp2p::PeerId, (Vec<DataCraftCapability>, u64)>>>;
+
 /// DataCraft IPC handler wrapping a DataCraftClient and protocol.
 pub struct DataCraftHandler {
     client: Arc<Mutex<DataCraftClient>>,
     _protocol: Option<Arc<DataCraftProtocol>>,
     command_tx: Option<mpsc::UnboundedSender<DataCraftCommand>>,
+    peer_capabilities: Option<PeerCapabilities>,
 }
 
 impl DataCraftHandler {
@@ -29,11 +36,13 @@ impl DataCraftHandler {
         client: Arc<Mutex<DataCraftClient>>,
         protocol: Arc<DataCraftProtocol>,
         command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+        peer_capabilities: PeerCapabilities,
     ) -> Self {
         Self { 
             client, 
             _protocol: Some(protocol),
             command_tx: Some(command_tx),
+            peer_capabilities: Some(peer_capabilities),
         }
     }
 
@@ -43,6 +52,7 @@ impl DataCraftHandler {
             client, 
             _protocol: None,
             command_tx: None,
+            peer_capabilities: None,
         }
     }
 
@@ -109,7 +119,7 @@ impl DataCraftHandler {
         let mut response = serde_json::json!({
             "cid": result.content_id.to_hex(),
             "size": result.total_size,
-            "chunks": result.chunk_count,
+            "chunks": result.chunk_count as u64,
         });
         if let Some(key) = &result.encryption_key {
             response["key"] = Value::String(hex::encode(key));
@@ -239,6 +249,25 @@ impl DataCraftHandler {
         serde_json::to_value(status).map_err(|e| e.to_string())
     }
 
+    async fn handle_peers(&self) -> Result<Value, String> {
+        let caps = match &self.peer_capabilities {
+            Some(pc) => pc.lock().await,
+            None => return Ok(serde_json::json!({})),
+        };
+        let mut result = serde_json::Map::new();
+        for (peer_id, (capabilities, timestamp)) in caps.iter() {
+            let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
+            result.insert(
+                peer_id.to_string(),
+                serde_json::json!({
+                    "capabilities": cap_strings,
+                    "last_seen": timestamp,
+                }),
+            );
+        }
+        Ok(Value::Object(result))
+    }
+
     /// Fetch missing shards from remote peers using P2P transfer.
     async fn fetch_missing_shards_from_peers(
         &self,
@@ -255,9 +284,10 @@ impl DataCraftHandler {
         
         // For each chunk, try to fetch missing shards from providers
         for chunk_idx in 0..manifest.chunk_count {
+            let chunk_idx_u32 = chunk_idx as u32;
             // Check which shards we already have locally
             for shard_idx in 0..total_shards {
-                if store.get_shard(content_id, chunk_idx, shard_idx as u8).is_ok() {
+                if store.get_shard(content_id, chunk_idx_u32, shard_idx as u8).is_ok() {
                     continue; // We already have this shard
                 }
                 
@@ -272,7 +302,7 @@ impl DataCraftHandler {
                     let command = DataCraftCommand::RequestShard {
                         peer_id: provider,
                         content_id: *content_id,
-                        chunk_index: chunk_idx,
+                        chunk_index: chunk_idx_u32,
                         shard_index: shard_idx as u8,
                         reply_tx,
                     };
@@ -286,7 +316,7 @@ impl DataCraftHandler {
                             debug!("Successfully received shard {}/{}/{} from {}", content_id, chunk_idx, shard_idx, provider);
                             
                             // Store the shard locally
-                            if let Err(e) = store.put_shard(content_id, chunk_idx, shard_idx as u8, &shard_data) {
+                            if let Err(e) = store.put_shard(content_id, chunk_idx_u32, shard_idx as u8, &shard_data) {
                                 warn!("Failed to store shard {}/{}/{}: {}", content_id, chunk_idx, shard_idx, e);
                                 continue;
                             }
@@ -332,6 +362,7 @@ impl IpcHandler for DataCraftHandler {
                 "unpin" => self.handle_unpin(params).await,
                 "list" => self.handle_list().await,
                 "status" => self.handle_status().await,
+                "peers" => self.handle_peers().await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })
