@@ -139,7 +139,7 @@ pub async fn run_daemon(
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
             info!("Incoming streams handler ended");
         }
-        _ = handle_protocol_events(&mut protocol_event_rx) => {
+        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone()) => {
             info!("Protocol events handler ended");
         }
     }

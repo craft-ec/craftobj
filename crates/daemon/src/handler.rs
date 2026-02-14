@@ -140,6 +140,61 @@ impl DataCraftHandler {
         let cid =
             datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
+        // Milestone 2: Try DHT resolution first if network is available
+        if let Some(ref command_tx) = self.command_tx {
+            debug!("Attempting DHT resolution for {}", cid);
+            
+            // First, try to get providers for this content
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let command = DataCraftCommand::ResolveProviders {
+                content_id: cid,
+                reply_tx,
+            };
+            
+            if command_tx.send(command).is_ok() {
+                match reply_rx.await {
+                    Ok(Ok(providers)) if !providers.is_empty() => {
+                        debug!("Found {} providers for {}", providers.len(), cid);
+                        
+                        // Try to get the manifest from DHT
+                        let (manifest_tx, manifest_rx) = oneshot::channel();
+                        let command = DataCraftCommand::GetManifest {
+                            content_id: cid,
+                            reply_tx: manifest_tx,
+                        };
+                        
+                        if command_tx.send(command).is_ok() {
+                            match manifest_rx.await {
+                                Ok(Ok(_manifest)) => {
+                                    debug!("Retrieved manifest for {} from DHT", cid);
+                                    // For now, we have the manifest but still use local reconstruction
+                                    // In Milestone 3, we'll implement P2P shard transfer
+                                    debug!("Manifest retrieved but P2P shard transfer not yet implemented, falling back to local");
+                                }
+                                Ok(Err(e)) => {
+                                    debug!("Failed to get manifest from DHT: {}", e);
+                                }
+                                Err(e) => {
+                                    debug!("Manifest request channel error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        debug!("No providers found for {}", cid);
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Provider resolution failed: {}", e);
+                    }
+                    Err(e) => {
+                        debug!("Provider resolution channel error: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Fall back to local reconstruction
+        debug!("Using local reconstruction for {}", cid);
         let client = self.client.lock().await;
         client
             .reconstruct(&cid, &output, key.as_deref())
