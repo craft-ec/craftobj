@@ -251,6 +251,16 @@ async fn handle_command(
                 }
             }
         }
+        
+        DataCraftCommand::RequestShard { peer_id, content_id, chunk_index, shard_index, reply_tx } => {
+            debug!("Handling request shard command: {}/{}/{} from {}", content_id, chunk_index, shard_index, peer_id);
+            
+            let result = protocol
+                .request_shard_from_peer(swarm.behaviour_mut(), peer_id, &content_id, chunk_index, shard_index)
+                .await;
+            
+            let _ = reply_tx.send(result);
+        }
     }
 }
 

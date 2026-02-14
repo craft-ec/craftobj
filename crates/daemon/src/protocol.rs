@@ -254,6 +254,82 @@ impl DataCraftProtocol {
         }
     }
 
+    /// Request a shard from a remote peer.
+    pub async fn request_shard_from_peer(
+        &self,
+        behaviour: &mut CraftBehaviour,
+        peer_id: libp2p::PeerId,
+        content_id: &ContentId,
+        chunk_index: u32,
+        shard_index: u8,
+    ) -> Result<Vec<u8>, String> {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+        use datacraft_transfer::{encode_shard_request, RESPONSE_HEADER_SIZE};
+        use datacraft_core::WireStatus;
+
+        debug!(
+            "Requesting shard {}/{}/{} from peer {}",
+            content_id, chunk_index, shard_index, peer_id
+        );
+
+        // Get stream control from behavior
+        let mut control = behaviour.stream_control();
+        
+        // Open stream to peer
+        let mut stream = control
+            .open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL))
+            .await
+            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
+
+        // Send request using the existing wire protocol
+        let request = encode_shard_request(content_id, chunk_index, shard_index);
+        stream.write_all(&request).await.map_err(|e| {
+            format!("Failed to send request to {}: {}", peer_id, e)
+        })?;
+
+        // Read response header
+        let mut header = [0u8; RESPONSE_HEADER_SIZE];
+        stream.read_exact(&mut header).await.map_err(|e| {
+            format!("Failed to read response header from {}: {}", peer_id, e)
+        })?;
+
+        let status = WireStatus::from_u8(header[0]).ok_or_else(|| {
+            format!("Invalid status byte from {}: {}", peer_id, header[0])
+        })?;
+        let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+        match status {
+            WireStatus::Ok => {
+                let mut payload = vec![0u8; payload_len];
+                stream.read_exact(&mut payload).await.map_err(|e| {
+                    format!("Failed to read payload from {}: {}", peer_id, e)
+                })?;
+
+                debug!(
+                    "Successfully received shard {}/{}/{} ({} bytes) from peer {}",
+                    content_id, chunk_index, shard_index, payload.len(), peer_id
+                );
+
+                Ok(payload)
+            }
+            WireStatus::NotFound => {
+                Err(format!(
+                    "Shard {}/{}/{} not found on peer {}",
+                    content_id, chunk_index, shard_index, peer_id
+                ))
+            }
+            WireStatus::Error => {
+                let mut msg = vec![0u8; payload_len];
+                stream.read_exact(&mut msg).await.ok();
+                Err(format!(
+                    "Error from peer {}: {}",
+                    peer_id,
+                    String::from_utf8_lossy(&msg)
+                ))
+            }
+        }
+    }
+
     /// Handle an incoming transfer stream from a peer.
     pub async fn handle_incoming_stream(&self, mut stream: libp2p::Stream) {
         use futures::{AsyncReadExt, AsyncWriteExt};

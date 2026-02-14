@@ -651,6 +651,7 @@ name = "datacraft-daemon"
 version = "0.1.0"
 dependencies = [
  "craftec-app",
+ "craftec-erasure",
  "craftec-ipc",
  "craftec-keystore",
  "craftec-logging",

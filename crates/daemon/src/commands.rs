@@ -3,6 +3,7 @@
 //! Commands sent from IPC handler to the swarm event loop for DHT operations.
 
 use datacraft_core::{ContentId, ChunkManifest};
+use libp2p::PeerId;
 use tokio::sync::oneshot;
 
 /// Commands that can be sent to the swarm event loop.
@@ -23,5 +24,13 @@ pub enum DataCraftCommand {
     GetManifest {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<ChunkManifest, String>>,
+    },
+    /// Request a shard from a remote peer.
+    RequestShard {
+        peer_id: PeerId,
+        content_id: ContentId,
+        chunk_index: u32,
+        shard_index: u8,
+        reply_tx: oneshot::Sender<Result<Vec<u8>, String>>,
     },
 }

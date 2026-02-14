@@ -16,6 +16,7 @@ datacraft-store = { workspace = true }
 datacraft-routing = { workspace = true }
 datacraft-transfer = { workspace = true }
 craftec-app = { workspace = true }
+craftec-erasure = { workspace = true }
 craftec-ipc = { workspace = true }
 craftec-logging = { workspace = true }
 craftec-keystore = { workspace = true }

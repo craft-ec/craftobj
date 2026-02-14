@@ -140,7 +140,7 @@ impl DataCraftHandler {
         let cid =
             datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
-        // Milestone 2: Try DHT resolution first if network is available
+        // Milestone 2 & 3: Try DHT resolution and P2P shard transfer if network is available
         if let Some(ref command_tx) = self.command_tx {
             debug!("Attempting DHT resolution for {}", cid);
             
@@ -160,16 +160,20 @@ impl DataCraftHandler {
                         let (manifest_tx, manifest_rx) = oneshot::channel();
                         let command = DataCraftCommand::GetManifest {
                             content_id: cid,
-                            reply_tx: manifest_tx,
+            reply_tx: manifest_tx,
                         };
                         
                         if command_tx.send(command).is_ok() {
                             match manifest_rx.await {
-                                Ok(Ok(_manifest)) => {
+                                Ok(Ok(manifest)) => {
                                     debug!("Retrieved manifest for {} from DHT", cid);
-                                    // For now, we have the manifest but still use local reconstruction
-                                    // In Milestone 3, we'll implement P2P shard transfer
-                                    debug!("Manifest retrieved but P2P shard transfer not yet implemented, falling back to local");
+                                    
+                                    // Milestone 3: Try to fetch missing shards from providers
+                                    if let Err(e) = self.fetch_missing_shards_from_peers(&cid, &manifest, &providers, command_tx).await {
+                                        debug!("P2P shard transfer failed: {}, falling back to local", e);
+                                    } else {
+                                        debug!("Successfully fetched missing shards via P2P");
+                                    }
                                 }
                                 Ok(Err(e)) => {
                                     debug!("Failed to get manifest from DHT: {}", e);
@@ -229,6 +233,82 @@ impl DataCraftHandler {
         let client = self.client.lock().await;
         let status = client.status().map_err(|e| e.to_string())?;
         serde_json::to_value(status).map_err(|e| e.to_string())
+    }
+
+    /// Fetch missing shards from remote peers using P2P transfer.
+    async fn fetch_missing_shards_from_peers(
+        &self,
+        content_id: &datacraft_core::ContentId,
+        manifest: &datacraft_core::ChunkManifest,
+        providers: &[libp2p::PeerId],
+        command_tx: &tokio::sync::mpsc::UnboundedSender<DataCraftCommand>,
+    ) -> Result<(), String> {
+        debug!("Fetching missing shards for {} from {} providers", content_id, providers.len());
+        
+        let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+        let client = self.client.lock().await;
+        let store = client.store();
+        
+        // For each chunk, try to fetch missing shards from providers
+        for chunk_idx in 0..manifest.chunk_count {
+            // Check which shards we already have locally
+            for shard_idx in 0..total_shards {
+                if store.get_shard(content_id, chunk_idx, shard_idx as u8).is_ok() {
+                    continue; // We already have this shard
+                }
+                
+                debug!("Trying to fetch missing shard {}/{}/{}", content_id, chunk_idx, shard_idx);
+                
+                // Try to fetch this shard from any provider
+                let mut fetched = false;
+                for &provider in providers {
+                    debug!("Requesting shard {}/{}/{} from provider {}", content_id, chunk_idx, shard_idx, provider);
+                    
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let command = DataCraftCommand::RequestShard {
+                        peer_id: provider,
+                        content_id: *content_id,
+                        chunk_index: chunk_idx,
+                        shard_index: shard_idx as u8,
+                        reply_tx,
+                    };
+                    
+                    if command_tx.send(command).is_err() {
+                        continue;
+                    }
+                    
+                    match reply_rx.await {
+                        Ok(Ok(shard_data)) => {
+                            debug!("Successfully received shard {}/{}/{} from {}", content_id, chunk_idx, shard_idx, provider);
+                            
+                            // Store the shard locally
+                            if let Err(e) = store.put_shard(content_id, chunk_idx, shard_idx as u8, &shard_data) {
+                                warn!("Failed to store shard {}/{}/{}: {}", content_id, chunk_idx, shard_idx, e);
+                                continue;
+                            }
+                            
+                            fetched = true;
+                            break; // Found this shard, move to next
+                        }
+                        Ok(Err(e)) => {
+                            debug!("Failed to get shard {}/{}/{} from {}: {}", content_id, chunk_idx, shard_idx, provider, e);
+                        }
+                        Err(e) => {
+                            debug!("Channel error when requesting shard {}/{}/{}: {}", content_id, chunk_idx, shard_idx, e);
+                        }
+                    }
+                }
+                
+                if !fetched {
+                    debug!("Failed to fetch shard {}/{}/{} from any provider", content_id, chunk_idx, shard_idx);
+                    // Continue trying other shards - we might have enough for erasure recovery
+                }
+            }
+        }
+        
+        drop(client); // Release the lock
+        debug!("Completed P2P shard fetching for {}", content_id);
+        Ok(())
     }
 }
 
