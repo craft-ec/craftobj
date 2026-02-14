@@ -135,7 +135,18 @@ pub async fn run_daemon(
 
     // Start IPC server with enhanced handler
     let ipc_server = IpcServer::new(&socket_path);
-    let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone()));
+    // Persistent receipt store
+    let receipts_path = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".datacraft")
+        .join("receipts.bin");
+    let receipt_store = Arc::new(Mutex::new(
+        crate::receipt_store::PersistentReceiptStore::new(receipts_path)
+            .expect("failed to open receipt store"),
+    ));
+
+    let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone()));
 
     info!("Starting IPC server on {}", socket_path);
 

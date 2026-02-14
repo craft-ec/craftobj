@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 
 use crate::commands::DataCraftCommand;
 use crate::protocol::DataCraftProtocol;
+use crate::receipt_store::PersistentReceiptStore;
 
 use datacraft_core::DataCraftCapability;
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ pub struct DataCraftHandler {
     _protocol: Option<Arc<DataCraftProtocol>>,
     command_tx: Option<mpsc::UnboundedSender<DataCraftCommand>>,
     peer_capabilities: Option<PeerCapabilities>,
+    receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
 }
 
 impl DataCraftHandler {
@@ -37,12 +39,14 @@ impl DataCraftHandler {
         protocol: Arc<DataCraftProtocol>,
         command_tx: mpsc::UnboundedSender<DataCraftCommand>,
         peer_capabilities: PeerCapabilities,
+        receipt_store: Arc<Mutex<PersistentReceiptStore>>,
     ) -> Self {
         Self { 
             client, 
             _protocol: Some(protocol),
             command_tx: Some(command_tx),
             peer_capabilities: Some(peer_capabilities),
+            receipt_store: Some(receipt_store),
         }
     }
 
@@ -53,6 +57,7 @@ impl DataCraftHandler {
             _protocol: None,
             command_tx: None,
             peer_capabilities: None,
+            receipt_store: None,
         }
     }
 
@@ -247,6 +252,62 @@ impl DataCraftHandler {
         let client = self.client.lock().await;
         let status = client.status().map_err(|e| e.to_string())?;
         serde_json::to_value(status).map_err(|e| e.to_string())
+    }
+
+    async fn handle_receipts_count(&self) -> Result<Value, String> {
+        let store = self.receipt_store.as_ref().ok_or("receipt store not available")?;
+        let store = store.lock().await;
+        Ok(serde_json::json!({
+            "storage": store.storage_receipt_count(),
+            "transfer": store.transfer_receipt_count(),
+        }))
+    }
+
+    async fn handle_receipts_query(&self, params: Option<Value>) -> Result<Value, String> {
+        let store = self.receipt_store.as_ref().ok_or("receipt store not available")?;
+        let store = store.lock().await;
+        let params = params.unwrap_or(serde_json::json!({}));
+
+        let entries: Vec<&crate::receipt_store::ReceiptEntry> = if let Some(cid_hex) = params.get("cid").and_then(|v| v.as_str()) {
+            let cid = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+            store.query_by_cid(&cid)
+        } else if let Some(node_hex) = params.get("node").and_then(|v| v.as_str()) {
+            let bytes = hex::decode(node_hex).map_err(|e| e.to_string())?;
+            if bytes.len() != 32 {
+                return Err("node must be 32 bytes hex".into());
+            }
+            let mut node = [0u8; 32];
+            node.copy_from_slice(&bytes);
+            store.query_by_node(&node)
+        } else if params.get("from").is_some() || params.get("to").is_some() {
+            let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
+            let to = params.get("to").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+            store.query_by_time_range(from, to)
+        } else {
+            store.query_by_time_range(0, u64::MAX)
+        };
+
+        let results: Vec<Value> = entries.iter().map(|e| match e {
+            crate::receipt_store::ReceiptEntry::Storage(r) => serde_json::json!({
+                "type": "storage",
+                "cid": r.content_id.to_hex(),
+                "shard_index": r.shard_index,
+                "storage_node": hex::encode(r.storage_node),
+                "challenger": hex::encode(r.challenger),
+                "timestamp": r.timestamp,
+            }),
+            crate::receipt_store::ReceiptEntry::Transfer(r) => serde_json::json!({
+                "type": "transfer",
+                "cid": r.content_id.to_hex(),
+                "shard_index": r.shard_index,
+                "server_node": hex::encode(r.server_node),
+                "requester": hex::encode(r.requester),
+                "bytes_served": r.bytes_served,
+                "timestamp": r.timestamp,
+            }),
+        }).collect();
+
+        Ok(serde_json::json!({ "receipts": results }))
     }
 
     async fn handle_peers(&self) -> Result<Value, String> {
@@ -497,6 +558,8 @@ impl IpcHandler for DataCraftHandler {
                 "status" => self.handle_status().await,
                 "peers" => self.handle_peers().await,
                 "extend" => self.handle_extend(params).await,
+                "receipts.count" => self.handle_receipts_count().await,
+                "receipts.query" => self.handle_receipts_query(params).await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })
