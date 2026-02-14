@@ -315,11 +315,8 @@ impl DataCraftHandler {
                 reply_tx: tx,
             }).map_err(|e| e.to_string())?;
 
-            match rx.await {
-                Ok(Ok(Some(idx))) => {
-                    global_max = Some(global_max.map_or(idx, |m| m.max(idx)));
-                }
-                _ => {}
+            if let Ok(Ok(Some(idx))) = rx.await {
+                global_max = Some(global_max.map_or(idx, |m| m.max(idx)));
             }
         }
 
