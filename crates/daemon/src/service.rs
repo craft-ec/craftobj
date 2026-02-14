@@ -8,7 +8,7 @@ use std::sync::Arc;
 use craftec_ipc::IpcServer;
 use craftec_network::{build_swarm, NetworkConfig};
 use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, ChunkManifest};
+use datacraft_core::{ContentId, ChunkManifest, CapabilityAnnouncement, DataCraftCapability};
 use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
@@ -62,6 +62,9 @@ fn dirs_home() -> Option<std::path::PathBuf> {
         .ok()
         .map(std::path::PathBuf::from)
 }
+
+/// Peer capability tracker — stores latest known capabilities per peer.
+type PeerCapabilities = Arc<Mutex<HashMap<libp2p::PeerId, (Vec<DataCraftCapability>, u64)>>>;
 
 /// Tracks pending DHT requests from IPC commands.
 #[derive(Debug)]
@@ -119,6 +122,15 @@ pub async fn run_daemon(
     {
         error!("Failed to subscribe to node status: {:?}", e);
     }
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .subscribe_topic(datacraft_core::CAPABILITIES_TOPIC)
+    {
+        error!("Failed to subscribe to capabilities topic: {:?}", e);
+    }
+
+    // Peer capabilities tracker
+    let peer_capabilities: PeerCapabilities = Arc::new(Mutex::new(HashMap::new()));
 
     // Start IPC server with enhanced handler
     let ipc_server = IpcServer::new(&socket_path);
