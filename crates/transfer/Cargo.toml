@@ -1,0 +1,17 @@
+[package]
+name = "datacraft-transfer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+datacraft-core = { workspace = true }
+datacraft-store = { workspace = true }
+craftec-erasure = { workspace = true }
+craftec-network = { workspace = true }
+libp2p = { workspace = true }
+libp2p-stream = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

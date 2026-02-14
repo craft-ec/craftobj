@@ -1,0 +1,30 @@
+[package]
+name = "datacraft-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "datacraft-daemon"
+path = "src/main.rs"
+
+[dependencies]
+datacraft-core = { workspace = true }
+datacraft-client = { workspace = true }
+datacraft-store = { workspace = true }
+datacraft-routing = { workspace = true }
+datacraft-transfer = { workspace = true }
+craftec-app = { workspace = true }
+craftec-ipc = { workspace = true }
+craftec-logging = { workspace = true }
+craftec-keystore = { workspace = true }
+craftec-network = { workspace = true }
+libp2p = { workspace = true }
+libp2p-stream = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
