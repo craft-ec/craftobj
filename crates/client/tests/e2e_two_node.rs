@@ -55,7 +55,7 @@ async fn test_two_node_publish_fetch_plaintext() {
     // --- Transfer shards from Node A → Node B via wire protocol ---
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    for chunk_idx in 0..manifest.chunk_count {
+    for chunk_idx in 0..manifest.chunk_count as u32 {
         for shard_idx in 0..total_shards as u8 {
             let (mut client_end, mut server_end) = tokio::io::duplex(65536);
 
@@ -135,12 +135,12 @@ async fn test_two_node_publish_fetch_encrypted() {
     // --- Transfer all shards via wire protocol ---
     let store_a = FsStore::new(&dir_a).unwrap();
     let manifest = store_a.get_manifest(&content_id).unwrap();
-    assert!(manifest.encrypted);
+    // Encryption is now caller-managed, not tracked in manifest
     let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
 
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    for chunk_idx in 0..manifest.chunk_count {
+    for chunk_idx in 0..manifest.chunk_count as u32 {
         for shard_idx in 0..total_shards as u8 {
             let (mut client_end, mut server_end) = tokio::io::duplex(65536);
 
@@ -208,7 +208,7 @@ async fn test_two_node_partial_shards_erasure_recovery() {
     // --- Transfer ONLY data_shards (skip parity) via wire protocol ---
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    for chunk_idx in 0..manifest.chunk_count {
+    for chunk_idx in 0..manifest.chunk_count as u32 {
         // Only transfer the first data_shards shards, skip parity
         for shard_idx in 0..data_shards as u8 {
             let (mut client_end, mut server_end) = tokio::io::duplex(65536);

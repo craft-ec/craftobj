@@ -28,7 +28,7 @@ pub struct PublishResult {
     /// Total size in bytes.
     pub total_size: u64,
     /// Number of chunks.
-    pub chunk_count: u32,
+    pub chunk_count: usize,
 }
 
 /// Content info returned by list().
@@ -36,8 +36,7 @@ pub struct PublishResult {
 pub struct ContentInfo {
     pub content_id: ContentId,
     pub total_size: u64,
-    pub chunk_count: u32,
-    pub encrypted: bool,
+    pub chunk_count: usize,
     pub pinned: bool,
 }
 
@@ -95,8 +94,7 @@ impl DataCraftClient {
 
         // Chunk the content
         let chunks = chunk_data(&content_bytes, config.chunk_size);
-        let chunk_count = chunks.len() as u32;
-        let chunk_sizes: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+        let chunk_count = chunks.len();
 
         info!(
             "Publishing {} ({} bytes, {} chunks, erasure {}/{})",
@@ -123,12 +121,12 @@ impl DataCraftClient {
         // Store manifest
         let manifest = ChunkManifest {
             content_id,
-            total_size,
-            chunk_count,
+            content_hash: content_id.0,
+            k: config.data_shards,
             chunk_size: config.chunk_size,
+            chunk_count,
             erasure_config: config,
-            encrypted: options.encrypted,
-            chunk_sizes,
+            content_size: total_size,
         };
         self.store.put_manifest(&manifest)?;
 
@@ -160,10 +158,16 @@ impl DataCraftClient {
             .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
         let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
 
-        let mut reconstructed = Vec::with_capacity(manifest.total_size as usize);
+        let mut reconstructed = Vec::with_capacity(manifest.content_size as usize);
 
-        for chunk_idx in 0..manifest.chunk_count {
-            let chunk_size = manifest.chunk_sizes[chunk_idx as usize];
+        for chunk_idx in 0..manifest.chunk_count as u32 {
+            // Compute the actual data size for this chunk
+            let chunk_size = if (chunk_idx as usize) < manifest.chunk_count - 1 {
+                manifest.chunk_size
+            } else {
+                // Last chunk: remaining bytes
+                manifest.content_size as usize - (chunk_idx as usize * manifest.chunk_size)
+            };
 
             // Gather available shards
             let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
@@ -189,11 +193,8 @@ impl DataCraftClient {
             ));
         }
 
-        // Decrypt if needed
-        let final_data = if manifest.encrypted {
-            let key = encryption_key.ok_or_else(|| {
-                DataCraftError::EncryptionError("encryption key required".into())
-            })?;
+        // Decrypt if key provided
+        let final_data = if let Some(key) = encryption_key {
             decrypt_content(&reconstructed, key)?
         } else {
             reconstructed
@@ -232,9 +233,8 @@ impl DataCraftClient {
             if let Ok(manifest) = self.store.get_manifest(&cid) {
                 result.push(ContentInfo {
                     content_id: cid,
-                    total_size: manifest.total_size,
+                    total_size: manifest.content_size,
                     chunk_count: manifest.chunk_count,
-                    encrypted: manifest.encrypted,
                     pinned: self.pin_manager.is_pinned(&cid),
                 });
             }
@@ -248,7 +248,7 @@ impl DataCraftClient {
         let mut stored_bytes = 0u64;
         for cid in &content {
             if let Ok(manifest) = self.store.get_manifest(cid) {
-                stored_bytes += manifest.total_size;
+                stored_bytes += manifest.content_size;
             }
         }
         Ok(NodeStatus {

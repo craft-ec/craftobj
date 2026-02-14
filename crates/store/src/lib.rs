@@ -254,14 +254,14 @@ impl GarbageCollector {
         let all_content = store.list_content()?;
         let mut removed = 0;
 
-        // Calculate current usage (rough estimate from manifest total_size)
+        // Calculate current usage (rough estimate from manifest content_size)
         let mut total: u64 = 0;
         let mut candidates: Vec<(ContentId, u64)> = Vec::new();
         for cid in &all_content {
             if let Ok(manifest) = store.get_manifest(cid) {
-                total += manifest.total_size;
+                total += manifest.content_size;
                 if !pin_manager.is_pinned(cid) {
-                    candidates.push((*cid, manifest.total_size));
+                    candidates.push((*cid, manifest.content_size));
                 }
             }
         }
@@ -330,12 +330,12 @@ mod tests {
 
         let manifest = ChunkManifest {
             content_id: cid,
-            total_size: 1000,
-            chunk_count: 1,
+            content_hash: cid.0,
+            k: 4,
             chunk_size: 65536,
+            chunk_count: 1,
             erasure_config: default_erasure_config(),
-            encrypted: false,
-            chunk_sizes: vec![1000],
+            content_size: 1000,
         };
 
         store.put_manifest(&manifest).unwrap();
@@ -343,7 +343,7 @@ mod tests {
 
         let loaded = store.get_manifest(&cid).unwrap();
         assert_eq!(loaded.content_id, cid);
-        assert_eq!(loaded.total_size, 1000);
+        assert_eq!(loaded.content_size, 1000);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -359,12 +359,12 @@ mod tests {
         for cid in [&cid1, &cid2] {
             let manifest = ChunkManifest {
                 content_id: *cid,
-                total_size: 100,
-                chunk_count: 1,
+                content_hash: cid.0,
+                k: 4,
                 chunk_size: 65536,
+                chunk_count: 1,
                 erasure_config: default_erasure_config(),
-                encrypted: false,
-                chunk_sizes: vec![100],
+                content_size: 100,
             };
             store.put_manifest(&manifest).unwrap();
             store.put_shard(cid, 0, 0, b"data").unwrap();
@@ -430,12 +430,12 @@ mod tests {
         for cid in [&cid1, &cid2, &cid3] {
             let manifest = ChunkManifest {
                 content_id: *cid,
-                total_size: 100,
-                chunk_count: 1,
+                content_hash: cid.0,
+                k: 4,
                 chunk_size: 65536,
+                chunk_count: 1,
                 erasure_config: default_erasure_config(),
-                encrypted: false,
-                chunk_sizes: vec![100],
+                content_size: 100,
             };
             store.put_manifest(&manifest).unwrap();
         }

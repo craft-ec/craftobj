@@ -118,18 +118,19 @@ mod tests {
     fn test_parse_manifest_record() {
         use datacraft_core::default_erasure_config;
 
+        let cid = ContentId::from_bytes(b"test");
         let manifest = ChunkManifest {
-            content_id: ContentId::from_bytes(b"test"),
-            total_size: 1024,
-            chunk_count: 1,
+            content_id: cid,
+            content_hash: cid.0,
+            k: 4,
             chunk_size: 65536,
+            chunk_count: 1,
             erasure_config: default_erasure_config(),
-            encrypted: false,
-            chunk_sizes: vec![1024],
+            content_size: 1024,
         };
         let value = serde_json::to_vec(&manifest).unwrap();
         let parsed = parse_manifest_record(&value).unwrap();
         assert_eq!(parsed.content_id, manifest.content_id);
-        assert_eq!(parsed.total_size, 1024);
+        assert_eq!(parsed.content_size, 1024);
     }
 }
