@@ -821,6 +821,27 @@ impl DataCraftHandler {
 
     // -- Content removal IPC handler --
 
+    async fn handle_data_providers(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+        let cid_bytes = hex::decode(cid_hex).map_err(|e| format!("invalid hex: {e}"))?;
+        if cid_bytes.len() != 32 { return Err("CID must be 32 bytes".into()); }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&cid_bytes);
+        let cid = datacraft_core::ContentId(arr);
+
+        let command_tx = self.command_tx.as_ref().ok_or("no command channel")?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        command_tx.send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
+            .map_err(|e| format!("send error: {e}"))?;
+        let providers = rx.await.map_err(|e| format!("recv error: {e}"))??;
+        Ok(serde_json::json!({
+            "cid": cid_hex,
+            "provider_count": providers.len(),
+            "providers": providers.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+        }))
+    }
+
     async fn handle_data_remove(&self, params: Option<Value>) -> Result<Value, String> {
         let params = params.ok_or("missing params")?;
         let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
@@ -1195,6 +1216,7 @@ impl IpcHandler for DataCraftHandler {
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
                 "receipt.storage.list" => self.handle_storage_receipt_list(params).await,
+                "data.providers" => self.handle_data_providers(params).await,
                 "data.remove" => self.handle_data_remove(params).await,
                 "access.grant" => self.handle_access_grant(params).await,
                 "access.revoke" => self.handle_access_revoke(params).await,
