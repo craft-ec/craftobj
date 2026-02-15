@@ -386,12 +386,10 @@ pub const STORAGE_RECEIPT_TOPIC: &str = "datacraft/storage-receipts/1.0.0";
 /// Capabilities a DataCraft node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataCraftCapability {
-    /// Stores and serves content (participates in PDP).
-    Storage,
-    /// Forwards requests, can cache hot content.
-    Relay,
     /// Publishes and fetches content.
     Client,
+    /// Stores and serves content (participates in PDP).
+    Storage,
     /// Settles distributions, aggregates receipts.
     Aggregator,
 }
@@ -399,9 +397,8 @@ pub enum DataCraftCapability {
 impl std::fmt::Display for DataCraftCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Storage => write!(f, "Storage"),
-            Self::Relay => write!(f, "Relay"),
             Self::Client => write!(f, "Client"),
+            Self::Storage => write!(f, "Storage"),
             Self::Aggregator => write!(f, "Aggregator"),
         }
     }
@@ -686,9 +683,8 @@ mod tests {
     #[test]
     fn test_capability_serde_roundtrip() {
         let caps = vec![
-            DataCraftCapability::Storage,
-            DataCraftCapability::Relay,
             DataCraftCapability::Client,
+            DataCraftCapability::Storage,
             DataCraftCapability::Aggregator,
         ];
         let json = serde_json::to_string(&caps).unwrap();
@@ -716,7 +712,7 @@ mod tests {
     fn test_capability_announcement_signable_data() {
         let ann = CapabilityAnnouncement {
             peer_id: vec![1, 2],
-            capabilities: vec![DataCraftCapability::Storage, DataCraftCapability::Relay],
+            capabilities: vec![DataCraftCapability::Storage, DataCraftCapability::Client],
             timestamp: 100,
             signature: vec![],
         };
