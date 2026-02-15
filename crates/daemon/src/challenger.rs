@@ -4,25 +4,28 @@
 //! Manages rotation state, tracks provided CIDs, orchestrates challenge rounds,
 //! and triggers self-healing when needed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use datacraft_core::{ChunkManifest, ContentId, StorageReceipt};
 use datacraft_store::FsStore;
+use ed25519_dalek::SigningKey;
 use libp2p::PeerId;
 use rand::seq::SliceRandom;
 use rand::Rng;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{debug, info, warn};
 
 use crate::commands::DataCraftCommand;
 use crate::health::{
-    self, CidHealth, DutyCycleResult, HealingResult, ProviderInfo, TierInfo,
+    self, DutyCycleResult, ProviderInfo, TierInfo,
 };
 use crate::pdp::{
-    ChallengerRotation, OnlineTimeTracker, PdpChallenge, PdpResponse, ReceiptStore,
-    compute_proof_hash, decode_pdp_message, encode_pdp_message, verify_pdp_response,
+    ChallengerRotation, OnlineTimeTracker, PdpResponse, ReceiptStore,
+    compute_proof_hash, verify_pdp_response,
 };
+use crate::receipt_store::PersistentReceiptStore;
 
 /// How often the challenger checks if any CID needs a challenge round.
 pub const CHALLENGE_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
@@ -54,10 +57,14 @@ pub struct ChallengerManager {
     rotation: ChallengerRotation,
     /// Online time tracker for peers.
     online_tracker: OnlineTimeTracker,
-    /// Receipt store for PDP receipts.
+    /// Receipt store for PDP receipts (in-memory).
     receipt_store: ReceiptStore,
     /// Command sender to the swarm event loop.
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    /// Ed25519 signing key for receipt signing.
+    signing_key: Option<SigningKey>,
+    /// Persistent receipt store (shared with handler).
+    persistent_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
 }
 
 impl ChallengerManager {
@@ -75,7 +82,19 @@ impl ChallengerManager {
             online_tracker: OnlineTimeTracker::new(),
             receipt_store: ReceiptStore::new(),
             command_tx,
+            signing_key: None,
+            persistent_store: None,
         }
+    }
+
+    /// Set the signing key for receipt signing.
+    pub fn set_signing_key(&mut self, key: SigningKey) {
+        self.signing_key = Some(key);
+    }
+
+    /// Set the persistent receipt store.
+    pub fn set_persistent_store(&mut self, store: Arc<Mutex<PersistentReceiptStore>>) {
+        self.persistent_store = Some(store);
     }
 
     /// Register a CID that this node provides.
@@ -311,7 +330,7 @@ impl ChallengerManager {
         }
 
         // 6. Run local duty cycle (assess health, heal if needed)
-        let result = health::run_challenger_duty_local(
+        let mut result = health::run_challenger_duty_local(
             store,
             &manifest,
             &provider_infos,
@@ -332,12 +351,36 @@ impl ChallengerManager {
             }
         }
 
-        // 8. Store receipts
-        for receipt in result.pdp_results.receipts() {
+        // 8. Sign and store receipts
+        let mut signed_receipts: Vec<StorageReceipt> = Vec::new();
+        for mut receipt in result.pdp_results.receipts() {
+            if let Some(ref key) = self.signing_key {
+                datacraft_core::signing::sign_storage_receipt(&mut receipt, key);
+            }
+            signed_receipts.push(receipt.clone());
             self.receipt_store.add_issued(receipt);
         }
-        if let Some(ref cr) = result.challenger_receipt {
+        if let Some(ref mut cr) = result.challenger_receipt {
+            if let Some(ref key) = self.signing_key {
+                datacraft_core::signing::sign_storage_receipt(cr, key);
+            }
+            signed_receipts.push(cr.clone());
             self.receipt_store.add_issued(cr.clone());
+        }
+
+        // Persist to disk
+        if let Some(ref persistent) = self.persistent_store {
+            let mut store = persistent.lock().await;
+            for receipt in &signed_receipts {
+                if let Err(e) = store.add_storage(receipt.clone()) {
+                    warn!("Failed to persist storage receipt: {}", e);
+                }
+            }
+            info!(
+                "Persisted {} storage receipts for {}",
+                signed_receipts.len(),
+                cid
+            );
         }
 
         // Advance rotation
@@ -517,7 +560,7 @@ mod tests {
         }
 
         // No duplicates
-        let unique: HashSet<u32> = chunks.iter().copied().collect();
+        let unique: std::collections::HashSet<u32> = chunks.iter().copied().collect();
         assert_eq!(unique.len(), chunks.len());
     }
 
@@ -608,5 +651,210 @@ mod tests {
             .collect();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0], cid2);
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageReceipt generation, signing, verification, and persistence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_signed_receipt_generation() {
+        use crate::pdp::create_signed_storage_receipt;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let cid = ContentId([42u8; 32]);
+        let receipt = create_signed_storage_receipt(
+            cid,
+            [1u8; 32],
+            key.verifying_key().to_bytes(),
+            3,
+            [9u8; 32],
+            [10u8; 32],
+            &key,
+        );
+
+        assert_eq!(receipt.content_id, cid);
+        assert_eq!(receipt.shard_index, 3);
+        assert_eq!(receipt.signature.len(), 64);
+        assert!(receipt.timestamp > 0);
+    }
+
+    #[test]
+    fn test_signed_receipt_verification() {
+        use crate::pdp::create_signed_storage_receipt;
+        use datacraft_core::signing::verify_storage_receipt;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let pubkey = key.verifying_key();
+        let receipt = create_signed_storage_receipt(
+            ContentId([50u8; 32]),
+            [1u8; 32],
+            pubkey.to_bytes(),
+            0,
+            [5u8; 32],
+            [6u8; 32],
+            &key,
+        );
+
+        assert!(verify_storage_receipt(&receipt, &pubkey));
+    }
+
+    #[test]
+    fn test_signed_receipt_tamper_detection() {
+        use crate::pdp::create_signed_storage_receipt;
+        use datacraft_core::signing::verify_storage_receipt;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let pubkey = key.verifying_key();
+        let mut receipt = create_signed_storage_receipt(
+            ContentId([60u8; 32]),
+            [1u8; 32],
+            pubkey.to_bytes(),
+            0,
+            [7u8; 32],
+            [8u8; 32],
+            &key,
+        );
+
+        // Tamper with shard_index
+        receipt.shard_index = 99;
+        assert!(!verify_storage_receipt(&receipt, &pubkey));
+    }
+
+    #[test]
+    fn test_signed_receipt_wrong_key_fails() {
+        use crate::pdp::create_signed_storage_receipt;
+        use datacraft_core::signing::verify_storage_receipt;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let key1 = SigningKey::generate(&mut OsRng);
+        let key2 = SigningKey::generate(&mut OsRng);
+
+        let receipt = create_signed_storage_receipt(
+            ContentId([70u8; 32]),
+            [1u8; 32],
+            key1.verifying_key().to_bytes(),
+            0,
+            [0u8; 32],
+            [0u8; 32],
+            &key1,
+        );
+
+        assert!(!verify_storage_receipt(&receipt, &key2.verifying_key()));
+    }
+
+    #[test]
+    fn test_receipt_persistence_roundtrip() {
+        use crate::pdp::create_signed_storage_receipt;
+        use crate::receipt_store::PersistentReceiptStore;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        use std::path::PathBuf;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let cid = ContentId([80u8; 32]);
+        let path = std::env::temp_dir().join(format!(
+            "challenger-persist-test-{}.bin",
+            std::process::id()
+        ));
+
+        {
+            let mut store = PersistentReceiptStore::new(path.clone()).unwrap();
+            for shard in 0..5u32 {
+                let receipt = create_signed_storage_receipt(
+                    cid,
+                    [1u8; 32],
+                    key.verifying_key().to_bytes(),
+                    shard,
+                    [shard as u8; 32],
+                    [(shard + 10) as u8; 32],
+                    &key,
+                );
+                assert!(store.add_storage(receipt).unwrap());
+            }
+            assert_eq!(store.storage_receipt_count(), 5);
+        }
+
+        // Reopen and verify persistence
+        {
+            let store = PersistentReceiptStore::new(path.clone()).unwrap();
+            assert_eq!(store.storage_receipt_count(), 5);
+            let receipts = store.all_storage_receipts();
+            for r in receipts {
+                assert_eq!(r.content_id, cid);
+                assert_eq!(r.signature.len(), 64);
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_receipt_dedup_in_persistence() {
+        use crate::pdp::create_signed_storage_receipt;
+        use crate::receipt_store::PersistentReceiptStore;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let path = std::env::temp_dir().join(format!(
+            "challenger-dedup-test-{}.bin",
+            std::process::id()
+        ));
+
+        let mut store = PersistentReceiptStore::new(path.clone()).unwrap();
+
+        let receipt = create_signed_storage_receipt(
+            ContentId([90u8; 32]),
+            [1u8; 32],
+            key.verifying_key().to_bytes(),
+            0,
+            [0u8; 32],
+            [0u8; 32],
+            &key,
+        );
+
+        assert!(store.add_storage(receipt.clone()).unwrap());
+        assert!(!store.add_storage(receipt).unwrap()); // duplicate
+        assert_eq!(store.storage_receipt_count(), 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_challenger_manager_with_signing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pubkey = key.verifying_key().to_bytes();
+        let mut mgr = ChallengerManager::new(PeerId::random(), pubkey, tx);
+        mgr.set_signing_key(key);
+
+        assert!(mgr.signing_key.is_some());
+        assert!(mgr.persistent_store.is_none());
+    }
+
+    #[test]
+    fn test_challenger_manager_with_persistent_store() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let path = std::env::temp_dir().join(format!(
+            "challenger-mgr-store-{}.bin",
+            std::process::id()
+        ));
+        let store = Arc::new(Mutex::new(
+            PersistentReceiptStore::new(path.clone()).unwrap(),
+        ));
+
+        let mut mgr = ChallengerManager::new(PeerId::random(), [0u8; 32], tx);
+        mgr.set_persistent_store(store);
+        assert!(mgr.persistent_store.is_some());
+
+        std::fs::remove_file(&path).ok();
     }
 }

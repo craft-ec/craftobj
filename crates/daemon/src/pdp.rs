@@ -212,7 +212,7 @@ pub fn verify_pdp_response(
     expected == response.proof_hash
 }
 
-/// Create a StorageReceipt for a provider that passed PDP.
+/// Create a StorageReceipt for a provider that passed PDP (unsigned).
 pub fn create_storage_receipt(
     content_id: ContentId,
     storage_node: [u8; 32],
@@ -234,8 +234,37 @@ pub fn create_storage_receipt(
         timestamp,
         nonce,
         proof_hash,
-        signature: vec![], // TODO: sign with challenger's keypair
+        signature: vec![],
     }
+}
+
+/// Create and sign a StorageReceipt for a provider that passed PDP.
+pub fn create_signed_storage_receipt(
+    content_id: ContentId,
+    storage_node: [u8; 32],
+    challenger: [u8; 32],
+    shard_index: u32,
+    nonce: [u8; 32],
+    proof_hash: [u8; 32],
+    signing_key: &ed25519_dalek::SigningKey,
+) -> StorageReceipt {
+    let mut receipt = create_storage_receipt(
+        content_id, storage_node, challenger, shard_index, nonce, proof_hash,
+    );
+    datacraft_core::signing::sign_storage_receipt(&mut receipt, signing_key);
+    receipt
+}
+
+/// Extract a 32-byte public key from a PeerId (best-effort, zero-padded).
+pub fn peer_id_to_local_pubkey(peer_id: &PeerId) -> [u8; 32] {
+    use datacraft_core::signing::peer_id_to_ed25519_pubkey;
+    peer_id_to_ed25519_pubkey(peer_id).unwrap_or_else(|| {
+        let bytes = peer_id.to_bytes();
+        let mut key = [0u8; 32];
+        let len = bytes.len().min(32);
+        key[..len].copy_from_slice(&bytes[..len]);
+        key
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -490,5 +519,39 @@ mod tests {
         assert_eq!(receipt.content_id, cid);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_create_signed_storage_receipt() {
+        use datacraft_core::signing::verify_storage_receipt;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let pubkey = key.verifying_key();
+
+        let receipt = super::create_signed_storage_receipt(
+            ContentId([20u8; 32]),
+            [1u8; 32],
+            pubkey.to_bytes(),
+            7,
+            [3u8; 32],
+            [4u8; 32],
+            &key,
+        );
+
+        assert_eq!(receipt.signature.len(), 64);
+        assert!(verify_storage_receipt(&receipt, &pubkey));
+        assert_eq!(receipt.shard_index, 7);
+    }
+
+    #[test]
+    fn test_peer_id_to_local_pubkey_ed25519() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = kp.public().to_peer_id();
+        let extracted = super::peer_id_to_local_pubkey(&peer_id);
+        // Should be the actual ed25519 public key
+        let expected = kp.public().try_into_ed25519().unwrap().to_bytes();
+        assert_eq!(extracted, expected);
     }
 }

@@ -180,6 +180,23 @@ pub async fn run_daemon(
     // Own capabilities (default: Storage + Client)
     let own_capabilities = vec![DataCraftCapability::Storage, DataCraftCapability::Client];
 
+    // Create challenger manager
+    let local_pubkey = crate::pdp::peer_id_to_local_pubkey(&local_peer_id);
+    let mut challenger_mgr = crate::challenger::ChallengerManager::new(
+        local_peer_id,
+        local_pubkey,
+        command_tx_for_caps.clone(),
+    );
+    if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {
+        let secret_bytes = ed25519_kp.secret();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(
+            secret_bytes.as_ref().try_into().expect("ed25519 secret is 32 bytes"),
+        );
+        challenger_mgr.set_signing_key(signing_key);
+    }
+    challenger_mgr.set_persistent_store(receipt_store.clone());
+    let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
+
     // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
@@ -201,6 +218,9 @@ pub async fn run_daemon(
         }
         _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps) => {
             info!("Capability announcement loop ended");
+        }
+        _ = run_challenger_loop(challenger_mgr, store.clone()) => {
+            info!("Challenger loop ended");
         }
     }
 
@@ -551,6 +571,28 @@ async fn handle_protocol_events(
                     debug!("Responded to DHT request with error for {}", content_id);
                 }
             }
+        }
+    }
+}
+
+/// Periodically run the challenger duty cycle.
+async fn run_challenger_loop(
+    challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
+    store: Arc<Mutex<datacraft_store::FsStore>>,
+) {
+    use std::time::Duration;
+
+    // Initial delay
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let mut interval = tokio::time::interval(crate::challenger::CHALLENGE_INTERVAL);
+    loop {
+        interval.tick().await;
+        let store_guard = store.lock().await;
+        let mut mgr = challenger.lock().await;
+        let rounds = mgr.periodic_check(&store_guard).await;
+        if rounds > 0 {
+            info!("Challenger completed {} rounds", rounds);
         }
     }
 }
