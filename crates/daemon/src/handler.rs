@@ -618,6 +618,7 @@ impl DataCraftHandler {
     }
 
     /// Fetch missing shards from remote peers using P2P transfer.
+    /// Providers are ranked by peer score — best peers tried first.
     async fn fetch_missing_shards_from_peers(
         &self,
         content_id: &datacraft_core::ContentId,
@@ -626,6 +627,14 @@ impl DataCraftHandler {
         command_tx: &tokio::sync::mpsc::UnboundedSender<DataCraftCommand>,
     ) -> Result<(), String> {
         debug!("Fetching missing shards for {} from {} providers", content_id, providers.len());
+
+        // Rank providers by peer score — try reliable peers first
+        let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
+            let s = scorer.lock().await;
+            s.rank_peers(providers)
+        } else {
+            providers.to_vec()
+        };
         
         let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
         let client = self.client.lock().await;
@@ -642,11 +651,12 @@ impl DataCraftHandler {
                 
                 debug!("Trying to fetch missing shard {}/{}/{}", content_id, chunk_idx, shard_idx);
                 
-                // Try to fetch this shard from any provider
+                // Try to fetch this shard from ranked providers (best score first)
                 let mut fetched = false;
-                for &provider in providers {
+                for &provider in &ranked_providers {
                     debug!("Requesting shard {}/{}/{} from provider {}", content_id, chunk_idx, shard_idx, provider);
                     
+                    let request_start = std::time::Instant::now();
                     let (reply_tx, reply_rx) = oneshot::channel();
                     let command = DataCraftCommand::RequestShard {
                         peer_id: provider,
@@ -663,7 +673,13 @@ impl DataCraftHandler {
                     
                     match reply_rx.await {
                         Ok(Ok(shard_data)) => {
-                            debug!("Successfully received shard {}/{}/{} from {}", content_id, chunk_idx, shard_idx, provider);
+                            let latency = request_start.elapsed();
+                            debug!("Successfully received shard {}/{}/{} from {} in {:?}", content_id, chunk_idx, shard_idx, provider, latency);
+                            
+                            // Record successful interaction
+                            if let Some(ref scorer) = self.peer_scorer {
+                                scorer.lock().await.record_success(&provider, latency);
+                            }
                             
                             // Store the shard locally
                             if let Err(e) = store.put_shard(content_id, chunk_idx_u32, shard_idx as u8, &shard_data) {
@@ -676,9 +692,17 @@ impl DataCraftHandler {
                         }
                         Ok(Err(e)) => {
                             debug!("Failed to get shard {}/{}/{} from {}: {}", content_id, chunk_idx, shard_idx, provider, e);
+                            // Record failure
+                            if let Some(ref scorer) = self.peer_scorer {
+                                scorer.lock().await.record_failure(&provider);
+                            }
                         }
                         Err(e) => {
                             debug!("Channel error when requesting shard {}/{}/{}: {}", content_id, chunk_idx, shard_idx, e);
+                            // Channel error = timeout-like (peer didn't respond)
+                            if let Some(ref scorer) = self.peer_scorer {
+                                scorer.lock().await.record_timeout(&provider);
+                            }
                         }
                     }
                 }

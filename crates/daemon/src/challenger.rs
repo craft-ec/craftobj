@@ -25,6 +25,7 @@ use crate::pdp::{
     ChallengerRotation, OnlineTimeTracker, PdpResponse, ReceiptStore,
     compute_proof_hash, verify_pdp_response,
 };
+use crate::peer_scorer::PeerScorer;
 use crate::receipt_store::PersistentReceiptStore;
 
 /// How often the challenger checks if any CID needs a challenge round.
@@ -65,6 +66,8 @@ pub struct ChallengerManager {
     signing_key: Option<SigningKey>,
     /// Persistent receipt store (shared with handler).
     persistent_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
+    /// Shared peer scorer — PDP results feed into peer reliability scores.
+    peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
 }
 
 impl ChallengerManager {
@@ -84,7 +87,13 @@ impl ChallengerManager {
             command_tx,
             signing_key: None,
             persistent_store: None,
+            peer_scorer: None,
         }
+    }
+
+    /// Set the shared peer scorer for recording PDP challenge results.
+    pub fn set_peer_scorer(&mut self, scorer: Arc<Mutex<PeerScorer>>) {
+        self.peer_scorer = Some(scorer);
     }
 
     /// Set the signing key for receipt signing.
@@ -272,11 +281,13 @@ impl ChallengerManager {
 
                 let nonce: [u8; 32] = rand::thread_rng().gen();
 
+                let challenge_start = Instant::now();
                 match self
                     .send_pdp_challenge(*peer, cid, chunk_idx, shard_index, nonce)
                     .await
                 {
                     Ok(response) => {
+                        let latency = challenge_start.elapsed();
                         // Verify: we need the shard data to check
                         let verified = if let Some(local_data) =
                             store.get_shard(&cid, chunk_idx, shard_index as u8).ok()
@@ -295,6 +306,16 @@ impl ChallengerManager {
                             false
                         };
 
+                        // Record PDP result in peer scorer
+                        if let Some(ref scorer) = self.peer_scorer {
+                            let mut s = scorer.lock().await;
+                            if verified {
+                                s.record_success(peer, latency);
+                            } else {
+                                s.record_failure(peer);
+                            }
+                        }
+
                         pdp_responses.push((
                             *peer,
                             shard_index,
@@ -303,6 +324,10 @@ impl ChallengerManager {
                     }
                     Err(e) => {
                         debug!("PDP challenge to {} failed: {}", peer, e);
+                        // Record timeout in peer scorer (challenge didn't complete)
+                        if let Some(ref scorer) = self.peer_scorer {
+                            scorer.lock().await.record_timeout(peer);
+                        }
                         pdp_responses.push((*peer, shard_index, None));
                     }
                 }

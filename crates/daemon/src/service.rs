@@ -300,6 +300,7 @@ pub async fn run_daemon_with_config(
         challenger_mgr.set_signing_key(signing_key);
     }
     challenger_mgr.set_persistent_store(receipt_store.clone());
+    challenger_mgr.set_peer_scorer(peer_scorer.clone());
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
     // Load or generate API key for WebSocket authentication
@@ -402,6 +403,11 @@ async fn drive_swarm(
                         handle_mdns_event(swarm, &event);
                         // Try to extract gossipsub capability announcements before passing through
                         handle_gossipsub_capability(&event, &peer_scorer).await;
+                        // Evict stale peers after processing announcements
+                        {
+                            let mut scorer = peer_scorer.lock().await;
+                            scorer.evict_stale(std::time::Duration::from_secs(900)); // 15min TTL (3x announce interval)
+                        }
                         handle_gossipsub_removal(&event, &removal_cache).await;
                         handle_gossipsub_storage_receipt(&event).await;
                         // Pass events to our protocol handler
