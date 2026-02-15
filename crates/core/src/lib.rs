@@ -209,6 +209,12 @@ pub const MANIFEST_DHT_PREFIX: &str = "/datacraft/manifest/";
 /// DHT key prefix for peer pubkey → PeerId records.
 pub const PEERS_DHT_PREFIX: &str = "/datacraft/peers/";
 
+/// DHT key prefix for access lists (per CID).
+pub const ACCESS_DHT_PREFIX: &str = "/datacraft/access/";
+
+/// DHT key prefix for re-encryption keys (per CID + recipient DID).
+pub const REKEY_DHT_PREFIX: &str = "/datacraft/rekey/";
+
 /// Gossipsub topic for node status heartbeats.
 pub const NODE_STATUS_TOPIC: &str = "datacraft/node-status/1.0.0";
 

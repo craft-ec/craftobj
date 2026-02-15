@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use datacraft_core::{
     ChunkManifest, ContentId, DataCraftError, Result,
-    MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX,
+    MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,
+    access::AccessList,
+    pre::ReKeyEntry,
 };
 use craftec_network::CraftBehaviour;
 use libp2p::{kad, PeerId};
@@ -22,6 +24,9 @@ pub const PROVIDER_RECORD_TTL: Duration = Duration::from_secs(600);
 /// TTL for manifest records (30 minutes).
 pub const MANIFEST_RECORD_TTL: Duration = Duration::from_secs(1800);
 
+/// TTL for access metadata records (1 hour).
+pub const ACCESS_RECORD_TTL: Duration = Duration::from_secs(3600);
+
 /// Build DHT key for content providers.
 pub fn providers_dht_key(content_id: &ContentId) -> Vec<u8> {
     format!("{}{}", PROVIDERS_DHT_PREFIX, content_id.to_hex()).into_bytes()
@@ -30,6 +35,16 @@ pub fn providers_dht_key(content_id: &ContentId) -> Vec<u8> {
 /// Build DHT key for a content manifest.
 pub fn manifest_dht_key(content_id: &ContentId) -> Vec<u8> {
     format!("{}{}", MANIFEST_DHT_PREFIX, content_id.to_hex()).into_bytes()
+}
+
+/// Build DHT key for an access list.
+pub fn access_dht_key(content_id: &ContentId) -> Vec<u8> {
+    format!("{}{}", ACCESS_DHT_PREFIX, content_id.to_hex()).into_bytes()
+}
+
+/// Build DHT key for a re-encryption key entry.
+pub fn rekey_dht_key(content_id: &ContentId, recipient_did: &[u8; 32]) -> Vec<u8> {
+    format!("{}{}/{}", REKEY_DHT_PREFIX, content_id.to_hex(), hex::encode(recipient_did)).into_bytes()
 }
 
 /// Content router — wraps CraftBehaviour's generic DHT methods
@@ -85,12 +100,115 @@ impl ContentRouter {
         debug!("Fetching manifest for {}", content_id);
         behaviour.get_record(&key)
     }
+
+    /// Publish an access list to the DHT.
+    pub fn put_access_list(
+        behaviour: &mut CraftBehaviour,
+        access_list: &AccessList,
+        local_peer_id: &libp2p::PeerId,
+    ) -> Result<kad::QueryId> {
+        let key = access_dht_key(&access_list.content_id);
+        let value = bincode::serialize(access_list)
+            .map_err(|e| DataCraftError::EncryptionError(format!("serialize access list: {e}")))?;
+        debug!(
+            "Publishing access list for {} ({} bytes, {} entries)",
+            access_list.content_id,
+            value.len(),
+            access_list.entries.len(),
+        );
+        behaviour
+            .put_record(&key, value, local_peer_id, Some(ACCESS_RECORD_TTL))
+            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+    }
+
+    /// Fetch an access list from the DHT.
+    pub fn get_access_list(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+    ) -> kad::QueryId {
+        let key = access_dht_key(content_id);
+        debug!("Fetching access list for {}", content_id);
+        behaviour.get_record(&key)
+    }
+
+    /// Publish a re-encryption key entry to the DHT.
+    pub fn put_re_key(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+        entry: &ReKeyEntry,
+        local_peer_id: &libp2p::PeerId,
+    ) -> Result<kad::QueryId> {
+        let key = rekey_dht_key(content_id, &entry.recipient_did);
+        let value = bincode::serialize(entry)
+            .map_err(|e| DataCraftError::EncryptionError(format!("serialize re-key: {e}")))?;
+        debug!(
+            "Publishing re-key for {} → {} ({} bytes)",
+            content_id,
+            hex::encode(entry.recipient_did),
+            value.len(),
+        );
+        behaviour
+            .put_record(&key, value, local_peer_id, Some(ACCESS_RECORD_TTL))
+            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+    }
+
+    /// Fetch a re-encryption key entry from the DHT.
+    pub fn get_re_key(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+        recipient_did: &[u8; 32],
+    ) -> kad::QueryId {
+        let key = rekey_dht_key(content_id, recipient_did);
+        debug!(
+            "Fetching re-key for {} → {}",
+            content_id,
+            hex::encode(recipient_did),
+        );
+        behaviour.get_record(&key)
+    }
+
+    /// Remove a re-encryption key entry from the DHT.
+    ///
+    /// Note: Kademlia doesn't natively support record removal. We overwrite
+    /// the record with an empty value to effectively "tombstone" it.
+    pub fn remove_re_key(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+        recipient_did: &[u8; 32],
+        local_peer_id: &libp2p::PeerId,
+    ) -> Result<kad::QueryId> {
+        let key = rekey_dht_key(content_id, recipient_did);
+        debug!(
+            "Removing re-key for {} → {}",
+            content_id,
+            hex::encode(recipient_did),
+        );
+        // Overwrite with empty value (tombstone)
+        behaviour
+            .put_record(&key, vec![], local_peer_id, Some(Duration::from_secs(1)))
+            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+    }
 }
 
 /// Parse a manifest from a DHT record value.
 pub fn parse_manifest_record(value: &[u8]) -> Result<ChunkManifest> {
     serde_json::from_slice(value)
         .map_err(|e| DataCraftError::ManifestError(e.to_string()))
+}
+
+/// Parse an access list from a DHT record value.
+pub fn parse_access_list_record(value: &[u8]) -> Result<AccessList> {
+    bincode::deserialize(value)
+        .map_err(|e| DataCraftError::EncryptionError(format!("deserialize access list: {e}")))
+}
+
+/// Parse a re-key entry from a DHT record value.
+pub fn parse_rekey_record(value: &[u8]) -> Result<ReKeyEntry> {
+    if value.is_empty() {
+        return Err(DataCraftError::EncryptionError("re-key record is tombstoned".into()));
+    }
+    bincode::deserialize(value)
+        .map_err(|e| DataCraftError::EncryptionError(format!("deserialize re-key: {e}")))
 }
 
 #[cfg(test)]
@@ -112,6 +230,72 @@ mod tests {
         let key = manifest_dht_key(&cid);
         let key_str = String::from_utf8(key).unwrap();
         assert!(key_str.starts_with("/datacraft/manifest/"));
+    }
+
+    #[test]
+    fn test_access_dht_key() {
+        let cid = ContentId::from_bytes(b"test");
+        let key = access_dht_key(&cid);
+        let key_str = String::from_utf8(key).unwrap();
+        assert!(key_str.starts_with("/datacraft/access/"));
+        assert_eq!(key_str.len(), "/datacraft/access/".len() + 64);
+    }
+
+    #[test]
+    fn test_rekey_dht_key() {
+        let cid = ContentId::from_bytes(b"test");
+        let recipient = [0xABu8; 32];
+        let key = rekey_dht_key(&cid, &recipient);
+        let key_str = String::from_utf8(key).unwrap();
+        assert!(key_str.starts_with("/datacraft/rekey/"));
+        // Should contain cid hex + "/" + recipient hex
+        assert!(key_str.contains("/"));
+        let parts: Vec<&str> = key_str.strip_prefix("/datacraft/rekey/").unwrap().split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 64); // CID hex
+        assert_eq!(parts[1].len(), 64); // recipient DID hex
+    }
+
+    #[test]
+    fn test_parse_access_list_record() {
+        use datacraft_core::access::create_access_list;
+        use ed25519_dalek::SigningKey;
+
+        let creator = SigningKey::generate(&mut rand::thread_rng());
+        let content_id = ContentId::from_bytes(b"access test");
+        let content_key = b"0123456789abcdef0123456789abcdef";
+
+        let list = create_access_list(&content_id, &creator, content_key, vec![]).unwrap();
+        let bytes = bincode::serialize(&list).unwrap();
+        let parsed = parse_access_list_record(&bytes).unwrap();
+        assert_eq!(parsed.content_id, list.content_id);
+        assert_eq!(parsed.creator_did, list.creator_did);
+        parsed.verify().unwrap();
+    }
+
+    #[test]
+    fn test_parse_rekey_record() {
+        use datacraft_core::pre::{generate_re_key, ReKeyEntry};
+        use ed25519_dalek::SigningKey;
+
+        let creator = SigningKey::generate(&mut rand::thread_rng());
+        let recipient = SigningKey::generate(&mut rand::thread_rng());
+        let re_key = generate_re_key(&creator, &recipient.verifying_key()).unwrap();
+
+        let entry = ReKeyEntry {
+            recipient_did: recipient.verifying_key().to_bytes(),
+            re_key,
+        };
+        let bytes = bincode::serialize(&entry).unwrap();
+        let parsed = parse_rekey_record(&bytes).unwrap();
+        assert_eq!(parsed.recipient_did, entry.recipient_did);
+        assert_eq!(parsed.re_key.transform_key, entry.re_key.transform_key);
+    }
+
+    #[test]
+    fn test_parse_rekey_record_tombstone() {
+        let result = parse_rekey_record(&[]);
+        assert!(result.is_err());
     }
 
     #[test]

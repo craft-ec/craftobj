@@ -698,10 +698,13 @@ dependencies = [
 name = "datacraft-routing"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "craftec-network",
  "datacraft-core",
+ "ed25519-dalek",
  "hex",
  "libp2p",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
