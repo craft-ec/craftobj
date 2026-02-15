@@ -13,7 +13,8 @@ use tracing::{debug, info, warn};
 use crate::commands::DataCraftCommand;
 use crate::content_tracker::ContentTracker;
 
-/// Default maintenance interval: 10 minutes.
+/// Default maintenance interval in seconds (10 minutes).
+/// Prefer using `DaemonConfig::reannounce_interval_secs` instead.
 pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
 /// Run the content maintenance loop.

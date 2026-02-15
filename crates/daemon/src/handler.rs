@@ -12,10 +12,11 @@ use datacraft_client::DataCraftClient;
 use datacraft_core::PublishOptions;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::channel_store::ChannelStore;
 use crate::commands::DataCraftCommand;
+use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
 use crate::protocol::DataCraftProtocol;
 use crate::receipt_store::PersistentReceiptStore;
@@ -38,6 +39,9 @@ pub struct DataCraftHandler {
     channel_store: Option<Arc<Mutex<ChannelStore>>>,
     settlement_client: Option<Arc<Mutex<SolanaClient>>>,
     content_tracker: Option<Arc<Mutex<ContentTracker>>>,
+    own_capabilities: Vec<DataCraftCapability>,
+    daemon_config: Option<Arc<Mutex<DaemonConfig>>>,
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl DataCraftHandler {
@@ -58,7 +62,16 @@ impl DataCraftHandler {
             channel_store: Some(channel_store),
             settlement_client: None,
             content_tracker: None,
+            own_capabilities: Vec::new(),
+            daemon_config: None,
+            data_dir: None,
         }
+    }
+
+    /// Set the daemon config for get/set-config IPC commands.
+    pub fn set_daemon_config(&mut self, config: Arc<Mutex<DaemonConfig>>, data_dir: std::path::PathBuf) {
+        self.daemon_config = Some(config);
+        self.data_dir = Some(data_dir);
     }
 
     /// Set the settlement client for on-chain operations.
@@ -69,6 +82,11 @@ impl DataCraftHandler {
     /// Set the content tracker.
     pub fn set_content_tracker(&mut self, tracker: Arc<Mutex<ContentTracker>>) {
         self.content_tracker = Some(tracker);
+    }
+
+    /// Set the node's own capabilities (for reporting via `node.capabilities` RPC).
+    pub fn set_own_capabilities(&mut self, caps: Vec<DataCraftCapability>) {
+        self.own_capabilities = caps;
     }
 
     /// Create handler without protocol (for testing).
@@ -82,6 +100,9 @@ impl DataCraftHandler {
             channel_store: None,
             settlement_client: None,
             content_tracker: None,
+            own_capabilities: Vec::new(),
+            daemon_config: None,
+            data_dir: None,
         }
     }
 
@@ -106,18 +127,23 @@ impl DataCraftHandler {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let mut client = self.client.lock().await;
-        let result = client
-            .publish(&PathBuf::from(path), &options)
-            .map_err(|e| e.to_string())?;
-        
-        // Get the manifest for DHT announcement
-        let manifest = client
-            .store()
-            .get_manifest(&result.content_id)
-            .map_err(|e| format!("Failed to get manifest: {}", e))?;
-        
-        drop(client); // Release the lock
+        // Run the blocking publish work (fs::read + erasure encode + shard storage)
+        // on a dedicated thread to avoid freezing the tokio runtime / WebSocket.
+        let client = self.client.clone();
+        let path_buf = PathBuf::from(path);
+        let (result, manifest) = tokio::task::spawn_blocking(move || {
+            let mut client = client.blocking_lock();
+            let result = client
+                .publish(&path_buf, &options)
+                .map_err(|e| e.to_string())?;
+            let manifest = client
+                .store()
+                .get_manifest(&result.content_id)
+                .map_err(|e| format!("Failed to get manifest: {}", e))?;
+            Ok::<_, String>((result, manifest))
+        })
+        .await
+        .map_err(|e| format!("publish task panicked: {}", e))??;
 
         // Track in content tracker
         if let Some(ref tracker) = self.content_tracker {
@@ -255,12 +281,18 @@ impl DataCraftHandler {
             }
         }
 
-        // Fall back to local reconstruction
+        // Fall back to local reconstruction (blocking I/O — run off the runtime)
         debug!("Using local reconstruction for {}", cid);
-        let client = self.client.lock().await;
-        client
-            .reconstruct(&cid, &output, key.as_deref())
-            .map_err(|e| e.to_string())?;
+        let client = self.client.clone();
+        let output_clone = output.clone();
+        tokio::task::spawn_blocking(move || {
+            let client = client.blocking_lock();
+            client
+                .reconstruct(&cid, &output_clone, key.as_deref())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("reconstruct task panicked: {}", e))??;
 
         Ok(serde_json::json!({
             "path": output.to_string_lossy(),
@@ -425,6 +457,11 @@ impl DataCraftHandler {
             "offset": offset,
             "limit": limit,
         }))
+    }
+
+    async fn handle_node_capabilities(&self) -> Result<Value, String> {
+        let cap_strings: Vec<String> = self.own_capabilities.iter().map(|c| c.to_string()).collect();
+        Ok(serde_json::json!({ "capabilities": cap_strings }))
     }
 
     async fn handle_peers(&self) -> Result<Value, String> {
@@ -1235,6 +1272,25 @@ impl DataCraftHandler {
 
         Ok(serde_json::json!({ "channels": items }))
     }
+
+    async fn handle_get_config(&self) -> Result<Value, String> {
+        let config = self.daemon_config.as_ref().ok_or("daemon config not available")?;
+        let config = config.lock().await;
+        serde_json::to_value(&*config).map_err(|e| e.to_string())
+    }
+
+    async fn handle_set_config(&self, params: Option<Value>) -> Result<Value, String> {
+        let partial = params.ok_or("missing params")?;
+        let config_arc = self.daemon_config.as_ref().ok_or("daemon config not available")?;
+        let data_dir = self.data_dir.as_ref().ok_or("data dir not available")?;
+
+        let mut config = config_arc.lock().await;
+        config.merge(&partial);
+        config.save(data_dir).map_err(|e| e.to_string())?;
+
+        info!("Config updated and saved");
+        serde_json::to_value(&*config).map_err(|e| e.to_string())
+    }
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
@@ -1264,6 +1320,7 @@ impl IpcHandler for DataCraftHandler {
                 "list" => self.handle_list().await,
                 "status" => self.handle_status().await,
                 "peers" => self.handle_peers().await,
+                "node.capabilities" => self.handle_node_capabilities().await,
                 "extend" => self.handle_extend(params).await,
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
@@ -1283,6 +1340,8 @@ impl IpcHandler for DataCraftHandler {
                 "settlement.claim" => self.handle_settlement_claim(params).await,
                 "settlement.open_channel" => self.handle_settlement_open_channel(params).await,
                 "settlement.close_channel" => self.handle_settlement_close_channel(params).await,
+                "get-config" => self.handle_get_config().await,
+                "set-config" => self.handle_set_config(params).await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })

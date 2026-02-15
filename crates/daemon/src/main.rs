@@ -14,13 +14,14 @@ use craftec_network::NetworkConfig;
 use libp2p::identity::Keypair;
 use tracing::info;
 
-fn parse_args() -> (String, std::path::PathBuf, String, String, u16) {
+fn parse_args() -> (String, std::path::PathBuf, String, String, u16, Option<std::path::PathBuf>) {
     let args: Vec<String> = std::env::args().collect();
     let mut listen = String::new();
     let mut data_dir: Option<std::path::PathBuf> = None;
     let mut socket: Option<String> = None;
     let mut log_level = "info".to_string();
     let mut ws_port: u16 = 9091;
+    let mut config_path: Option<std::path::PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -45,6 +46,10 @@ fn parse_args() -> (String, std::path::PathBuf, String, String, u16) {
                 i += 1;
                 if i < args.len() { ws_port = args[i].parse().unwrap_or(9091); }
             }
+            "--config" => {
+                i += 1;
+                if i < args.len() { config_path = Some(std::path::PathBuf::from(&args[i])); }
+            }
             "--help" | "-h" => {
                 eprintln!("DataCraft Daemon");
                 eprintln!();
@@ -56,6 +61,7 @@ fn parse_args() -> (String, std::path::PathBuf, String, String, u16) {
                 eprintln!("  --socket <PATH>      IPC socket path (default: /tmp/datacraft.sock)");
                 eprintln!("  --log-level <LEVEL>  Log level (default: info)");
                 eprintln!("  --ws-port <PORT>     WebSocket server port (default: 9091, 0 to disable)");
+                eprintln!("  --config <PATH>      Config file path (default: <data-dir>/config.json)");
                 std::process::exit(0);
             }
             other => {
@@ -69,12 +75,12 @@ fn parse_args() -> (String, std::path::PathBuf, String, String, u16) {
     let data_dir = data_dir.unwrap_or_else(service::default_data_dir);
     let socket = socket.unwrap_or_else(service::default_socket_path);
 
-    (listen, data_dir, socket, log_level, ws_port)
+    (listen, data_dir, socket, log_level, ws_port, config_path)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (listen, data_dir, socket_path, log_level, ws_port) = parse_args();
+    let (listen, data_dir, socket_path, log_level, ws_port, config_path) = parse_args();
 
     // Initialize logging
     let level = match log_level.as_str() {
@@ -117,5 +123,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("DataCraft daemon starting with peer ID {}", peer_id);
 
-    service::run_daemon(keypair, data_dir, socket_path, network_config, ws_port).await
+    service::run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, config_path).await
 }

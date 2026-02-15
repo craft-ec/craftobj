@@ -8,6 +8,7 @@
 pub mod api_key;
 pub mod challenger;
 pub mod channel_store;
+pub mod config;
 pub mod content_tracker;
 
 pub mod commands;

@@ -93,6 +93,29 @@ pub async fn run_daemon(
     network_config: NetworkConfig,
     ws_port: u16,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None).await
+}
+
+/// Run the DataCraft daemon with an optional config file path override.
+pub async fn run_daemon_with_config(
+    keypair: Keypair,
+    data_dir: std::path::PathBuf,
+    socket_path: String,
+    network_config: NetworkConfig,
+    ws_port: u16,
+    config_path: Option<std::path::PathBuf>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Load daemon config
+    let daemon_config = match config_path {
+        Some(ref path) => crate::config::DaemonConfig::load_from(path),
+        None => crate::config::DaemonConfig::load(&data_dir),
+    };
+    info!("Daemon config: capability_announce={}s, reannounce_interval={}s, reannounce_threshold={}s",
+        daemon_config.capability_announce_interval_secs,
+        daemon_config.reannounce_interval_secs,
+        daemon_config.reannounce_threshold_secs,
+    );
+
     // Build client and shared store
     let client = DataCraftClient::new(&data_dir)?;
     let client = Arc::new(Mutex::new(client));
@@ -211,15 +234,11 @@ pub async fn run_daemon(
 
     // Content lifecycle tracker
     let content_tracker = Arc::new(Mutex::new(
-        crate::content_tracker::ContentTracker::new(&data_dir),
+        crate::content_tracker::ContentTracker::with_threshold(
+            &data_dir,
+            daemon_config.reannounce_threshold_secs,
+        ),
     ));
-
-    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store);
-    handler.set_settlement_client(settlement_client);
-    handler.set_content_tracker(content_tracker.clone());
-    let handler = Arc::new(handler);
-
-    info!("Starting IPC server on {}", socket_path);
 
     // Own capabilities — read from CRAFTEC_CAPABILITIES env (comma-separated)
     // e.g., CRAFTEC_CAPABILITIES=storage,client,aggregator
@@ -242,6 +261,16 @@ pub async fn run_daemon(
         }
         Err(_) => vec![DataCraftCapability::Storage, DataCraftCapability::Client],
     };
+
+    let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
+    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store);
+    handler.set_settlement_client(settlement_client);
+    handler.set_content_tracker(content_tracker.clone());
+    handler.set_own_capabilities(own_capabilities.clone());
+    handler.set_daemon_config(daemon_config_shared, data_dir.clone());
+    let handler = Arc::new(handler);
+
+    info!("Starting IPC server on {}", socket_path);
 
     // Create challenger manager
     let local_pubkey = crate::pdp::peer_id_to_local_pubkey(&local_peer_id);
@@ -300,7 +329,7 @@ pub async fn run_daemon(
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone()) => {
             info!("Protocol events handler ended");
         }
-        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps) => {
+        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs) => {
             info!("Capability announcement loop ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone()) => {
@@ -310,7 +339,7 @@ pub async fn run_daemon(
             content_tracker,
             command_tx_for_maintenance,
             client.clone(),
-            crate::reannounce::DEFAULT_INTERVAL_SECS,
+            daemon_config.reannounce_interval_secs,
         ) => {
             info!("Content maintenance loop ended");
         }
@@ -699,13 +728,14 @@ async fn announce_capabilities_periodically(
     _local_peer_id: &libp2p::PeerId,
     capabilities: Vec<DataCraftCapability>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    interval_secs: u64,
 ) {
     use std::time::Duration;
 
     // Initial delay before first announcement
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
         debug!("Publishing capability announcement");

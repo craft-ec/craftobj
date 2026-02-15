@@ -10,8 +10,8 @@ use datacraft_core::{ChunkManifest, ContentId};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-/// Re-announcement threshold: content announced more than 20 minutes ago needs re-announcement.
-const REANNOUNCE_THRESHOLD_SECS: u64 = 20 * 60;
+/// Default re-announcement threshold in seconds (20 minutes).
+pub const DEFAULT_REANNOUNCE_THRESHOLD_SECS: u64 = 1200;
 
 /// Lifecycle stage of content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,15 +62,21 @@ pub struct ContentState {
 pub struct ContentTracker {
     states: HashMap<ContentId, ContentState>,
     path: PathBuf,
+    reannounce_threshold_secs: u64,
 }
 
 impl ContentTracker {
     /// Create a new tracker, loading persisted state from disk.
     pub fn new(data_dir: &std::path::Path) -> Self {
+        Self::with_threshold(data_dir, DEFAULT_REANNOUNCE_THRESHOLD_SECS)
+    }
+
+    /// Create a new tracker with a custom reannounce threshold.
+    pub fn with_threshold(data_dir: &std::path::Path, reannounce_threshold_secs: u64) -> Self {
         let path = data_dir.join("content_tracker.json");
         let states = Self::load_from(&path).unwrap_or_default();
         debug!("ContentTracker loaded {} entries from {:?}", states.len(), path);
-        Self { states, path }
+        Self { states, path, reannounce_threshold_secs }
     }
 
     /// Track newly published content (initial stage = Chunked).
@@ -168,7 +174,7 @@ impl ContentTracker {
             .filter(|s| {
                 s.stage == ContentStage::Chunked
                     || match s.last_announced {
-                        Some(ts) => now.saturating_sub(ts) > REANNOUNCE_THRESHOLD_SECS,
+                        Some(ts) => now.saturating_sub(ts) > self.reannounce_threshold_secs,
                         None => true,
                     }
             })
