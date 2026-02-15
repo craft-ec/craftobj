@@ -368,7 +368,7 @@ impl ChallengerManager {
             self.receipt_store.add_issued(cr.clone());
         }
 
-        // Persist to disk
+        // Persist to disk and broadcast via gossipsub
         if let Some(ref persistent) = self.persistent_store {
             let mut store = persistent.lock().await;
             for receipt in &signed_receipts {
@@ -381,6 +381,15 @@ impl ChallengerManager {
                 signed_receipts.len(),
                 cid
             );
+        }
+
+        // Broadcast receipts via gossipsub for aggregator collection
+        for receipt in &signed_receipts {
+            if let Ok(data) = bincode::serialize(receipt) {
+                let _ = self.command_tx.send(
+                    DataCraftCommand::BroadcastStorageReceipt { receipt_data: data }
+                );
+            }
         }
 
         // Advance rotation

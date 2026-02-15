@@ -146,6 +146,12 @@ pub async fn run_daemon(
     {
         error!("Failed to subscribe to removal topic: {:?}", e);
     }
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .subscribe_topic(datacraft_core::STORAGE_RECEIPT_TOPIC)
+    {
+        error!("Failed to subscribe to storage receipt topic: {:?}", e);
+    }
 
     // Peer capabilities tracker
     let peer_capabilities: PeerCapabilities = Arc::new(Mutex::new(HashMap::new()));
@@ -307,6 +313,7 @@ async fn drive_swarm(
                         // Try to extract gossipsub capability announcements before passing through
                         handle_gossipsub_capability(&event, &peer_capabilities).await;
                         handle_gossipsub_removal(&event, &removal_cache).await;
+                        handle_gossipsub_storage_receipt(&event).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -499,6 +506,14 @@ async fn handle_command(
             let _ = reply_tx.send(dht_result);
         }
 
+        DataCraftCommand::BroadcastStorageReceipt { receipt_data } => {
+            debug!("Broadcasting StorageReceipt via gossipsub ({} bytes)", receipt_data.len());
+            if let Err(e) = swarm.behaviour_mut()
+                .publish_to_topic(datacraft_core::STORAGE_RECEIPT_TOPIC, receipt_data) {
+                warn!("Failed to broadcast StorageReceipt via gossipsub: {:?}", e);
+            }
+        }
+
         DataCraftCommand::CheckRemoval { content_id, reply_tx } => {
             debug!("Handling check removal command for {}", content_id);
             // For now, just start a DHT query. Full async response would need pending request tracking.
@@ -581,6 +596,36 @@ async fn handle_gossipsub_removal(
                 }
                 Err(e) => {
                     debug!("Failed to parse removal notice: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Handle gossipsub StorageReceipt messages (for aggregator collection).
+async fn handle_gossipsub_storage_receipt(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+) {
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    use libp2p::gossipsub;
+
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        message, ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::STORAGE_RECEIPT_TOPIC {
+            match bincode::deserialize::<datacraft_core::StorageReceipt>(&message.data) {
+                Ok(receipt) => {
+                    debug!(
+                        "Received StorageReceipt via gossipsub: content_id={}, storage_node={}",
+                        receipt.content_id,
+                        hex::encode(receipt.storage_node),
+                    );
+                    // TODO: forward to aggregator service channel when running as aggregator node
+                }
+                Err(e) => {
+                    debug!("Failed to parse StorageReceipt from gossipsub: {}", e);
                 }
             }
         }

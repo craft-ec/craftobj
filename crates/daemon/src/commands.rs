@@ -83,4 +83,8 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<Option<datacraft_core::RemovalNotice>, String>>,
     },
+    /// Broadcast a StorageReceipt via gossipsub (for aggregator collection).
+    BroadcastStorageReceipt {
+        receipt_data: Vec<u8>,
+    },
 }

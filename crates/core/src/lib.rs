@@ -380,6 +380,9 @@ pub const CAPABILITIES_TOPIC: &str = "datacraft/capabilities/1.0.0";
 /// Gossipsub topic for content removal notices (fast propagation).
 pub const REMOVAL_TOPIC: &str = "datacraft/removal/1.0.0";
 
+/// Gossipsub topic for StorageReceipt broadcast (aggregator collection).
+pub const STORAGE_RECEIPT_TOPIC: &str = "datacraft/storage-receipts/1.0.0";
+
 /// Capabilities a DataCraft node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataCraftCapability {
