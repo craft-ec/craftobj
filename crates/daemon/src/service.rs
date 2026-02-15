@@ -253,13 +253,19 @@ pub async fn run_daemon_with_config(
     }
     let settlement_client = Arc::new(Mutex::new(settlement_client));
 
-    // Content lifecycle tracker
-    let content_tracker = Arc::new(Mutex::new(
-        crate::content_tracker::ContentTracker::with_threshold(
+    // Content lifecycle tracker — import any existing content from store
+    let content_tracker = {
+        let mut tracker = crate::content_tracker::ContentTracker::with_threshold(
             &data_dir,
             daemon_config.reannounce_threshold_secs,
-        ),
-    ));
+        );
+        let c = client.blocking_lock();
+        let imported = tracker.import_from_store(c.store());
+        if imported > 0 {
+            info!("Imported {} existing content items into tracker on startup", imported);
+        }
+        Arc::new(Mutex::new(tracker))
+    };
 
     // Own capabilities — read from config file (env var override applied during config load)
     let own_capabilities = {

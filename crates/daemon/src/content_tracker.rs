@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use datacraft_core::{ChunkManifest, ContentId};
+use datacraft_store::FsStore;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Default re-announcement threshold in seconds (20 minutes).
 pub const DEFAULT_REANNOUNCE_THRESHOLD_SECS: u64 = 1200;
@@ -189,6 +190,56 @@ impl ContentTracker {
             .filter(|s| s.local_shards > 0 && s.remote_shards < s.total_shards)
             .map(|s| s.content_id)
             .collect()
+    }
+
+    /// Import existing content from the store that isn't already tracked.
+    /// Called on startup to catch content published before the tracker existed.
+    pub fn import_from_store(&mut self, store: &FsStore) -> usize {
+        let existing = match store.list_content() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("Failed to list store content for import: {}", e);
+                return 0;
+            }
+        };
+
+        let mut imported = 0;
+        for cid in existing {
+            if self.states.contains_key(&cid) {
+                continue; // already tracked
+            }
+            match store.get_manifest(&cid) {
+                Ok(manifest) => {
+                    let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+                    let state = ContentState {
+                        content_id: cid,
+                        stage: ContentStage::Chunked, // treat as fresh — needs announcement
+                        total_shards,
+                        local_shards: total_shards,
+                        remote_shards: 0,
+                        provider_count: 0,
+                        last_announced: None,
+                        last_checked: None,
+                        created_at: now_secs(),
+                        encrypted: false, // can't tell from manifest alone
+                        name: cid.to_hex()[..12].to_string(),
+                        size: manifest.content_size,
+                    };
+                    self.states.insert(cid, state);
+                    imported += 1;
+                }
+                Err(e) => {
+                    debug!("Skipping import of {}: {}", cid, e);
+                }
+            }
+        }
+
+        if imported > 0 {
+            info!("Imported {} existing content items into tracker", imported);
+            self.save();
+        }
+
+        imported
     }
 
     /// Persist state to disk.
