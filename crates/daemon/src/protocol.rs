@@ -33,6 +33,11 @@ pub enum DataCraftEvent {
         content_id: ContentId,
         manifest: ChunkManifest,
     },
+    /// DHT access list record retrieved.
+    AccessListRetrieved {
+        content_id: ContentId,
+        access_list: datacraft_core::access::AccessList,
+    },
     /// DHT operation failed.
     DhtError {
         content_id: ContentId,
@@ -93,6 +98,7 @@ pub struct DataCraftProtocol {
 enum PendingQuery {
     ProvidersLookup { content_id: ContentId },
     ManifestLookup { content_id: ContentId },
+    AccessListLookup { content_id: ContentId },
 }
 
 impl DataCraftProtocol {
@@ -204,6 +210,21 @@ impl DataCraftProtocol {
         Ok(())
     }
 
+    /// Get an access list from the DHT (tracked for async response).
+    pub async fn get_access_list_dht(
+        &self,
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("Getting access list for {} from DHT", content_id);
+        let query_id = datacraft_routing::ContentRouter::get_access_list(behaviour, content_id);
+        let mut queries = self.pending_queries.lock().await;
+        queries.insert(query_id, PendingQuery::AccessListLookup {
+            content_id: *content_id,
+        });
+        Ok(())
+    }
+
     /// Handle libp2p swarm events related to DataCraft.
     pub async fn handle_swarm_event(&self, event: &SwarmEvent<CraftBehaviourEvent>) {
         match event {
@@ -290,6 +311,32 @@ impl DataCraftProtocol {
                 }
             }
 
+            (PendingQuery::AccessListLookup { content_id }, QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(peer_record)))) => {
+                debug!("Found access list record for {}", content_id);
+
+                match datacraft_routing::parse_access_list_record(&peer_record.record.value) {
+                    Ok(access_list) => {
+                        let event = DataCraftEvent::AccessListRetrieved {
+                            content_id,
+                            access_list,
+                        };
+                        if let Err(e) = self.event_tx.send(event) {
+                            error!("Failed to send access list retrieved event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse access list record for {}: {}", content_id, e);
+                        let event = DataCraftEvent::DhtError {
+                            content_id,
+                            error: format!("Failed to parse access list: {}", e),
+                        };
+                        if let Err(e) = self.event_tx.send(event) {
+                            error!("Failed to send DHT error event: {}", e);
+                        }
+                    }
+                }
+            }
+
             (pending, result) => {
                 debug!("Query {:?} completed with unhandled result: {:?}", pending, result);
                 
@@ -297,6 +344,7 @@ impl DataCraftProtocol {
                 let content_id = match pending {
                     PendingQuery::ProvidersLookup { content_id } => content_id,
                     PendingQuery::ManifestLookup { content_id } => content_id,
+                    PendingQuery::AccessListLookup { content_id } => content_id,
                 };
                 
                 let error_msg = match result {

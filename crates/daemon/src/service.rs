@@ -75,6 +75,9 @@ enum PendingRequest {
     GetManifest {
         reply_tx: oneshot::Sender<Result<ChunkManifest, String>>,
     },
+    GetAccessList {
+        reply_tx: oneshot::Sender<Result<datacraft_core::access::AccessList, String>>,
+    },
 }
 
 /// Global pending requests tracker.
@@ -364,6 +367,46 @@ async fn handle_command(
             warn!("Extend command received in swarm loop — should be orchestrated by handler");
             let _ = reply_tx.send(Err("Extend should be orchestrated by the IPC handler".into()));
         }
+
+        DataCraftCommand::PutReKey { content_id, entry, reply_tx } => {
+            debug!("Handling put re-key command for {} → {}", content_id, hex::encode(entry.recipient_did));
+            let local_peer_id = *swarm.local_peer_id();
+            let result = datacraft_routing::ContentRouter::put_re_key(
+                swarm.behaviour_mut(), &content_id, &entry, &local_peer_id,
+            ).map(|_| ()).map_err(|e| e.to_string());
+            let _ = reply_tx.send(result);
+        }
+
+        DataCraftCommand::RemoveReKey { content_id, recipient_did, reply_tx } => {
+            debug!("Handling remove re-key command for {} → {}", content_id, hex::encode(recipient_did));
+            let local_peer_id = *swarm.local_peer_id();
+            let result = datacraft_routing::ContentRouter::remove_re_key(
+                swarm.behaviour_mut(), &content_id, &recipient_did, &local_peer_id,
+            ).map(|_| ()).map_err(|e| e.to_string());
+            let _ = reply_tx.send(result);
+        }
+
+        DataCraftCommand::PutAccessList { access_list, reply_tx } => {
+            debug!("Handling put access list command for {}", access_list.content_id);
+            let local_peer_id = *swarm.local_peer_id();
+            let result = datacraft_routing::ContentRouter::put_access_list(
+                swarm.behaviour_mut(), &access_list, &local_peer_id,
+            ).map(|_| ()).map_err(|e| e.to_string());
+            let _ = reply_tx.send(result);
+        }
+
+        DataCraftCommand::GetAccessList { content_id, reply_tx } => {
+            debug!("Handling get access list command for {}", content_id);
+            match protocol.get_access_list_dht(swarm.behaviour_mut(), &content_id).await {
+                Ok(()) => {
+                    let mut pending = pending_requests.lock().await;
+                    pending.insert(content_id, PendingRequest::GetAccessList { reply_tx });
+                }
+                Err(e) => {
+                    let _ = reply_tx.send(Err(format!("Failed to start access list retrieval: {}", e)));
+                }
+            }
+        }
     }
 }
 
@@ -479,6 +522,15 @@ async fn handle_protocol_events(
                 }
             }
             
+            DataCraftEvent::AccessListRetrieved { content_id, access_list } => {
+                info!("Retrieved access list for {} ({} entries)", content_id, access_list.entries.len());
+                let mut pending = pending_requests.lock().await;
+                if let Some(PendingRequest::GetAccessList { reply_tx }) = pending.remove(&content_id) {
+                    let _ = reply_tx.send(Ok(access_list));
+                    debug!("Responded to access list retrieval request for {}", content_id);
+                }
+            }
+
             DataCraftEvent::DhtError { content_id, error } => {
                 warn!("DHT error for {}: {}", content_id, error);
                 
@@ -490,6 +542,9 @@ async fn handle_protocol_events(
                             let _ = reply_tx.send(Err(error));
                         }
                         PendingRequest::GetManifest { reply_tx } => {
+                            let _ = reply_tx.send(Err(error));
+                        }
+                        PendingRequest::GetAccessList { reply_tx } => {
                             let _ = reply_tx.send(Err(error));
                         }
                     }

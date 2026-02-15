@@ -20,6 +20,7 @@ use crate::protocol::DataCraftProtocol;
 use crate::receipt_store::PersistentReceiptStore;
 
 use datacraft_core::DataCraftCapability;
+use ed25519_dalek;
 use std::collections::HashMap;
 
 /// Peer capability tracker type alias.
@@ -544,6 +545,117 @@ impl DataCraftHandler {
         Ok(())
     }
 
+    // -- Access control IPC handlers --
+
+    async fn handle_access_grant(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+        let creator_secret_hex = params.get("creator_secret").and_then(|v| v.as_str()).ok_or("missing 'creator_secret'")?;
+        let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
+        let content_key_hex = params.get("content_key").and_then(|v| v.as_str()).ok_or("missing 'content_key'")?;
+
+        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
+        if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(
+            creator_bytes.as_slice().try_into().unwrap()
+        );
+        let recipient_bytes = parse_pubkey(recipient_pubkey_hex)?;
+        let recipient_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&recipient_bytes)
+            .map_err(|e| format!("invalid recipient pubkey: {e}"))?;
+        let content_key = hex::decode(content_key_hex).map_err(|e| e.to_string())?;
+
+        // Generate re-key entry
+        let re_key = datacraft_core::pre::generate_re_key(&creator_key, &recipient_pubkey)
+            .map_err(|e| e.to_string())?;
+        let entry = datacraft_core::pre::ReKeyEntry {
+            recipient_did: recipient_bytes,
+            re_key,
+        };
+
+        // Also generate the re-encrypted key for the recipient
+        let re_encrypted = datacraft_core::pre::re_encrypt_with_content_key(&content_key, &entry.re_key)
+            .map_err(|e| e.to_string())?;
+
+        // Store re-key in DHT
+        if let Some(ref command_tx) = self.command_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::PutReKey {
+                content_id,
+                entry: entry.clone(),
+                reply_tx,
+            }).map_err(|e| e.to_string())?;
+            reply_rx.await.map_err(|e| e.to_string())??;
+        }
+
+        Ok(serde_json::json!({
+            "cid": cid_hex,
+            "recipient": recipient_pubkey_hex,
+            "re_encrypted_key": {
+                "ephemeral_public": hex::encode(re_encrypted.ephemeral_public),
+                "nonce": hex::encode(re_encrypted.nonce),
+                "ciphertext": hex::encode(&re_encrypted.ciphertext),
+            },
+        }))
+    }
+
+    async fn handle_access_revoke(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+        let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
+
+        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let recipient_did = parse_pubkey(recipient_pubkey_hex)?;
+
+        if let Some(ref command_tx) = self.command_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::RemoveReKey {
+                content_id,
+                recipient_did,
+                reply_tx,
+            }).map_err(|e| e.to_string())?;
+            reply_rx.await.map_err(|e| e.to_string())??;
+        }
+
+        Ok(serde_json::json!({
+            "cid": cid_hex,
+            "recipient": recipient_pubkey_hex,
+            "revoked": true,
+        }))
+    }
+
+    async fn handle_access_list(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+
+        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+
+        if let Some(ref command_tx) = self.command_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::GetAccessList {
+                content_id,
+                reply_tx,
+            }).map_err(|e| e.to_string())?;
+
+            match reply_rx.await {
+                Ok(Ok(access_list)) => {
+                    let dids: Vec<String> = access_list.entries.iter()
+                        .map(|e| hex::encode(e.recipient_did))
+                        .collect();
+                    Ok(serde_json::json!({
+                        "cid": cid_hex,
+                        "creator": hex::encode(access_list.creator_did),
+                        "authorized": dids,
+                    }))
+                }
+                Ok(Err(e)) => Err(format!("DHT lookup failed: {e}")),
+                Err(e) => Err(format!("channel error: {e}")),
+            }
+        } else {
+            Err("no network available".into())
+        }
+    }
+
     // -- Payment channel IPC handlers --
 
     async fn handle_channel_open(&self, params: Option<Value>) -> Result<Value, String> {
@@ -708,6 +820,9 @@ impl IpcHandler for DataCraftHandler {
                 "extend" => self.handle_extend(params).await,
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
+                "access.grant" => self.handle_access_grant(params).await,
+                "access.revoke" => self.handle_access_revoke(params).await,
+                "access.list" => self.handle_access_list(params).await,
                 "channel.open" => self.handle_channel_open(params).await,
                 "channel.voucher" => self.handle_channel_voucher(params).await,
                 "channel.close" => self.handle_channel_close(params).await,

@@ -50,4 +50,26 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<u8, String>>,
     },
+    /// Store a re-encryption key in the DHT for access grant.
+    PutReKey {
+        content_id: ContentId,
+        entry: datacraft_core::pre::ReKeyEntry,
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Remove a re-encryption key from the DHT (revoke access).
+    RemoveReKey {
+        content_id: ContentId,
+        recipient_did: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Store an access list in the DHT.
+    PutAccessList {
+        access_list: datacraft_core::access::AccessList,
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Fetch an access list from the DHT.
+    GetAccessList {
+        content_id: ContentId,
+        reply_tx: oneshot::Sender<Result<datacraft_core::access::AccessList, String>>,
+    },
 }
