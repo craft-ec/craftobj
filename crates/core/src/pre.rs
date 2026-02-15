@@ -19,9 +19,10 @@
 //!   but the re-key allows this without revealing the content key
 
 use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::{ContentId, DataCraftError, Result};
@@ -71,11 +72,11 @@ pub struct ReKeyEntry {
     pub re_key: ReKey,
 }
 
-/// Convert ed25519 signing key to x25519 static secret (same as in access.rs).
+/// Convert ed25519 signing key to x25519 static secret.
 fn ed25519_to_x25519_secret(signing_key: &SigningKey) -> StaticSecret {
-    let hash = Sha256::digest(signing_key.as_bytes());
+    let hash = Sha512::digest(signing_key.as_bytes());
     let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&hash);
+    key_bytes.copy_from_slice(&hash[..32]);
     key_bytes[0] &= 248;
     key_bytes[31] &= 127;
     key_bytes[31] |= 64;
@@ -88,16 +89,14 @@ fn ed25519_to_x25519_public_from_signing(signing_key: &SigningKey) -> X25519Publ
     X25519PublicKey::from(&secret)
 }
 
-/// Get x25519 public key from ed25519 verifying key (via hash derivation).
-fn ed25519_verifying_to_x25519_public(verifying_key: &ed25519_dalek::VerifyingKey) -> X25519PublicKey {
-    let hash = Sha256::digest(verifying_key.as_bytes());
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&hash);
-    key_bytes[0] &= 248;
-    key_bytes[31] &= 127;
-    key_bytes[31] |= 64;
-    let secret = StaticSecret::from(key_bytes);
-    X25519PublicKey::from(&secret)
+/// Get x25519 public key from ed25519 verifying key (Edwards→Montgomery conversion).
+fn ed25519_verifying_to_x25519_public(verifying_key: &ed25519_dalek::VerifyingKey) -> Result<X25519PublicKey> {
+    let compressed = CompressedEdwardsY(verifying_key.to_bytes());
+    let edwards = compressed
+        .decompress()
+        .ok_or_else(|| DataCraftError::EncryptionError("invalid ed25519 public key".into()))?;
+    let montgomery = edwards.to_montgomery();
+    Ok(X25519PublicKey::from(montgomery.to_bytes()))
 }
 
 /// Encrypt a content key to the creator's own public key.
@@ -156,18 +155,18 @@ pub fn decrypt_content_key(
 pub fn generate_re_key(
     creator_secret: &SigningKey,
     recipient_pubkey: &ed25519_dalek::VerifyingKey,
-) -> ReKey {
+) -> Result<ReKey> {
     let creator_x25519 = ed25519_to_x25519_secret(creator_secret);
-    let recipient_x25519_pub = ed25519_verifying_to_x25519_public(recipient_pubkey);
+    let recipient_x25519_pub = ed25519_verifying_to_x25519_public(recipient_pubkey)?;
 
     // The transform key is the ECDH shared secret between creator and recipient.
     // This is used during re-encryption to bridge the two key domains.
     let shared = creator_x25519.diffie_hellman(&recipient_x25519_pub);
 
-    ReKey {
+    Ok(ReKey {
         transform_key: *shared.as_bytes(),
         recipient_x25519_public: *recipient_x25519_pub.as_bytes(),
-    }
+    })
 }
 
 /// Re-encrypt: transform a content key encrypted to the creator into one
@@ -202,7 +201,7 @@ pub fn re_encrypt(
     // the content key transiently (client-side PRE). The security property
     // is that storage nodes never see it — only the user's client.
 
-    let creator_x25519_pub = ed25519_verifying_to_x25519_public(creator_pubkey);
+    let creator_x25519_pub = ed25519_verifying_to_x25519_public(creator_pubkey)?;
 
     // We need to reconstruct the shared secret used for encryption.
     // shared = ECDH(ephemeral_secret, creator_public)
@@ -286,7 +285,7 @@ pub fn decrypt_re_encrypted(
     creator_pubkey: &ed25519_dalek::VerifyingKey,
 ) -> Result<Vec<u8>> {
     let recipient_x25519 = ed25519_to_x25519_secret(recipient_secret);
-    let creator_x25519_pub = ed25519_verifying_to_x25519_public(creator_pubkey);
+    let creator_x25519_pub = ed25519_verifying_to_x25519_public(creator_pubkey)?;
 
     // Same shared secret as transform_key = ECDH(creator_secret, recipient_public)
     // = ECDH(recipient_secret, creator_public) (ECDH is symmetric)
@@ -309,7 +308,7 @@ pub fn full_pre_grant(
     content_key: &[u8],
 ) -> Result<(EncryptedContentKey, ReKey, ReEncryptedKey)> {
     let encrypted = encrypt_content_key(creator_keypair, content_key)?;
-    let re_key = generate_re_key(creator_keypair, recipient_pubkey);
+    let re_key = generate_re_key(creator_keypair, recipient_pubkey)?;
     let re_encrypted = re_encrypt_with_content_key(content_key, &re_key)?;
     Ok((encrypted, re_key, re_encrypted))
 }
@@ -353,7 +352,7 @@ mod tests {
         let encrypted = encrypt_content_key(&creator, content_key).unwrap();
 
         // Step 2: Creator generates re-key for recipient
-        let re_key = generate_re_key(&creator, &recipient.verifying_key());
+        let re_key = generate_re_key(&creator, &recipient.verifying_key()).unwrap();
 
         // Step 3: Creator decrypts and re-encrypts (client-side)
         let decrypted = decrypt_content_key(&creator, &encrypted).unwrap();
@@ -405,7 +404,7 @@ mod tests {
     fn test_re_key_entry_serialization() {
         let creator = test_keypair();
         let recipient = test_keypair();
-        let re_key = generate_re_key(&creator, &recipient.verifying_key());
+        let re_key = generate_re_key(&creator, &recipient.verifying_key()).unwrap();
 
         let entry = ReKeyEntry {
             recipient_did: recipient.verifying_key().to_bytes(),
@@ -446,7 +445,7 @@ mod tests {
         let content_key = b"0123456789abcdef0123456789abcdef";
 
         let encrypted = encrypt_content_key(&creator, content_key).unwrap();
-        let re_key = generate_re_key(&creator, &recipient.verifying_key());
+        let re_key = generate_re_key(&creator, &recipient.verifying_key()).unwrap();
 
         // The direct re_encrypt (without content key) should error
         let result = re_encrypt(&encrypted, &re_key, &creator.verifying_key());

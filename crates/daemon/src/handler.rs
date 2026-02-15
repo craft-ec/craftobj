@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, warn};
 
+use crate::channel_store::ChannelStore;
 use crate::commands::DataCraftCommand;
 use crate::protocol::DataCraftProtocol;
 use crate::receipt_store::PersistentReceiptStore;
@@ -31,6 +32,7 @@ pub struct DataCraftHandler {
     command_tx: Option<mpsc::UnboundedSender<DataCraftCommand>>,
     peer_capabilities: Option<PeerCapabilities>,
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
+    channel_store: Option<Arc<Mutex<ChannelStore>>>,
 }
 
 impl DataCraftHandler {
@@ -40,6 +42,7 @@ impl DataCraftHandler {
         command_tx: mpsc::UnboundedSender<DataCraftCommand>,
         peer_capabilities: PeerCapabilities,
         receipt_store: Arc<Mutex<PersistentReceiptStore>>,
+        channel_store: Arc<Mutex<ChannelStore>>,
     ) -> Self {
         Self { 
             client, 
@@ -47,6 +50,7 @@ impl DataCraftHandler {
             command_tx: Some(command_tx),
             peer_capabilities: Some(peer_capabilities),
             receipt_store: Some(receipt_store),
+            channel_store: Some(channel_store),
         }
     }
 
@@ -58,6 +62,7 @@ impl DataCraftHandler {
             command_tx: None,
             peer_capabilities: None,
             receipt_store: None,
+            channel_store: None,
         }
     }
 
@@ -542,6 +547,7 @@ impl DataCraftHandler {
     // -- Payment channel IPC handlers --
 
     async fn handle_channel_open(&self, params: Option<Value>) -> Result<Value, String> {
+        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
         let params = params.ok_or("missing params")?;
         let sender_hex = params.get("sender").and_then(|v| v.as_str()).ok_or("missing 'sender'")?;
         let receiver_hex = params.get("receiver").and_then(|v| v.as_str()).ok_or("missing 'receiver'")?;
@@ -571,6 +577,10 @@ impl DataCraftHandler {
             channel_id, sender, receiver, amount,
         );
 
+        // Persist via ChannelStore
+        let cs = store.lock().await;
+        cs.open_channel(channel.clone()).map_err(|e| e.to_string())?;
+
         debug!("Opened payment channel {}", hex::encode(channel_id));
 
         Ok(serde_json::json!({
@@ -582,6 +592,7 @@ impl DataCraftHandler {
     }
 
     async fn handle_channel_voucher(&self, params: Option<Value>) -> Result<Value, String> {
+        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
         let params = params.ok_or("missing params")?;
         let channel_id_hex = params.get("channel_id").and_then(|v| v.as_str()).ok_or("missing 'channel_id'")?;
         let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
@@ -602,27 +613,68 @@ impl DataCraftHandler {
             signature,
         };
 
-        debug!("Received voucher for channel {} amount={} nonce={}", hex::encode(channel_id), amount, nonce);
+        // Validate + persist via ChannelStore (includes sig verification)
+        let cs = store.lock().await;
+        cs.apply_voucher(&channel_id, voucher.clone()).map_err(|e| e.to_string())?;
+
+        debug!("Applied voucher for channel {} amount={} nonce={}", hex::encode(channel_id), amount, nonce);
 
         Ok(serde_json::json!({
-            "channel_id": hex::encode(voucher.channel_id),
-            "cumulative_amount": voucher.cumulative_amount,
-            "nonce": voucher.nonce,
-            "valid": !voucher.signature.is_empty(),
+            "channel_id": hex::encode(channel_id),
+            "cumulative_amount": amount,
+            "nonce": nonce,
+            "valid": true,
         }))
     }
 
     async fn handle_channel_close(&self, params: Option<Value>) -> Result<Value, String> {
+        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
         let params = params.ok_or("missing params")?;
         let channel_id_hex = params.get("channel_id").and_then(|v| v.as_str()).ok_or("missing 'channel_id'")?;
-        let _channel_id = parse_pubkey(channel_id_hex)?;
+        let channel_id = parse_pubkey(channel_id_hex)?;
 
-        debug!("Closing payment channel {}", channel_id_hex);
+        let cs = store.lock().await;
+        let final_state = cs.close_channel(&channel_id).map_err(|e| e.to_string())?;
+
+        debug!("Closed payment channel {}", channel_id_hex);
 
         Ok(serde_json::json!({
             "channel_id": channel_id_hex,
             "status": "closed",
+            "final_spent": final_state.spent,
+            "locked_amount": final_state.locked_amount,
+            "remaining": final_state.remaining(),
         }))
+    }
+
+    async fn handle_channel_list(&self, params: Option<Value>) -> Result<Value, String> {
+        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
+        let cs = store.lock().await;
+
+        let channels = if let Some(params) = params {
+            if let Some(peer_hex) = params.get("peer").and_then(|v| v.as_str()) {
+                let peer = parse_pubkey(peer_hex)?;
+                cs.list_channels_by_peer(&peer)
+            } else {
+                cs.list_channels()
+            }
+        } else {
+            cs.list_channels()
+        };
+
+        let items: Vec<Value> = channels.iter().map(|ch| {
+            serde_json::json!({
+                "channel_id": hex::encode(ch.channel_id),
+                "sender": hex::encode(ch.sender),
+                "receiver": hex::encode(ch.receiver),
+                "locked_amount": ch.locked_amount,
+                "spent": ch.spent,
+                "remaining": ch.remaining(),
+                "nonce": ch.nonce,
+            })
+        }).collect();
+
+        Ok(serde_json::json!({ "channels": items }))
     }
 }
 
@@ -659,6 +711,7 @@ impl IpcHandler for DataCraftHandler {
                 "channel.open" => self.handle_channel_open(params).await,
                 "channel.voucher" => self.handle_channel_voucher(params).await,
                 "channel.close" => self.handle_channel_close(params).await,
+                "channel.list" => self.handle_channel_list(params).await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })

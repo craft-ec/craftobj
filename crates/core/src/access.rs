@@ -4,9 +4,10 @@
 //! Uses x25519 ECDH + ChaCha20-Poly1305 to encrypt the content key to each recipient.
 
 use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier, Signature};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::{ContentId, DataCraftError, Result};
@@ -78,11 +79,12 @@ impl AccessList {
 }
 
 /// Convert ed25519 signing key to x25519 static secret.
+///
+/// Uses the standard conversion: SHA-512(secret_key)[..32], clamped.
 fn ed25519_to_x25519_secret(signing_key: &SigningKey) -> StaticSecret {
-    let hash = Sha256::digest(signing_key.as_bytes());
+    let hash = Sha512::digest(signing_key.as_bytes());
     let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&hash);
-    // Clamp for x25519
+    key_bytes.copy_from_slice(&hash[..32]);
     key_bytes[0] &= 248;
     key_bytes[31] &= 127;
     key_bytes[31] |= 64;
@@ -91,19 +93,14 @@ fn ed25519_to_x25519_secret(signing_key: &SigningKey) -> StaticSecret {
 
 /// Convert ed25519 verifying key to x25519 public key.
 ///
-/// Uses a hash-based derivation for compatibility (not the standard
-/// edwards-to-montgomery conversion, which requires accessing the
-/// internal edwards point). Both sides must use the same derivation.
-fn ed25519_to_x25519_public(verifying_key: &VerifyingKey) -> X25519PublicKey {
-    let hash = Sha256::digest(verifying_key.as_bytes());
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&hash);
-    key_bytes[0] &= 248;
-    key_bytes[31] &= 127;
-    key_bytes[31] |= 64;
-    // Derive the public key from this as a static secret
-    let secret = StaticSecret::from(key_bytes);
-    X25519PublicKey::from(&secret)
+/// Uses the standard Edwards-to-Montgomery point conversion.
+fn ed25519_to_x25519_public(verifying_key: &VerifyingKey) -> Result<X25519PublicKey> {
+    let compressed = CompressedEdwardsY(verifying_key.to_bytes());
+    let edwards = compressed
+        .decompress()
+        .ok_or_else(|| DataCraftError::EncryptionError("invalid ed25519 public key".into()))?;
+    let montgomery = edwards.to_montgomery();
+    Ok(X25519PublicKey::from(montgomery.to_bytes()))
 }
 
 /// Encrypt a content key to a recipient's ed25519 public key.
@@ -115,7 +112,7 @@ pub fn grant_access(
     recipient_pubkey: &VerifyingKey,
     content_key: &[u8],
 ) -> Result<AccessEntry> {
-    let recipient_x25519 = ed25519_to_x25519_public(recipient_pubkey);
+    let recipient_x25519 = ed25519_to_x25519_public(recipient_pubkey)?;
 
     // Ephemeral ECDH
     let ephemeral_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
