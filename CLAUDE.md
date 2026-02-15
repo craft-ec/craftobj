@@ -26,7 +26,7 @@ crates/
 
 - **P2P pipeline working**: Publish → DHT announce → DHT resolve → libp2p-stream transfer → fetch complete
 - **166 tests passing**, build + clippy clean
-- **Capability announcements wired**: Nodes subscribe to gossipsub topic, broadcast capabilities periodically (every 5 min), track peer capabilities in memory
+- **Peer scoring active**: `PeerScorer` in daemon tracks per-peer reliability (success/failure/timeout with exponential decay), latency EMA, and capabilities from gossipsub. Replaces old static `PeerCapabilities` map. `rank_peers()` for routing, `evict_stale()` for TTL cleanup. Capability announcements still broadcast every 5 min via gossipsub.
 - **TransferReceipts generated on shard transfers**: Requester signs receipt with ed25519 key after receiving shard data, sends back to server. Server verifies signature and stores in PersistentReceiptStore (append-only binary file with in-memory indices, dedup, CID/node/time queries)
 - **Signing module active**: `crates/core/src/signing.rs` provides `sign_transfer_receipt`, `verify_transfer_receipt`, `peer_id_to_ed25519_pubkey`
 - **Payment channel persistence**: `ChannelStore` (daemon) manages open channels on disk (one JSON per channel in `~/.datacraft/channels/`). Full voucher validation (sig verify, nonce, cumulative amounts). IPC handlers (`channel.open`, `channel.voucher`, `channel.close`, `channel.list`) wired to ChannelStore.
