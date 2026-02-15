@@ -79,9 +79,9 @@ if [[ ! -S /tmp/dc-test-a.sock ]]; then
     exit 1
 fi
 
-# Wait for mDNS discovery
-echo "=== Waiting for mDNS peer discovery (5s) ==="
-sleep 5
+# Wait for mDNS discovery and Kademlia routing table population
+echo "=== Waiting for mDNS peer discovery + DHT bootstrap (8s) ==="
+sleep 8
 
 # Test 1: Status check on all nodes
 echo ""

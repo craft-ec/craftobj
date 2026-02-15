@@ -16,3 +16,4 @@ pub mod receipt_store;
 pub mod removal_cache;
 pub mod service;
 pub mod settlement;
+pub mod ws_server;

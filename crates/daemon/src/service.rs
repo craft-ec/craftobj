@@ -91,6 +91,7 @@ pub async fn run_daemon(
     data_dir: std::path::PathBuf,
     socket_path: String,
     network_config: NetworkConfig,
+    ws_port: u16,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Build client and shared store
     let client = DataCraftClient::new(&data_dir)?;
@@ -102,6 +103,9 @@ pub async fn run_daemon(
     let (mut swarm, local_peer_id) = build_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
     info!("DataCraft node started: {}", local_peer_id);
+
+    // Set Kademlia to server mode so DHT queries work (especially on localhost / LAN)
+    swarm.behaviour_mut().kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
     // Create event channel for protocol communication
     let (protocol_event_tx, mut protocol_event_rx) = mpsc::unbounded_channel::<DataCraftEvent>();
@@ -249,12 +253,28 @@ pub async fn run_daemon(
     challenger_mgr.set_persistent_store(receipt_store.clone());
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
+    // Start WebSocket server if enabled
+    let ws_handler = handler.clone();
+    let ws_future = async {
+        if ws_port > 0 {
+            if let Err(e) = crate::ws_server::run_ws_server(ws_port, ws_handler).await {
+                error!("WebSocket server error: {}", e);
+            }
+        } else {
+            // WS disabled — park forever so select! doesn't short-circuit
+            std::future::pending::<()>().await;
+        }
+    };
+
     // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
             if let Err(e) = result {
                 error!("IPC server error: {}", e);
             }
+        }
+        _ = ws_future => {
+            info!("WebSocket server ended");
         }
         _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone(), removal_cache.clone()) => {
             info!("Swarm event loop ended");
@@ -310,6 +330,8 @@ async fn drive_swarm(
                     }
                     SwarmEvent::Behaviour(event) => {
                         debug!("Behaviour event: {:?}", event);
+                        // Handle mDNS discovery: add discovered peers to Kademlia and dial them
+                        handle_mdns_event(swarm, &event);
                         // Try to extract gossipsub capability announcements before passing through
                         handle_gossipsub_capability(&event, &peer_capabilities).await;
                         handle_gossipsub_removal(&event, &removal_cache).await;
@@ -523,6 +545,26 @@ async fn handle_command(
             );
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
+        }
+    }
+}
+
+/// Handle mDNS discovery events: add peers to Kademlia and dial them.
+fn handle_mdns_event(
+    swarm: &mut craftec_network::CraftSwarm,
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+) {
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    use libp2p::mdns;
+
+    if let CraftBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) = event {
+        for (peer_id, addr) in peers {
+            info!("mDNS discovered peer {} at {}", peer_id, addr);
+            swarm.behaviour_mut().add_address(peer_id, addr.clone());
+            // Dial the peer to establish a connection
+            if let Err(e) = swarm.dial(addr.clone()) {
+                debug!("Failed to dial mDNS peer {} at {}: {:?}", peer_id, addr, e);
+            }
         }
     }
 }
