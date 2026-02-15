@@ -173,7 +173,22 @@ pub async fn run_daemon(
             .expect("failed to open channel store"),
     ));
 
-    let handler = Arc::new(DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store));
+    // Initialize settlement client (dry-run mode by default)
+    let settlement_config = crate::settlement::SettlementConfig::default();
+    let mut settlement_client = crate::settlement::SolanaClient::new(settlement_config)
+        .expect("failed to create settlement client");
+    if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {
+        let secret_bytes = ed25519_kp.secret();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(
+            secret_bytes.as_ref().try_into().expect("ed25519 secret is 32 bytes"),
+        );
+        settlement_client.set_signing_key(signing_key);
+    }
+    let settlement_client = Arc::new(Mutex::new(settlement_client));
+
+    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store);
+    handler.set_settlement_client(settlement_client);
+    let handler = Arc::new(handler);
 
     info!("Starting IPC server on {}", socket_path);
 

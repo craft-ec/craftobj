@@ -18,6 +18,7 @@ use crate::channel_store::ChannelStore;
 use crate::commands::DataCraftCommand;
 use crate::protocol::DataCraftProtocol;
 use crate::receipt_store::PersistentReceiptStore;
+use crate::settlement::SolanaClient;
 
 use datacraft_core::DataCraftCapability;
 use ed25519_dalek;
@@ -34,6 +35,7 @@ pub struct DataCraftHandler {
     peer_capabilities: Option<PeerCapabilities>,
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     channel_store: Option<Arc<Mutex<ChannelStore>>>,
+    settlement_client: Option<Arc<Mutex<SolanaClient>>>,
 }
 
 impl DataCraftHandler {
@@ -52,7 +54,13 @@ impl DataCraftHandler {
             peer_capabilities: Some(peer_capabilities),
             receipt_store: Some(receipt_store),
             channel_store: Some(channel_store),
+            settlement_client: None,
         }
+    }
+
+    /// Set the settlement client for on-chain operations.
+    pub fn set_settlement_client(&mut self, client: Arc<Mutex<SolanaClient>>) {
+        self.settlement_client = Some(client);
     }
 
     /// Create handler without protocol (for testing).
@@ -64,6 +72,7 @@ impl DataCraftHandler {
             peer_capabilities: None,
             receipt_store: None,
             channel_store: None,
+            settlement_client: None,
         }
     }
 
@@ -913,6 +922,151 @@ impl DataCraftHandler {
         }))
     }
 
+    // -- Settlement IPC handlers --
+
+    async fn handle_settlement_create_pool(&self, params: Option<Value>) -> Result<Value, String> {
+        let sc = self.settlement_client.as_ref().ok_or("settlement client not available")?;
+        let params = params.ok_or("missing params")?;
+        let creator_hex = params.get("creator").and_then(|v| v.as_str()).ok_or("missing 'creator'")?;
+        let tier = params.get("tier").and_then(|v| v.as_u64()).unwrap_or(2) as u8;
+        let creator = parse_pubkey(creator_hex)?;
+
+        let client = sc.lock().await;
+        let result = client.create_creator_pool(&creator, tier).await.map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "signature": result.signature,
+            "confirmed": result.confirmed,
+            "creator": creator_hex,
+            "tier": tier,
+        }))
+    }
+
+    async fn handle_settlement_fund_pool(&self, params: Option<Value>) -> Result<Value, String> {
+        let sc = self.settlement_client.as_ref().ok_or("settlement client not available")?;
+        let params = params.ok_or("missing params")?;
+        let creator_hex = params.get("creator").and_then(|v| v.as_str()).ok_or("missing 'creator'")?;
+        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
+        let creator = parse_pubkey(creator_hex)?;
+
+        let client = sc.lock().await;
+        let result = client.fund_pool(&creator, amount).await.map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "signature": result.signature,
+            "confirmed": result.confirmed,
+            "creator": creator_hex,
+            "amount": amount,
+        }))
+    }
+
+    async fn handle_settlement_claim(&self, params: Option<Value>) -> Result<Value, String> {
+        let sc = self.settlement_client.as_ref().ok_or("settlement client not available")?;
+        let params = params.ok_or("missing params")?;
+        let pool_hex = params.get("pool").and_then(|v| v.as_str()).ok_or("missing 'pool'")?;
+        let weight = params.get("weight").and_then(|v| v.as_u64()).ok_or("missing 'weight'")?;
+        let leaf_index = params.get("leaf_index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let pool = parse_pubkey(pool_hex)?;
+
+        // Parse merkle_proof
+        let proof: Vec<[u8; 32]> = if let Some(arr) = params.get("merkle_proof").and_then(|v| v.as_array()) {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| {
+                    let bytes = hex::decode(s).ok()?;
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Build a minimal receipt for the claim
+        let storage_node_hex = params.get("operator").and_then(|v| v.as_str()).ok_or("missing 'operator'")?;
+        let storage_node = parse_pubkey(storage_node_hex)?;
+        let receipt = datacraft_core::StorageReceipt {
+            content_id: datacraft_core::ContentId::from_bytes(&[0u8; 32]),
+            storage_node,
+            challenger: [0u8; 32],
+            shard_index: 0,
+            timestamp: 0,
+            nonce: [0u8; 32],
+            proof_hash: [0u8; 32],
+            signature: vec![],
+        };
+
+        let client = sc.lock().await;
+        let result = client.claim_pdp(&pool, &receipt, weight, proof, leaf_index).await.map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "signature": result.signature,
+            "confirmed": result.confirmed,
+            "pool": pool_hex,
+            "weight": weight,
+        }))
+    }
+
+    async fn handle_settlement_open_channel(&self, params: Option<Value>) -> Result<Value, String> {
+        let sc = self.settlement_client.as_ref().ok_or("settlement client not available")?;
+        let params = params.ok_or("missing params")?;
+        let payee_hex = params.get("payee").and_then(|v| v.as_str()).ok_or("missing 'payee'")?;
+        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
+        let payee = parse_pubkey(payee_hex)?;
+
+        let client = sc.lock().await;
+        let result = client.open_payment_channel(&payee, amount).await.map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "signature": result.signature,
+            "confirmed": result.confirmed,
+            "payee": payee_hex,
+            "amount": amount,
+        }))
+    }
+
+    async fn handle_settlement_close_channel(&self, params: Option<Value>) -> Result<Value, String> {
+        let sc = self.settlement_client.as_ref().ok_or("settlement client not available")?;
+        let params = params.ok_or("missing params")?;
+        let user_hex = params.get("user").and_then(|v| v.as_str()).ok_or("missing 'user'")?;
+        let node_hex = params.get("node").and_then(|v| v.as_str()).ok_or("missing 'node'")?;
+        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
+        let nonce = params.get("nonce").and_then(|v| v.as_u64()).ok_or("missing 'nonce'")?;
+        let signature_hex = params.get("voucher_signature").and_then(|v| v.as_str()).unwrap_or("");
+
+        let user = parse_pubkey(user_hex)?;
+        let node = parse_pubkey(node_hex)?;
+        let voucher_sig = if signature_hex.is_empty() {
+            vec![]
+        } else {
+            hex::decode(signature_hex).map_err(|e| e.to_string())?
+        };
+
+        let client = sc.lock().await;
+        let channel_pda = craftec_settlement::pda::payment_channel_pda(
+            client.program_id(),
+            &user,
+            &node,
+        );
+        let result = client
+            .close_payment_channel(&channel_pda, &user, &node, amount, nonce, voucher_sig)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "signature": result.signature,
+            "confirmed": result.confirmed,
+            "user": user_hex,
+            "node": node_hex,
+            "amount": amount,
+        }))
+    }
+
     async fn handle_channel_list(&self, params: Option<Value>) -> Result<Value, String> {
         let store = self.channel_store.as_ref().ok_or("channel store not available")?;
         let cs = store.lock().await;
@@ -983,6 +1137,11 @@ impl IpcHandler for DataCraftHandler {
                 "channel.voucher" => self.handle_channel_voucher(params).await,
                 "channel.close" => self.handle_channel_close(params).await,
                 "channel.list" => self.handle_channel_list(params).await,
+                "settlement.create_pool" => self.handle_settlement_create_pool(params).await,
+                "settlement.fund_pool" => self.handle_settlement_fund_pool(params).await,
+                "settlement.claim" => self.handle_settlement_claim(params).await,
+                "settlement.open_channel" => self.handle_settlement_open_channel(params).await,
+                "settlement.close_channel" => self.handle_settlement_close_channel(params).await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })

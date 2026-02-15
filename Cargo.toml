@@ -33,6 +33,7 @@ craftec-logging = { path = "../craftec-core/crates/logging" }
 craftec-settings = { path = "../craftec-core/crates/settings" }
 craftec-app = { path = "../craftec-core/crates/app" }
 craftec-ipc = { path = "../craftec-core/crates/ipc" }
+craftec-settlement = { path = "../craftec-core/crates/settlement" }
 
 # Async
 tokio = { version = "1.35", features = ["full"] }

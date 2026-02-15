@@ -511,6 +511,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-settlement"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "craftec-core",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -675,6 +686,7 @@ dependencies = [
  "craftec-keystore",
  "craftec-logging",
  "craftec-network",
+ "craftec-settlement",
  "datacraft-client",
  "datacraft-core",
  "datacraft-routing",

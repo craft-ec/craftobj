@@ -34,3 +34,4 @@ bincode = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }
+craftec-settlement = { workspace = true }
