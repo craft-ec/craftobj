@@ -201,41 +201,9 @@ pub fn re_encrypt(
     // the content key transiently (client-side PRE). The security property
     // is that storage nodes never see it — only the user's client.
 
-    let creator_x25519_pub = ed25519_verifying_to_x25519_public(creator_pubkey)?;
-
-    // We need to reconstruct the shared secret used for encryption.
-    // shared = ECDH(ephemeral_secret, creator_public)
-    // We don't have ephemeral_secret, but we have:
-    // - encrypted_content_key.ephemeral_public
-    // - re_key.transform_key = ECDH(creator_secret, recipient_public)
-    //
-    // We can't directly compute ECDH(ephemeral_secret, creator_public)
-    // from just the re_key. This is why the design says "re-encrypts locally"
-    // — the client that holds the re_key also needs the creator's secret
-    // OR we need a different scheme.
-    //
-    // For the pragmatic client-side approach: we need the creator secret
-    // to decrypt, then re-encrypt to recipient. But the API doesn't expose
-    // the creator secret to the re-encryptor.
-    //
-    // Resolution: Use the re_key.transform_key as a symmetric key to
-    // wrap the content key. The grant flow becomes:
-    // 1. Creator decrypts content key
-    // 2. Creator encrypts content key with transform_key
-    // 3. Stores this as the "re-encrypted" form
-    // 4. Recipient derives same transform_key via ECDH(recipient_secret, creator_public)
-    // 5. Recipient decrypts
-    //
-    // This IS the standard approach for client-side PRE with curve25519.
-
-    // Use transform_key as symmetric encryption key for the content key
-    // We need to first decrypt the original (requires creator secret — not available here)
-    // So this function must be called by someone who can decrypt.
-    //
-    // Let's restructure: re_encrypt takes the PLAINTEXT content key + re_key
-    // and produces something the recipient can decrypt.
-
-    let _ = (encrypted_content_key, creator_x25519_pub);
+    // Client-side PRE: cannot transform ciphertext without the creator's
+    // secret key. Use re_encrypt_with_content_key instead.
+    let _ = (encrypted_content_key, re_key, creator_pubkey);
 
     Err(DataCraftError::EncryptionError(
         "use re_encrypt_with_content_key for client-side PRE".into(),
@@ -256,7 +224,7 @@ pub fn re_encrypt_with_content_key(
 ) -> Result<ReEncryptedKey> {
     // Encrypt content key using the transform_key (ECDH shared secret)
     // as the symmetric key. Recipient can derive the same shared secret.
-    let sym_key = Sha256::digest(&re_key.transform_key);
+    let sym_key = Sha256::digest(re_key.transform_key);
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
         .map_err(|e| DataCraftError::EncryptionError(e.to_string()))?;
 
