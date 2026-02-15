@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
-use crate::{ContentId, DataCraftError, Result};
+use crate::{DataCraftError, Result};
 
 /// Re-encryption key that transforms a ciphertext from creator to recipient.
 #[derive(Debug, Clone, Serialize, Deserialize)]

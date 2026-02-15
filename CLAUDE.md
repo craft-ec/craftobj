@@ -29,6 +29,8 @@ crates/
 - **Capability announcements wired**: Nodes subscribe to gossipsub topic, broadcast capabilities periodically (every 5 min), track peer capabilities in memory
 - **TransferReceipts generated on shard transfers**: Requester signs receipt with ed25519 key after receiving shard data, sends back to server. Server verifies signature and stores in PersistentReceiptStore (append-only binary file with in-memory indices, dedup, CID/node/time queries)
 - **Signing module active**: `crates/core/src/signing.rs` provides `sign_transfer_receipt`, `verify_transfer_receipt`, `peer_id_to_ed25519_pubkey`
+- **Payment channel persistence**: `ChannelStore` (daemon) manages open channels on disk (one JSON per channel in `~/.datacraft/channels/`). Full voucher validation (sig verify, nonce, cumulative amounts). IPC handlers (`channel.open`, `channel.voucher`, `channel.close`, `channel.list`) wired to ChannelStore.
+- **Protocol egress pricing**: Fixed rate `PROTOCOL_EGRESS_PRICE_PER_BYTE` (1 USDC lamport/byte) in `economics.rs`. `EgressPricing` struct with `cost()` and `covers()` helpers. Nodes compete on performance, not price.
 - **Not yet implemented**: StorageReceipt generation (requires PDP challenger), settlement on-chain, payment channel on-chain settlement
 
 ## Key Design Decisions (from recent discussions)
