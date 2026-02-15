@@ -4,6 +4,7 @@
 //! content-addressed distributed storage with erasure coding.
 
 pub mod economics;
+pub mod payment_channel;
 pub mod signing;
 
 use craftec_erasure::ErasureConfig;
@@ -139,7 +140,12 @@ impl StorageReceipt {
 
 /// TransferReceipt — issued on every shard transfer, signed by requester.
 ///
-/// Weight: bytes_served (proving you served data).
+/// **Analytics only — NOT used for settlement.** TransferReceipts are generated
+/// for protocol analytics, bandwidth monitoring, and node reputation tracking
+/// via `craftec-identity`. Settlement for egress uses payment channels instead
+/// (see `payment_channel` module). Storage settlement uses StorageReceipts only.
+///
+/// Weight: bytes_served (for analytics aggregation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferReceipt {
     /// Content that was served.

@@ -1,10 +1,15 @@
-//! Economics: Pool types, tier logic, distribution math, and eviction policy.
+//! Economics: Creator Pool, tier logic, distribution math, and eviction policy.
+//!
+//! The economics model uses Creator Pools (one per creator, funding multiple CIDs)
+//! with StorageReceipt (PDP) as the ONLY settlement mechanism for storage distribution.
+//! Premium egress uses payment channels (see `payment_channel` module).
+//! Free egress has no reward — best effort, volunteer.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentId, StorageReceipt, TransferReceipt};
+use crate::{ContentId, StorageReceipt};
 
 // ---------------------------------------------------------------------------
 // Tiers
@@ -73,37 +78,58 @@ const TB: u64 = 1_000_000_000_000;
 const USDC: u64 = 1_000_000;
 
 // ---------------------------------------------------------------------------
-// Pool types
+// Creator Pool
 // ---------------------------------------------------------------------------
 
-/// Protocol-wide default ratio constants.
-pub const DEFAULT_STORAGE_RATIO: f64 = 0.6;
-pub const DEFAULT_TRANSFER_RATIO: f64 = 0.4;
+/// Default protocol fee in basis points (e.g. 500 = 5%).
+pub const DEFAULT_PROTOCOL_FEE_BPS: u16 = 500;
 
-/// Per-CID shared pool — no expiry, fluid settlement.
+/// Creator Pool — one per creator, funds storage for all their CIDs.
+///
+/// The pool is funded by direct USDC deposits from the creator. Pool balance
+/// determines content availability — depleted pool → content degrades to free
+/// tier (volunteer serving only).
+///
+/// Distribution is based solely on StorageReceipts (PDP). No transfer/egress
+/// settlement — premium egress uses payment channels directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContentPool {
-    pub content_id: ContentId,
+pub struct CreatorPool {
+    /// Creator's public key (ed25519, 32 bytes).
+    pub creator: [u8; 32],
+    /// Tier determining minimum shard health ratio for all the creator's CIDs.
     pub tier: Tier,
     /// USDC lamports remaining in the pool.
     pub balance: u64,
     /// Cumulative USDC lamports claimed from this pool.
     pub total_claimed: u64,
-    /// Fraction of pool allocated to storage receipts.
-    pub storage_ratio: f64,
-    /// Fraction of pool allocated to transfer receipts.
-    pub transfer_ratio: f64,
+    /// Protocol fee in basis points (applied on every claim).
+    pub protocol_fee_bps: u16,
+    /// CIDs funded by this pool.
+    pub funded_cids: Vec<ContentId>,
 }
 
-impl ContentPool {
-    pub fn new(content_id: ContentId, tier: Tier, balance: u64) -> Self {
+impl CreatorPool {
+    /// Create a new creator pool.
+    pub fn new(creator: [u8; 32], tier: Tier, balance: u64) -> Self {
         Self {
-            content_id,
+            creator,
             tier,
             balance,
             total_claimed: 0,
-            storage_ratio: DEFAULT_STORAGE_RATIO,
-            transfer_ratio: DEFAULT_TRANSFER_RATIO,
+            protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            funded_cids: Vec::new(),
+        }
+    }
+
+    /// Create a new creator pool with a custom protocol fee.
+    pub fn with_fee(creator: [u8; 32], tier: Tier, balance: u64, protocol_fee_bps: u16) -> Self {
+        Self {
+            creator,
+            tier,
+            balance,
+            total_claimed: 0,
+            protocol_fee_bps,
+            funded_cids: Vec::new(),
         }
     }
 
@@ -111,186 +137,91 @@ impl ContentPool {
     pub fn is_funded(&self) -> bool {
         self.balance > 0
     }
-}
 
-/// Per-user subscription pool — time-bound.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscriptionPool {
-    pub subscriber: [u8; 32],
-    pub tier: Tier,
-    /// USDC lamports remaining.
-    pub balance: u64,
-    /// Storage quota in bytes.
-    pub storage_quota: u64,
-    /// Bandwidth quota in bytes per epoch.
-    pub bandwidth_quota: u64,
-    /// Storage used in bytes.
-    pub storage_used: u64,
-    /// Bandwidth used in bytes (this epoch).
-    pub bandwidth_used: u64,
-    /// Unix timestamp when the subscription started.
-    pub start_date: u64,
-    /// Unix timestamp when the subscription expires.
-    pub expires_at: u64,
-    /// Fraction allocated to storage receipts.
-    pub storage_ratio: f64,
-    /// Fraction allocated to transfer receipts.
-    pub transfer_ratio: f64,
-}
-
-impl SubscriptionPool {
-    pub fn new(subscriber: [u8; 32], tier: Tier, balance: u64, start_date: u64, duration_secs: u64) -> Self {
-        Self {
-            subscriber,
-            tier,
-            balance,
-            storage_quota: tier.storage_quota(),
-            bandwidth_quota: tier.bandwidth_quota(),
-            storage_used: 0,
-            bandwidth_used: 0,
-            start_date,
-            expires_at: start_date + duration_secs,
-            storage_ratio: DEFAULT_STORAGE_RATIO,
-            transfer_ratio: DEFAULT_TRANSFER_RATIO,
+    /// Add a CID to be funded by this pool.
+    pub fn add_cid(&mut self, cid: ContentId) {
+        if !self.funded_cids.contains(&cid) {
+            self.funded_cids.push(cid);
         }
     }
 
-    /// Whether the subscription is active at `now` (unix timestamp).
-    pub fn is_active(&self, now: u64) -> bool {
-        now >= self.start_date && now < self.expires_at && self.balance > 0
+    /// Remove a CID from this pool.
+    pub fn remove_cid(&mut self, cid: &ContentId) {
+        self.funded_cids.retain(|c| c != cid);
     }
 
-    /// Whether the pool is funded.
-    pub fn is_funded(&self) -> bool {
-        self.balance > 0
+    /// Check if a CID is funded by this pool.
+    pub fn funds_cid(&self, cid: &ContentId) -> bool {
+        self.funded_cids.contains(cid)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Pool distribution
+// Pool distribution (StorageReceipt-only)
 // ---------------------------------------------------------------------------
 
 /// Public key type alias (32-byte ed25519 pubkey).
 pub type PublicKey = [u8; 32];
 
-/// Distribution of receipts across storage and transfer buckets.
+/// Distribution of StorageReceipts across nodes.
+///
+/// Only StorageReceipts (PDP) are used for settlement. TransferReceipts
+/// are analytics-only and not included in distribution.
 #[derive(Debug, Clone, Default)]
 pub struct PoolDistribution {
     /// (node pubkey, receipt count) from StorageReceipts.
-    pub storage_bucket: Vec<(PublicKey, u64)>,
-    /// (node pubkey, total bytes served) from TransferReceipts.
-    pub transfer_bucket: Vec<(PublicKey, u64)>,
+    pub storage_receipts: Vec<(PublicKey, u64)>,
 }
 
-/// Compute distribution from receipts.
+/// Compute distribution from StorageReceipts only.
 ///
-/// Aggregates StorageReceipts by `storage_node` (count) and
-/// TransferReceipts by `server_node` (sum of bytes_served).
-pub fn compute_distribution(
-    storage_receipts: &[StorageReceipt],
-    transfer_receipts: &[TransferReceipt],
-) -> PoolDistribution {
+/// Aggregates StorageReceipts by `storage_node` (count). Each PDP pass = 1 receipt.
+pub fn compute_distribution(storage_receipts: &[StorageReceipt]) -> PoolDistribution {
     let mut storage_map: HashMap<PublicKey, u64> = HashMap::new();
     for r in storage_receipts {
         *storage_map.entry(r.storage_node).or_default() += 1;
     }
 
-    let mut transfer_map: HashMap<PublicKey, u64> = HashMap::new();
-    for r in transfer_receipts {
-        *transfer_map.entry(r.server_node).or_default() += r.bytes_served;
-    }
-
     PoolDistribution {
-        storage_bucket: storage_map.into_iter().collect(),
-        transfer_bucket: transfer_map.into_iter().collect(),
+        storage_receipts: storage_map.into_iter().collect(),
     }
 }
 
-/// Compute the USDC lamports claimable by `node` from a pool.
+/// Compute the USDC lamports claimable by `node` from a creator pool.
 ///
-/// Storage bucket: `pool_balance * storage_ratio * (node_receipts / total_receipts)`
-/// Transfer bucket: `pool_balance * transfer_ratio * (node_bytes / total_bytes)`
+/// `node_payout = (node_receipts / total_receipts) * pool_balance * (10_000 - fee_bps) / 10_000`
+///
+/// Protocol fee is deducted from each claim.
 pub fn compute_claim(
     node: &PublicKey,
     distribution: &PoolDistribution,
     pool_balance: u64,
-    storage_ratio: f64,
-    transfer_ratio: f64,
+    protocol_fee_bps: u16,
 ) -> u64 {
-    let storage_share = {
-        let total: u64 = distribution.storage_bucket.iter().map(|(_, c)| c).sum();
-        if total == 0 {
-            0
-        } else {
-            let node_count = distribution
-                .storage_bucket
-                .iter()
-                .find(|(k, _)| k == node)
-                .map(|(_, c)| *c)
-                .unwrap_or(0);
-            ((pool_balance as f64) * storage_ratio * (node_count as f64 / total as f64)) as u64
-        }
-    };
+    let total: u64 = distribution.storage_receipts.iter().map(|(_, c)| c).sum();
+    if total == 0 {
+        return 0;
+    }
 
-    let transfer_share = {
-        let total: u64 = distribution.transfer_bucket.iter().map(|(_, b)| b).sum();
-        if total == 0 {
-            0
-        } else {
-            let node_bytes = distribution
-                .transfer_bucket
-                .iter()
-                .find(|(k, _)| k == node)
-                .map(|(_, b)| *b)
-                .unwrap_or(0);
-            ((pool_balance as f64) * transfer_ratio * (node_bytes as f64 / total as f64)) as u64
-        }
-    };
-
-    storage_share + transfer_share
-}
-
-// ---------------------------------------------------------------------------
-// Double-pool detection
-// ---------------------------------------------------------------------------
-
-/// Result of double-pool detection for a transfer event.
-#[derive(Debug, Clone)]
-pub struct DoublePoolClaim {
-    /// Amount claimable from the content pool (storage bucket).
-    pub content_pool_amount: u64,
-    /// Amount claimable from the subscription pool (transfer bucket).
-    pub subscription_pool_amount: u64,
-}
-
-/// Check if a TransferReceipt qualifies for double-pool earning.
-///
-/// Returns amounts claimable from each pool if both conditions are met:
-/// 1. The content_id has a funded ContentPool
-/// 2. The requester has an active SubscriptionPool
-pub fn detect_double_pool(
-    receipt: &TransferReceipt,
-    content_pool: Option<&ContentPool>,
-    subscription_pool: Option<&SubscriptionPool>,
-    content_distribution: Option<&PoolDistribution>,
-    sub_distribution: Option<&PoolDistribution>,
-    now: u64,
-) -> Option<DoublePoolClaim> {
-    let cp = content_pool.filter(|p| p.is_funded() && p.content_id == receipt.content_id)?;
-    let sp = subscription_pool.filter(|p| p.is_active(now) && p.subscriber == receipt.requester)?;
-
-    let content_amount = content_distribution
-        .map(|d| compute_claim(&receipt.server_node, d, cp.balance, cp.storage_ratio, cp.transfer_ratio))
+    let node_count = distribution
+        .storage_receipts
+        .iter()
+        .find(|(k, _)| k == node)
+        .map(|(_, c)| *c)
         .unwrap_or(0);
 
-    let sub_amount = sub_distribution
-        .map(|d| compute_claim(&receipt.server_node, d, sp.balance, sp.storage_ratio, sp.transfer_ratio))
-        .unwrap_or(0);
+    if node_count == 0 {
+        return 0;
+    }
 
-    Some(DoublePoolClaim {
-        content_pool_amount: content_amount,
-        subscription_pool_amount: sub_amount,
-    })
+    let gross = ((pool_balance as u128) * (node_count as u128) / (total as u128)) as u64;
+    // Deduct protocol fee
+    (gross as u128 * (10_000 - protocol_fee_bps as u128) / 10_000) as u64
+}
+
+/// Compute the protocol fee amount for a given gross claim.
+pub fn protocol_fee(amount: u64, fee_bps: u16) -> u64 {
+    (amount as u128 * fee_bps as u128 / 10_000) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +243,7 @@ pub enum EvictionPolicy {
 #[derive(Debug, Clone)]
 pub struct StoredCid {
     pub content_id: ContentId,
-    /// Whether this CID has a funded content pool.
+    /// Whether this CID has a funded creator pool.
     pub is_funded: bool,
     /// Last access timestamp (unix seconds).
     pub last_accessed: u64,
@@ -398,40 +329,60 @@ mod tests {
         }
     }
 
-    // -- ContentPool tests --
+    // -- CreatorPool tests --
 
     #[test]
-    fn test_content_pool_new() {
-        let cid = ContentId([1u8; 32]);
-        let pool = ContentPool::new(cid, Tier::Pro, 100 * USDC);
+    fn test_creator_pool_new() {
+        let pool = CreatorPool::new([1u8; 32], Tier::Pro, 100 * USDC);
         assert!(pool.is_funded());
         assert_eq!(pool.total_claimed, 0);
-        assert!((pool.storage_ratio - 0.6).abs() < f64::EPSILON);
-        assert!((pool.transfer_ratio - 0.4).abs() < f64::EPSILON);
+        assert_eq!(pool.protocol_fee_bps, DEFAULT_PROTOCOL_FEE_BPS);
+        assert!(pool.funded_cids.is_empty());
     }
 
     #[test]
-    fn test_content_pool_unfunded() {
-        let pool = ContentPool::new(ContentId([0u8; 32]), Tier::Free, 0);
+    fn test_creator_pool_unfunded() {
+        let pool = CreatorPool::new([0u8; 32], Tier::Free, 0);
         assert!(!pool.is_funded());
     }
 
-    // -- SubscriptionPool tests --
-
     #[test]
-    fn test_subscription_pool_active() {
-        let pool = SubscriptionPool::new([1u8; 32], Tier::Standard, 10 * USDC, 1000, 3600);
-        assert!(pool.is_active(1000));
-        assert!(pool.is_active(2000));
-        assert!(!pool.is_active(4600)); // expired
-        assert!(!pool.is_active(999)); // not started
+    fn test_creator_pool_with_fee() {
+        let pool = CreatorPool::with_fee([1u8; 32], Tier::Lite, 50 * USDC, 300);
+        assert_eq!(pool.protocol_fee_bps, 300);
     }
 
     #[test]
-    fn test_subscription_pool_expired_balance() {
-        let mut pool = SubscriptionPool::new([1u8; 32], Tier::Lite, 5 * USDC, 1000, 3600);
-        pool.balance = 0;
-        assert!(!pool.is_active(2000)); // has time but no balance
+    fn test_creator_pool_cid_management() {
+        let mut pool = CreatorPool::new([1u8; 32], Tier::Pro, 100 * USDC);
+        let cid1 = ContentId([1u8; 32]);
+        let cid2 = ContentId([2u8; 32]);
+
+        pool.add_cid(cid1);
+        pool.add_cid(cid2);
+        assert!(pool.funds_cid(&cid1));
+        assert!(pool.funds_cid(&cid2));
+        assert_eq!(pool.funded_cids.len(), 2);
+
+        // Adding duplicate is a no-op
+        pool.add_cid(cid1);
+        assert_eq!(pool.funded_cids.len(), 2);
+
+        pool.remove_cid(&cid1);
+        assert!(!pool.funds_cid(&cid1));
+        assert!(pool.funds_cid(&cid2));
+    }
+
+    #[test]
+    fn test_creator_pool_serde_roundtrip() {
+        let mut pool = CreatorPool::new([1u8; 32], Tier::Standard, 10 * USDC);
+        pool.add_cid(ContentId([5u8; 32]));
+        let json = serde_json::to_string(&pool).unwrap();
+        let parsed: CreatorPool = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.creator, pool.creator);
+        assert_eq!(parsed.tier, pool.tier);
+        assert_eq!(parsed.balance, pool.balance);
+        assert_eq!(parsed.funded_cids.len(), 1);
     }
 
     // -- Distribution tests --
@@ -449,23 +400,10 @@ mod tests {
         }
     }
 
-    fn make_transfer_receipt(node: [u8; 32], requester: [u8; 32], cid: ContentId, bytes: u64) -> TransferReceipt {
-        TransferReceipt {
-            content_id: cid,
-            server_node: node,
-            requester,
-            shard_index: 0,
-            bytes_served: bytes,
-            timestamp: 1000,
-            signature: vec![],
-        }
-    }
-
     #[test]
     fn test_compute_distribution_empty() {
-        let d = compute_distribution(&[], &[]);
-        assert!(d.storage_bucket.is_empty());
-        assert!(d.transfer_bucket.is_empty());
+        let d = compute_distribution(&[]);
+        assert!(d.storage_receipts.is_empty());
     }
 
     #[test]
@@ -479,20 +417,12 @@ mod tests {
             make_storage_receipt(node_a, cid),
             make_storage_receipt(node_b, cid),
         ];
-        let transfer = vec![
-            make_transfer_receipt(node_a, [10u8; 32], cid, 1000),
-            make_transfer_receipt(node_b, [10u8; 32], cid, 3000),
-        ];
 
-        let d = compute_distribution(&storage, &transfer);
+        let d = compute_distribution(&storage);
 
-        let sa: HashMap<_, _> = d.storage_bucket.into_iter().collect();
+        let sa: HashMap<_, _> = d.storage_receipts.into_iter().collect();
         assert_eq!(sa[&node_a], 2);
         assert_eq!(sa[&node_b], 1);
-
-        let ta: HashMap<_, _> = d.transfer_bucket.into_iter().collect();
-        assert_eq!(ta[&node_a], 1000);
-        assert_eq!(ta[&node_b], 3000);
     }
 
     #[test]
@@ -502,103 +432,77 @@ mod tests {
         let balance = 1_000_000u64; // 1 USDC
 
         let dist = PoolDistribution {
-            storage_bucket: vec![(node_a, 3), (node_b, 1)],
-            transfer_bucket: vec![(node_a, 1000), (node_b, 3000)],
+            storage_receipts: vec![(node_a, 3), (node_b, 1)],
         };
 
-        let claim_a = compute_claim(&node_a, &dist, balance, 0.6, 0.4);
-        let claim_b = compute_claim(&node_b, &dist, balance, 0.6, 0.4);
+        // With 0% fee for easy math
+        let claim_a = compute_claim(&node_a, &dist, balance, 0);
+        let claim_b = compute_claim(&node_b, &dist, balance, 0);
 
-        // Storage: A gets 3/4 of 600k = 450k, B gets 1/4 of 600k = 150k
-        // Transfer: A gets 1/4 of 400k = 100k, B gets 3/4 of 400k = 300k
-        // A total: 550k, B total: 450k
-        assert_eq!(claim_a, 550_000);
-        assert_eq!(claim_b, 450_000);
+        // A gets 3/4 = 750k, B gets 1/4 = 250k
+        assert_eq!(claim_a, 750_000);
+        assert_eq!(claim_b, 250_000);
         assert_eq!(claim_a + claim_b, balance);
+    }
+
+    #[test]
+    fn test_compute_claim_with_protocol_fee() {
+        let node = [1u8; 32];
+        let balance = 1_000_000u64;
+
+        let dist = PoolDistribution {
+            storage_receipts: vec![(node, 10)],
+        };
+
+        // 5% fee (500 bps)
+        let claim = compute_claim(&node, &dist, balance, 500);
+        // gross = 1_000_000, net = 1_000_000 * 9500 / 10000 = 950_000
+        assert_eq!(claim, 950_000);
+    }
+
+    #[test]
+    fn test_compute_claim_with_10_percent_fee() {
+        let node_a = [1u8; 32];
+        let node_b = [2u8; 32];
+        let balance = 1_000_000u64;
+
+        let dist = PoolDistribution {
+            storage_receipts: vec![(node_a, 1), (node_b, 1)],
+        };
+
+        // 10% fee (1000 bps)
+        let claim_a = compute_claim(&node_a, &dist, balance, 1000);
+        let claim_b = compute_claim(&node_b, &dist, balance, 1000);
+
+        // Each gets 500k gross, 450k net
+        assert_eq!(claim_a, 450_000);
+        assert_eq!(claim_b, 450_000);
     }
 
     #[test]
     fn test_compute_claim_unknown_node() {
         let dist = PoolDistribution {
-            storage_bucket: vec![([1u8; 32], 10)],
-            transfer_bucket: vec![([1u8; 32], 5000)],
+            storage_receipts: vec![([1u8; 32], 10)],
         };
         let unknown = [99u8; 32];
-        assert_eq!(compute_claim(&unknown, &dist, 1_000_000, 0.6, 0.4), 0);
+        assert_eq!(compute_claim(&unknown, &dist, 1_000_000, 0), 0);
     }
 
     #[test]
-    fn test_compute_claim_storage_only() {
+    fn test_compute_claim_empty_distribution() {
         let node = [1u8; 32];
         let dist = PoolDistribution {
-            storage_bucket: vec![(node, 5)],
-            transfer_bucket: vec![],
+            storage_receipts: vec![],
         };
-        // All storage, no transfer receipts → gets storage share only
-        let claim = compute_claim(&node, &dist, 1_000_000, 0.6, 0.4);
-        assert_eq!(claim, 600_000); // 100% of storage bucket
-    }
-
-    // -- Double-pool tests --
-
-    #[test]
-    fn test_double_pool_both_funded() {
-        let cid = ContentId([1u8; 32]);
-        let server = [10u8; 32];
-        let requester = [20u8; 32];
-
-        let receipt = make_transfer_receipt(server, requester, cid, 5000);
-
-        let cp = ContentPool::new(cid, Tier::Pro, 100 * USDC);
-        let sp = SubscriptionPool::new(requester, Tier::Standard, 10 * USDC, 1000, 3600);
-
-        let cd = PoolDistribution {
-            storage_bucket: vec![(server, 5)],
-            transfer_bucket: vec![(server, 5000)],
-        };
-        let sd = PoolDistribution {
-            storage_bucket: vec![(server, 2)],
-            transfer_bucket: vec![(server, 5000)],
-        };
-
-        let result = detect_double_pool(&receipt, Some(&cp), Some(&sp), Some(&cd), Some(&sd), 2000);
-        assert!(result.is_some());
-        let claim = result.unwrap();
-        assert!(claim.content_pool_amount > 0);
-        assert!(claim.subscription_pool_amount > 0);
+        assert_eq!(compute_claim(&node, &dist, 1_000_000, 0), 0);
     }
 
     #[test]
-    fn test_double_pool_no_content_pool() {
-        let cid = ContentId([1u8; 32]);
-        let receipt = make_transfer_receipt([10u8; 32], [20u8; 32], cid, 5000);
-        let sp = SubscriptionPool::new([20u8; 32], Tier::Lite, 5 * USDC, 1000, 3600);
-
-        let result = detect_double_pool(&receipt, None, Some(&sp), None, None, 2000);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_double_pool_no_subscription() {
-        let cid = ContentId([1u8; 32]);
-        let receipt = make_transfer_receipt([10u8; 32], [20u8; 32], cid, 5000);
-        let cp = ContentPool::new(cid, Tier::Lite, 5 * USDC);
-
-        let result = detect_double_pool(&receipt, Some(&cp), None, None, None, 2000);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_double_pool_expired_subscription() {
-        let cid = ContentId([1u8; 32]);
-        let requester = [20u8; 32];
-        let receipt = make_transfer_receipt([10u8; 32], requester, cid, 5000);
-        let cp = ContentPool::new(cid, Tier::Lite, 5 * USDC);
-        let sp = SubscriptionPool::new(requester, Tier::Lite, 5 * USDC, 1000, 100);
-
-        // now=5000 > expires_at=1100
-        let result = detect_double_pool(&receipt, Some(&cp), Some(&sp), None, None, 5000);
-        assert!(result.is_none());
+    fn test_protocol_fee_calculation() {
+        assert_eq!(protocol_fee(1_000_000, 500), 50_000); // 5%
+        assert_eq!(protocol_fee(1_000_000, 1000), 100_000); // 10%
+        assert_eq!(protocol_fee(1_000_000, 0), 0); // 0%
+        assert_eq!(protocol_fee(0, 500), 0); // zero amount
     }
 
     // -- Eviction tests --
@@ -613,7 +517,6 @@ mod tests {
 
         let result = eviction_priority(&cids, EvictionPolicy::LRU);
         assert_eq!(result.len(), 2);
-        // Funded CID [1] should never appear
         assert!(!result.contains(&ContentId([1u8; 32])));
     }
 
@@ -626,7 +529,7 @@ mod tests {
         ];
 
         let result = eviction_priority(&cids, EvictionPolicy::LRU);
-        assert_eq!(result[0], ContentId([2u8; 32])); // accessed earliest
+        assert_eq!(result[0], ContentId([2u8; 32]));
         assert_eq!(result[1], ContentId([3u8; 32]));
         assert_eq!(result[2], ContentId([1u8; 32]));
     }
@@ -640,7 +543,7 @@ mod tests {
         ];
 
         let result = eviction_priority(&cids, EvictionPolicy::LeastFetched);
-        assert_eq!(result[0], ContentId([2u8; 32])); // fewest fetches
+        assert_eq!(result[0], ContentId([2u8; 32]));
         assert_eq!(result[1], ContentId([3u8; 32]));
         assert_eq!(result[2], ContentId([1u8; 32]));
     }
@@ -654,7 +557,7 @@ mod tests {
         ];
 
         let result = eviction_priority(&cids, EvictionPolicy::Oldest);
-        assert_eq!(result[0], ContentId([2u8; 32])); // stored earliest
+        assert_eq!(result[0], ContentId([2u8; 32]));
         assert_eq!(result[1], ContentId([3u8; 32]));
         assert_eq!(result[2], ContentId([1u8; 32]));
     }
