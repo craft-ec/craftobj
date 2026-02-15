@@ -538,6 +538,102 @@ impl DataCraftHandler {
         debug!("Completed P2P shard fetching for {} - downloaded missing shards from {} providers", content_id, providers.len());
         Ok(())
     }
+
+    // -- Payment channel IPC handlers --
+
+    async fn handle_channel_open(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let sender_hex = params.get("sender").and_then(|v| v.as_str()).ok_or("missing 'sender'")?;
+        let receiver_hex = params.get("receiver").and_then(|v| v.as_str()).ok_or("missing 'receiver'")?;
+        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
+
+        let sender = parse_pubkey(sender_hex)?;
+        let receiver = parse_pubkey(receiver_hex)?;
+
+        // Generate channel ID from hash of (sender, receiver, timestamp)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut id_data = Vec::new();
+        id_data.extend_from_slice(&sender);
+        id_data.extend_from_slice(&receiver);
+        id_data.extend_from_slice(&timestamp.to_le_bytes());
+        let channel_id: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(&id_data);
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&hash);
+            id
+        };
+
+        let channel = datacraft_core::payment_channel::PaymentChannel::new(
+            channel_id, sender, receiver, amount,
+        );
+
+        debug!("Opened payment channel {}", hex::encode(channel_id));
+
+        Ok(serde_json::json!({
+            "channel_id": hex::encode(channel.channel_id),
+            "sender": hex::encode(channel.sender),
+            "receiver": hex::encode(channel.receiver),
+            "locked_amount": channel.locked_amount,
+        }))
+    }
+
+    async fn handle_channel_voucher(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let channel_id_hex = params.get("channel_id").and_then(|v| v.as_str()).ok_or("missing 'channel_id'")?;
+        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
+        let nonce = params.get("nonce").and_then(|v| v.as_u64()).ok_or("missing 'nonce'")?;
+        let signature_hex = params.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+
+        let channel_id = parse_pubkey(channel_id_hex)?;
+        let signature = if signature_hex.is_empty() {
+            vec![]
+        } else {
+            hex::decode(signature_hex).map_err(|e| e.to_string())?
+        };
+
+        let voucher = datacraft_core::payment_channel::PaymentVoucher {
+            channel_id,
+            cumulative_amount: amount,
+            nonce,
+            signature,
+        };
+
+        debug!("Received voucher for channel {} amount={} nonce={}", hex::encode(channel_id), amount, nonce);
+
+        Ok(serde_json::json!({
+            "channel_id": hex::encode(voucher.channel_id),
+            "cumulative_amount": voucher.cumulative_amount,
+            "nonce": voucher.nonce,
+            "valid": !voucher.signature.is_empty(),
+        }))
+    }
+
+    async fn handle_channel_close(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let channel_id_hex = params.get("channel_id").and_then(|v| v.as_str()).ok_or("missing 'channel_id'")?;
+        let _channel_id = parse_pubkey(channel_id_hex)?;
+
+        debug!("Closing payment channel {}", channel_id_hex);
+
+        Ok(serde_json::json!({
+            "channel_id": channel_id_hex,
+            "status": "closed",
+        }))
+    }
+}
+
+fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
+    if bytes.len() != 32 {
+        return Err("expected 32 bytes hex".into());
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 impl IpcHandler for DataCraftHandler {
@@ -560,6 +656,9 @@ impl IpcHandler for DataCraftHandler {
                 "extend" => self.handle_extend(params).await,
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
+                "channel.open" => self.handle_channel_open(params).await,
+                "channel.voucher" => self.handle_channel_voucher(params).await,
+                "channel.close" => self.handle_channel_close(params).await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })
