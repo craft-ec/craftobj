@@ -18,6 +18,7 @@ use crate::channel_store::ChannelStore;
 use crate::commands::DataCraftCommand;
 use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
+use crate::events::{DaemonEvent, EventSender};
 use crate::protocol::DataCraftProtocol;
 use crate::receipt_store::PersistentReceiptStore;
 use crate::settlement::SolanaClient;
@@ -43,6 +44,7 @@ pub struct DataCraftHandler {
     own_capabilities: Vec<DataCraftCapability>,
     daemon_config: Option<Arc<Mutex<DaemonConfig>>>,
     data_dir: Option<std::path::PathBuf>,
+    event_sender: Option<EventSender>,
 }
 
 impl DataCraftHandler {
@@ -66,7 +68,13 @@ impl DataCraftHandler {
             own_capabilities: Vec::new(),
             daemon_config: None,
             data_dir: None,
+            event_sender: None,
         }
+    }
+
+    /// Set the event sender for broadcasting daemon events to WS clients.
+    pub fn set_event_sender(&mut self, sender: EventSender) {
+        self.event_sender = Some(sender);
     }
 
     /// Set the daemon config for get/set-config IPC commands.
@@ -104,6 +112,7 @@ impl DataCraftHandler {
             own_capabilities: Vec::new(),
             daemon_config: None,
             data_dir: None,
+            event_sender: None,
         }
     }
 
@@ -185,6 +194,14 @@ impl DataCraftHandler {
             }
         } else {
             debug!("Published {} (no DHT announcement - running without network)", result.content_id);
+        }
+
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::ContentPublished {
+                content_id: result.content_id.to_hex(),
+                size: result.total_size,
+                chunks: result.chunk_count as u32,
+            });
         }
 
         let mut response = serde_json::json!({
@@ -762,6 +779,13 @@ impl DataCraftHandler {
             reply_rx.await.map_err(|e| e.to_string())??;
         }
 
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::AccessGranted {
+                content_id: cid_hex.to_string(),
+                recipient: recipient_pubkey_hex.to_string(),
+            });
+        }
+
         Ok(serde_json::json!({
             "cid": cid_hex,
             "recipient": recipient_pubkey_hex,
@@ -789,6 +813,13 @@ impl DataCraftHandler {
                 reply_tx,
             }).map_err(|e| e.to_string())?;
             reply_rx.await.map_err(|e| e.to_string())??;
+        }
+
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::AccessRevoked {
+                content_id: cid_hex.to_string(),
+                recipient: recipient_pubkey_hex.to_string(),
+            });
         }
 
         Ok(serde_json::json!({
@@ -1013,6 +1044,12 @@ impl DataCraftHandler {
             }
         }
 
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::RemovalPublished {
+                content_id: cid_hex.to_string(),
+            });
+        }
+
         Ok(serde_json::json!({
             "cid": cid_hex,
             "removed": true,
@@ -1059,6 +1096,14 @@ impl DataCraftHandler {
         cs.open_channel(channel.clone()).map_err(|e| e.to_string())?;
 
         debug!("Opened payment channel {}", hex::encode(channel_id));
+
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::ChannelOpened {
+                channel_id: hex::encode(channel.channel_id),
+                receiver: hex::encode(channel.receiver),
+                amount: channel.locked_amount,
+            });
+        }
 
         Ok(serde_json::json!({
             "channel_id": hex::encode(channel.channel_id),
@@ -1115,6 +1160,12 @@ impl DataCraftHandler {
 
         debug!("Closed payment channel {}", channel_id_hex);
 
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::ChannelClosed {
+                channel_id: channel_id_hex.to_string(),
+            });
+        }
+
         Ok(serde_json::json!({
             "channel_id": channel_id_hex,
             "status": "closed",
@@ -1153,6 +1204,13 @@ impl DataCraftHandler {
 
         let client = sc.lock().await;
         let result = client.fund_pool(&creator, amount).await.map_err(|e| e.to_string())?;
+
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(DaemonEvent::PoolFunded {
+                creator: creator_hex.to_string(),
+                amount,
+            });
+        }
 
         Ok(serde_json::json!({
             "signature": result.signature,

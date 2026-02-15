@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::DataCraftCommand;
 use crate::content_tracker::ContentTracker;
+use crate::events::{DaemonEvent, EventSender};
 
 /// Default maintenance interval in seconds (10 minutes).
 /// Prefer using `DaemonConfig::reannounce_interval_secs` instead.
@@ -26,6 +27,7 @@ pub async fn content_maintenance_loop(
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     client: Arc<Mutex<DataCraftClient>>,
     interval_secs: u64,
+    event_tx: EventSender,
 ) {
     use std::time::Duration;
 
@@ -35,7 +37,7 @@ pub async fn content_maintenance_loop(
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
-        run_maintenance_cycle(&tracker, &command_tx, &client).await;
+        run_maintenance_cycle(&tracker, &command_tx, &client, &event_tx).await;
     }
 }
 
@@ -44,6 +46,7 @@ pub async fn run_maintenance_cycle(
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
     client: &Arc<Mutex<DataCraftClient>>,
+    event_tx: &EventSender,
 ) {
     // Phase 1: Re-announce content that needs it
     let needs_announce = {
@@ -56,7 +59,7 @@ pub async fn run_maintenance_cycle(
     }
 
     for content_id in needs_announce {
-        reannounce_content(&content_id, tracker, command_tx, client).await;
+        reannounce_content(&content_id, tracker, command_tx, client, event_tx).await;
     }
 
     // Phase 2: Check distribution status by resolving providers
@@ -76,6 +79,7 @@ async fn reannounce_content(
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
     client: &Arc<Mutex<DataCraftClient>>,
+    event_tx: &EventSender,
 ) {
     // Get manifest from local store
     let manifest = {
@@ -104,6 +108,9 @@ async fn reannounce_content(
     match reply_rx.await {
         Ok(Ok(())) => {
             debug!("Re-announced {} to DHT", content_id);
+            let _ = event_tx.send(DaemonEvent::ContentReannounced {
+                content_id: content_id.to_hex(),
+            });
             let mut t = tracker.lock().await;
             t.mark_announced(content_id);
         }
@@ -163,7 +170,8 @@ pub async fn trigger_immediate_reannounce(
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
     client: &Arc<Mutex<DataCraftClient>>,
+    event_tx: &EventSender,
 ) {
     info!("Triggering immediate re-announcement (first storage peer connected)");
-    run_maintenance_cycle(tracker, command_tx, client).await;
+    run_maintenance_cycle(tracker, command_tx, client, event_tx).await;
 }

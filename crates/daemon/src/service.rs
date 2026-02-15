@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::commands::DataCraftCommand;
+use crate::events::{self, DaemonEvent, EventSender};
 use crate::handler::DataCraftHandler;
 use crate::protocol::{DataCraftProtocol, DataCraftEvent};
 
@@ -132,6 +133,9 @@ pub async fn run_daemon_with_config(
         daemon_config.reannounce_interval_secs,
         daemon_config.reannounce_threshold_secs,
     );
+
+    // Create broadcast channel for daemon events (WS push)
+    let (event_tx, _) = events::event_channel(256);
 
     // Build client and shared store
     let client = DataCraftClient::new(&data_dir)?;
@@ -281,6 +285,7 @@ pub async fn run_daemon_with_config(
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
     handler.set_daemon_config(daemon_config_shared, data_dir.clone());
+    handler.set_event_sender(event_tx.clone());
     let handler = Arc::new(handler);
 
     info!("Starting IPC server on {}", socket_path);
@@ -310,9 +315,10 @@ pub async fn run_daemon_with_config(
 
     // Start WebSocket server if enabled
     let ws_handler = handler.clone();
+    let ws_event_tx = event_tx.clone();
     let ws_future = async {
         if ws_port > 0 {
-            if let Err(e) = crate::ws_server::run_ws_server(ws_port, ws_handler, api_key).await {
+            if let Err(e) = crate::ws_server::run_ws_server(ws_port, ws_handler, api_key, ws_event_tx).await {
                 error!("WebSocket server error: {}", e);
             }
         } else {
@@ -320,6 +326,8 @@ pub async fn run_daemon_with_config(
             std::future::pending::<()>().await;
         }
     };
+
+    let _ = event_tx.send(DaemonEvent::DaemonStarted);
 
     // Run all components concurrently
     tokio::select! {
@@ -331,7 +339,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -340,13 +348,13 @@ pub async fn run_daemon_with_config(
         _ = handle_incoming_coord_streams(coord_streams, protocol.clone()) => {
             info!("Incoming coord streams handler ended");
         }
-        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone()) => {
+        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone()) => {
             info!("Protocol events handler ended");
         }
         _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs) => {
             info!("Capability announcement loop ended");
         }
-        _ = run_challenger_loop(challenger_mgr, store.clone()) => {
+        _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
             info!("Challenger loop ended");
         }
         _ = crate::reannounce::content_maintenance_loop(
@@ -354,6 +362,7 @@ pub async fn run_daemon_with_config(
             command_tx_for_maintenance,
             client.clone(),
             daemon_config.reannounce_interval_secs,
+            event_tx.clone(),
         ) => {
             info!("Content maintenance loop ended");
         }
@@ -375,6 +384,7 @@ async fn drive_swarm(
     removal_cache: SharedRemovalCache,
     own_capabilities: Vec<DataCraftCapability>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    event_tx: EventSender,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -386,9 +396,11 @@ async fn drive_swarm(
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("Listening on {}", address);
+                        let _ = event_tx.send(DaemonEvent::ListeningOn { address: address.to_string() });
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         info!("Connected to {}", peer_id);
+                        let _ = event_tx.send(DaemonEvent::PeerConnected { peer_id: peer_id.to_string() });
                         // Announce capabilities immediately so the new peer learns about us
                         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
                             capabilities: own_capabilities.clone(),
@@ -396,20 +408,21 @@ async fn drive_swarm(
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         info!("Disconnected from {}", peer_id);
+                        let _ = event_tx.send(DaemonEvent::PeerDisconnected { peer_id: peer_id.to_string() });
                     }
                     SwarmEvent::Behaviour(event) => {
                         debug!("Behaviour event: {:?}", event);
                         // Handle mDNS discovery: add discovered peers to Kademlia and dial them
-                        handle_mdns_event(swarm, &event);
+                        handle_mdns_event(swarm, &event, &event_tx);
                         // Try to extract gossipsub capability announcements before passing through
-                        handle_gossipsub_capability(&event, &peer_scorer).await;
+                        handle_gossipsub_capability(&event, &peer_scorer, &event_tx).await;
                         // Evict stale peers after processing announcements
                         {
                             let mut scorer = peer_scorer.lock().await;
                             scorer.evict_stale(std::time::Duration::from_secs(900)); // 15min TTL (3x announce interval)
                         }
-                        handle_gossipsub_removal(&event, &removal_cache).await;
-                        handle_gossipsub_storage_receipt(&event).await;
+                        handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
+                        handle_gossipsub_storage_receipt(&event, &event_tx).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -420,7 +433,7 @@ async fn drive_swarm(
             // Handle commands from IPC handler
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
-                    handle_command(swarm, &protocol, cmd, pending_requests.clone()).await;
+                    handle_command(swarm, &protocol, cmd, pending_requests.clone(), &event_tx).await;
                 }
             }
         }
@@ -433,6 +446,7 @@ async fn handle_command(
     protocol: &DataCraftProtocol,
     command: DataCraftCommand,
     pending_requests: PendingRequests,
+    event_tx: &EventSender,
 ) {
     match command {
         DataCraftCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
@@ -450,6 +464,7 @@ async fn handle_command(
                 protocol.publish_manifest(swarm.behaviour_mut(), &manifest, &local_peer_id).await
                     .map_err(|e| format!("Failed to publish manifest: {}", e))?;
                 
+                let _ = event_tx.send(DaemonEvent::ProviderAnnounced { content_id: content_id.to_hex() });
                 debug!("Successfully started DHT operations for {}", content_id);
                 Ok(())
             }.await;
@@ -490,6 +505,7 @@ async fn handle_command(
         }
         
         DataCraftCommand::PublishCapabilities { capabilities } => {
+            let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
             let local_peer_id = *swarm.local_peer_id();
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -508,6 +524,8 @@ async fn handle_command(
                         .publish_to_topic(datacraft_core::CAPABILITIES_TOPIC, data)
                     {
                         debug!("Failed to publish capabilities: {:?}", e);
+                    } else {
+                        let _ = event_tx.send(DaemonEvent::CapabilityPublished { capabilities: cap_strings });
                     }
                 }
                 Err(e) => {
@@ -627,6 +645,7 @@ async fn handle_command(
 fn handle_mdns_event(
     swarm: &mut craftec_network::CraftSwarm,
     event: &craftec_network::behaviour::CraftBehaviourEvent,
+    event_tx: &EventSender,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::mdns;
@@ -634,6 +653,10 @@ fn handle_mdns_event(
     if let CraftBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) = event {
         for (peer_id, addr) in peers {
             info!("mDNS discovered peer {} at {}", peer_id, addr);
+            let _ = event_tx.send(DaemonEvent::PeerDiscovered {
+                peer_id: peer_id.to_string(),
+                address: addr.to_string(),
+            });
             swarm.behaviour_mut().add_address(peer_id, addr.clone());
             // Dial the peer to establish a connection
             if let Err(e) = swarm.dial(addr.clone()) {
@@ -647,6 +670,7 @@ fn handle_mdns_event(
 async fn handle_gossipsub_capability(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     peer_scorer: &SharedPeerScorer,
+    event_tx: &EventSender,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -660,10 +684,15 @@ async fn handle_gossipsub_capability(
             match serde_json::from_slice::<CapabilityAnnouncement>(&message.data) {
                 Ok(ann) => {
                     if let Ok(peer_id) = libp2p::PeerId::from_bytes(&ann.peer_id) {
+                        let cap_strings: Vec<String> = ann.capabilities.iter().map(|c| c.to_string()).collect();
                         debug!(
                             "Received capability announcement from {}: {:?}",
                             peer_id, ann.capabilities
                         );
+                        let _ = event_tx.send(DaemonEvent::CapabilityAnnounced {
+                            peer_id: peer_id.to_string(),
+                            capabilities: cap_strings,
+                        });
                         let mut scorer = peer_scorer.lock().await;
                         // Only update if newer
                         let dominated = scorer
@@ -687,6 +716,7 @@ async fn handle_gossipsub_capability(
 async fn handle_gossipsub_removal(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     removal_cache: &SharedRemovalCache,
+    event_tx: &EventSender,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -699,7 +729,13 @@ async fn handle_gossipsub_removal(
         if topic_str == datacraft_core::REMOVAL_TOPIC {
             match bincode::deserialize::<datacraft_core::RemovalNotice>(&message.data) {
                 Ok(notice) => {
-                    if notice.verify() {
+                    let valid = notice.verify();
+                    let _ = event_tx.send(DaemonEvent::RemovalNoticeReceived {
+                        content_id: notice.cid.to_hex(),
+                        creator: notice.creator.clone(),
+                        valid,
+                    });
+                    if valid {
                         debug!(
                             "Received removal notice for {} from {}",
                             notice.cid, notice.creator
@@ -721,6 +757,7 @@ async fn handle_gossipsub_removal(
 /// Handle gossipsub StorageReceipt messages (for aggregator collection).
 async fn handle_gossipsub_storage_receipt(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
+    event_tx: &EventSender,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -738,6 +775,10 @@ async fn handle_gossipsub_storage_receipt(
                         receipt.content_id,
                         hex::encode(receipt.storage_node),
                     );
+                    let _ = event_tx.send(DaemonEvent::StorageReceiptReceived {
+                        content_id: receipt.content_id.to_hex(),
+                        storage_node: hex::encode(receipt.storage_node),
+                    });
                     // TODO: forward to aggregator service channel when running as aggregator node
                 }
                 Err(e) => {
@@ -794,6 +835,7 @@ async fn handle_incoming_streams(
 async fn handle_protocol_events(
     event_rx: &mut mpsc::UnboundedReceiver<DataCraftEvent>,
     pending_requests: PendingRequests,
+    daemon_event_tx: EventSender,
 ) {
     info!("Starting protocol events handler");
     
@@ -801,6 +843,10 @@ async fn handle_protocol_events(
         match event {
             DataCraftEvent::ProvidersResolved { content_id, providers } => {
                 info!("Found {} providers for {}", providers.len(), content_id);
+                let _ = daemon_event_tx.send(DaemonEvent::ProvidersResolved {
+                    content_id: content_id.to_hex(),
+                    count: providers.len(),
+                });
                 
                 // Find and respond to the waiting request
                 let mut pending = pending_requests.lock().await;
@@ -812,6 +858,10 @@ async fn handle_protocol_events(
             
             DataCraftEvent::ManifestRetrieved { content_id, manifest } => {
                 info!("Retrieved manifest for {} ({} chunks)", content_id, manifest.chunk_count);
+                let _ = daemon_event_tx.send(DaemonEvent::ManifestRetrieved {
+                    content_id: content_id.to_hex(),
+                    chunks: manifest.chunk_count as u32,
+                });
                 
                 // Find and respond to the waiting request
                 let mut pending = pending_requests.lock().await;
@@ -832,6 +882,10 @@ async fn handle_protocol_events(
 
             DataCraftEvent::DhtError { content_id, error } => {
                 warn!("DHT error for {}: {}", content_id, error);
+                let _ = daemon_event_tx.send(DaemonEvent::DhtError {
+                    content_id: content_id.to_hex(),
+                    error: error.clone(),
+                });
                 
                 // Find and respond to any waiting request with error
                 let mut pending = pending_requests.lock().await;
@@ -858,6 +912,7 @@ async fn handle_protocol_events(
 async fn run_challenger_loop(
     challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
     store: Arc<Mutex<datacraft_store::FsStore>>,
+    event_tx: EventSender,
 ) {
     use std::time::Duration;
 
@@ -872,6 +927,7 @@ async fn run_challenger_loop(
         let rounds = mgr.periodic_check(&store_guard).await;
         if rounds > 0 {
             info!("Challenger completed {} rounds", rounds);
+            let _ = event_tx.send(DaemonEvent::ChallengerRoundCompleted { rounds: rounds as u32 });
         }
     }
 }

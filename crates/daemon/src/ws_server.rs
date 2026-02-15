@@ -3,6 +3,9 @@
 //! Accepts WebSocket connections at `/ws` and routes JSON-RPC requests
 //! through the same `IpcHandler` used by the Unix socket IPC server.
 //! Connections must authenticate via `?key=<api_key>` query parameter.
+//!
+//! Server-push: each connection also receives `DaemonEvent`s as JSON-RPC
+//! notifications with `method: "event"`.
 
 use std::sync::Arc;
 
@@ -13,15 +16,20 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
+use crate::events::EventSender;
+
 /// Run the WebSocket JSON-RPC server.
 ///
 /// Listens on the given port and upgrades HTTP connections at `/ws` to WebSocket.
 /// Each incoming text message is parsed as a JSON-RPC 2.0 request and dispatched
 /// to the shared `handler`. Connections must include `?key=<api_key>` in the URI.
+///
+/// Each connection also receives broadcast `DaemonEvent`s as JSON-RPC notifications.
 pub async fn run_ws_server(
     port: u16,
     handler: Arc<dyn IpcHandler>,
     api_key: String,
+    event_tx: EventSender,
 ) -> std::io::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
@@ -32,6 +40,7 @@ pub async fn run_ws_server(
             Ok((stream, peer)) => {
                 let handler = handler.clone();
                 let api_key = api_key.clone();
+                let event_rx = event_tx.subscribe();
                 tokio::spawn(async move {
                     // Perform WebSocket handshake with path + API key check
                     let ws_stream = match tokio_tungstenite::accept_hdr_async(
@@ -75,7 +84,7 @@ pub async fn run_ws_server(
                     };
 
                     debug!("WebSocket client connected: {}", peer);
-                    handle_ws_connection(ws_stream, handler, peer).await;
+                    handle_ws_connection(ws_stream, handler, peer, event_rx).await;
                     debug!("WebSocket client disconnected: {}", peer);
                 });
             }
@@ -90,46 +99,75 @@ async fn handle_ws_connection(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     handler: Arc<dyn IpcHandler>,
     peer: std::net::SocketAddr,
+    mut event_rx: crate::events::EventReceiver,
 ) {
     let (mut sink, mut stream) = ws_stream.split();
 
-    while let Some(msg) = stream.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                debug!("WebSocket read error from {}: {}", peer, e);
-                break;
-            }
-        };
-
-        match msg {
-            Message::Text(text) => {
-                let response = match serde_json::from_str::<RpcRequest>(&text) {
-                    Ok(req) => {
-                        debug!("WS RPC: {} (id={})", req.method, req.id);
-                        match handler.handle(&req.method, req.params).await {
-                            Ok(result) => RpcResponse::success(req.id, result),
-                            Err(msg) => RpcResponse::error(req.id, -32000, msg),
-                        }
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        debug!("WebSocket read error from {}: {}", peer, e);
+                        break;
                     }
-                    Err(e) => {
-                        warn!("Invalid JSON-RPC from {}: {}", peer, e);
-                        RpcResponse::error(0, -32700, format!("Parse error: {}", e))
-                    }
+                    None => break,
                 };
 
-                let json = serde_json::to_string(&response).unwrap_or_default();
-                if sink.send(Message::Text(json)).await.is_err() {
-                    break;
+                match msg {
+                    Message::Text(text) => {
+                        let response = match serde_json::from_str::<RpcRequest>(&text) {
+                            Ok(req) => {
+                                debug!("WS RPC: {} (id={})", req.method, req.id);
+                                match handler.handle(&req.method, req.params).await {
+                                    Ok(result) => RpcResponse::success(req.id, result),
+                                    Err(msg) => RpcResponse::error(req.id, -32000, msg),
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Invalid JSON-RPC from {}: {}", peer, e);
+                                RpcResponse::error(0, -32700, format!("Parse error: {}", e))
+                            }
+                        };
+
+                        let json = serde_json::to_string(&response).unwrap_or_default();
+                        if sink.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Ping(data) => {
+                        if sink.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {} // Ignore binary, pong, etc.
                 }
             }
-            Message::Ping(data) => {
-                if sink.send(Message::Pong(data)).await.is_err() {
-                    break;
+
+            event = event_rx.recv() => {
+                match event {
+                    Ok(daemon_event) => {
+                        // Send as JSON-RPC notification (no id)
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": daemon_event,
+                        });
+                        let json = serde_json::to_string(&notification).unwrap_or_default();
+                        if sink.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("WebSocket client {} lagged, dropped {} events", peer, n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
-            Message::Close(_) => break,
-            _ => {} // Ignore binary, pong, etc.
         }
     }
 }

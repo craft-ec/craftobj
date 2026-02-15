@@ -10,6 +10,7 @@ pub mod challenger;
 pub mod channel_store;
 pub mod config;
 pub mod content_tracker;
+pub mod events;
 
 pub mod commands;
 pub mod handler;
