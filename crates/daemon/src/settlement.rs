@@ -43,10 +43,10 @@ const COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const MAX_RPC_RETRIES: u32 = 3;
 
 /// Environment variable for RPC URL override.
-pub const RPC_URL_ENV: &str = "DATACRAFT_SOLANA_RPC_URL";
+pub const RPC_URL_ENV: &str = "CRAFTEC_SOLANA_RPC_URL";
 
 /// Environment variable for USDC mint override.
-pub const USDC_MINT_ENV: &str = "DATACRAFT_USDC_MINT";
+pub const USDC_MINT_ENV: &str = "CRAFTEC_USDC_MINT";
 
 // ── Errors ──────────────────────────────────────────────────────────────
 
@@ -338,8 +338,8 @@ impl Default for SettlementConfig {
 impl SettlementConfig {
     /// Create config from environment, falling back to defaults.
     ///
-    /// - `DATACRAFT_SOLANA_RPC_URL` → sets RPC URL and disables dry-run
-    /// - `DATACRAFT_USDC_MINT` → overrides USDC mint address
+    /// - `CRAFTEC_SOLANA_RPC_URL` → sets RPC URL and disables dry-run
+    /// - `CRAFTEC_USDC_MINT` → overrides USDC mint address
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
