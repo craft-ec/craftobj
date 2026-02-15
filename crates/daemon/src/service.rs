@@ -105,10 +105,27 @@ pub async fn run_daemon_with_config(
     ws_port: u16,
     config_path: Option<std::path::PathBuf>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Load daemon config
+    // Load daemon config (writes defaults if no config file exists yet)
     let daemon_config = match config_path {
-        Some(ref path) => crate::config::DaemonConfig::load_from(path),
-        None => crate::config::DaemonConfig::load(&data_dir),
+        Some(ref path) => {
+            let cfg = crate::config::DaemonConfig::load_from(path);
+            if !path.exists() {
+                if let Err(e) = cfg.save_to(path) {
+                    warn!("Failed to write default config to {:?}: {}", path, e);
+                }
+            }
+            cfg
+        }
+        None => {
+            let cfg = crate::config::DaemonConfig::load(&data_dir);
+            let config_file = data_dir.join("config.json");
+            if !config_file.exists() {
+                if let Err(e) = cfg.save(&data_dir) {
+                    warn!("Failed to write default config to {:?}: {}", config_file, e);
+                }
+            }
+            cfg
+        }
     };
     info!("Daemon config: capability_announce={}s, reannounce_interval={}s, reannounce_threshold={}s",
         daemon_config.capability_announce_interval_secs,
@@ -240,27 +257,23 @@ pub async fn run_daemon_with_config(
         ),
     ));
 
-    // Own capabilities — read from CRAFTEC_CAPABILITIES env (comma-separated)
-    // e.g., CRAFTEC_CAPABILITIES=storage,client,aggregator
-    // Default: Storage + Client
-    let own_capabilities = match std::env::var("CRAFTEC_CAPABILITIES") {
-        Ok(caps) => {
-            let mut result = Vec::new();
-            for cap in caps.split(',').map(|s| s.trim().to_lowercase()) {
-                match cap.as_str() {
-                    "storage" => result.push(DataCraftCapability::Storage),
-                    "client" => result.push(DataCraftCapability::Client),
-                    _ => warn!("Unknown capability '{}', skipping", cap),
-                }
-            }
-            if result.is_empty() {
-                vec![DataCraftCapability::Client]
-            } else {
-                result
+    // Own capabilities — read from config file (env var override applied during config load)
+    let own_capabilities = {
+        let mut result = Vec::new();
+        for cap in &daemon_config.capabilities {
+            match cap.to_lowercase().as_str() {
+                "storage" => result.push(DataCraftCapability::Storage),
+                "client" => result.push(DataCraftCapability::Client),
+                _ => warn!("Unknown capability '{}' in config, skipping", cap),
             }
         }
-        Err(_) => vec![DataCraftCapability::Storage, DataCraftCapability::Client],
+        if result.is_empty() {
+            vec![DataCraftCapability::Client]
+        } else {
+            result
+        }
     };
+    info!("Capabilities: {:?}", own_capabilities);
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
     let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store);
@@ -317,7 +330,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone(), removal_cache.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -359,6 +372,8 @@ async fn drive_swarm(
     pending_requests: PendingRequests,
     peer_capabilities: PeerCapabilities,
     removal_cache: SharedRemovalCache,
+    own_capabilities: Vec<DataCraftCapability>,
+    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -373,6 +388,10 @@ async fn drive_swarm(
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         info!("Connected to {}", peer_id);
+                        // Announce capabilities immediately so the new peer learns about us
+                        let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
+                            capabilities: own_capabilities.clone(),
+                        });
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         info!("Disconnected from {}", peer_id);

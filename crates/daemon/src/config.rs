@@ -1,17 +1,41 @@
 //! Daemon configuration
 //!
-//! Configurable timing and behaviour parameters for the DataCraft daemon.
-//! Loaded from a JSON file with env var overrides.
+//! Configurable timing, capabilities, network, and behaviour parameters.
+//! Loaded from a JSON file with env var overrides as escape hatch.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
-/// Daemon configuration with timing parameters.
+/// Current schema version. Bump when adding/removing/renaming fields.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Daemon configuration — the single source of truth for a daemon instance.
+///
+/// Persisted to `{data_dir}/config.json`. CraftStudio writes this file;
+/// the daemon reads it on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
+    /// Schema version for migration support.
+    pub schema_version: u32,
+
+    // ── Capabilities ────────────────────────────────────────
+    /// Node capabilities (e.g. ["client", "storage", "aggregator"]).
+    /// This is the primary source — NOT env vars.
+    pub capabilities: Vec<String>,
+
+    // ── Network ─────────────────────────────────────────────
+    /// libp2p listen port (0 = random). CLI --listen overrides this.
+    pub listen_port: u16,
+    /// WebSocket server port for IPC (0 = disabled).
+    pub ws_port: u16,
+    /// Unix socket path for IPC.
+    pub socket_path: Option<String>,
+
+    // ── Timing ──────────────────────────────────────────────
     /// Capability announcement interval in seconds (default: 300)
     pub capability_announce_interval_secs: u64,
     /// Content reannounce check interval in seconds (default: 600)
@@ -20,38 +44,65 @@ pub struct DaemonConfig {
     pub reannounce_threshold_secs: u64,
     /// Challenger check interval in seconds (default: 300)
     pub challenger_interval_secs: Option<u64>,
+
+    // ── Storage ─────────────────────────────────────────────
+    /// Maximum storage in bytes (0 = unlimited).
+    pub max_storage_bytes: u64,
+
+    /// Unknown fields — preserved for forward compatibility.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            schema_version: SCHEMA_VERSION,
+            capabilities: vec!["client".to_string(), "storage".to_string()],
+            listen_port: 0,
+            ws_port: 9091,
+            socket_path: None,
             capability_announce_interval_secs: 300,
             reannounce_interval_secs: 600,
             reannounce_threshold_secs: 1200,
             challenger_interval_secs: None,
+            max_storage_bytes: 0,
+            extra: serde_json::Map::new(),
         }
     }
 }
 
 impl DaemonConfig {
     /// Load config from a specific file path, falling back to defaults.
-    /// Env vars always take priority.
+    /// Missing fields are filled from defaults (backward compat).
+    /// Unknown fields are preserved (forward compat).
+    /// Corrupt files → warning + defaults + overwrite.
     pub fn load_from(path: &Path) -> Self {
         let mut config = match std::fs::read_to_string(path) {
             Ok(data) => {
                 match serde_json::from_str::<DaemonConfig>(&data) {
-                    Ok(c) => {
-                        info!("Loaded daemon config from {:?}", path);
+                    Ok(mut c) => {
+                        info!("Loaded daemon config from {:?} (schema v{})", path, c.schema_version);
+                        c.migrate();
                         c
                     }
                     Err(e) => {
-                        warn!("Failed to parse config {:?}: {}, using defaults", path, e);
-                        Self::default()
+                        warn!("Corrupt config {:?}: {} — using defaults", path, e);
+                        let default = Self::default();
+                        // Try to overwrite the corrupt file
+                        if let Err(e2) = default.save_to(path) {
+                            warn!("Failed to overwrite corrupt config: {}", e2);
+                        }
+                        default
                     }
                 }
             }
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 debug!("No config file at {:?}, using defaults", path);
+                Self::default()
+            }
+            Err(e) => {
+                warn!("Failed to read config {:?}: {} — using defaults", path, e);
                 Self::default()
             }
         };
@@ -60,18 +111,18 @@ impl DaemonConfig {
         config
     }
 
-    /// Load config from `{data_dir}/config.json`, with env var overrides.
+    /// Load config from `{data_dir}/config.json`.
     pub fn load(data_dir: &Path) -> Self {
         Self::load_from(&data_dir.join("config.json"))
     }
 
-    /// Save config to a specific file path.
+    /// Save config to a specific file path. Creates parent dirs as needed.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -80,8 +131,31 @@ impl DaemonConfig {
         self.save_to(&data_dir.join("config.json"))
     }
 
-    /// Apply environment variable overrides (env vars take priority).
+    /// Migrate from older schema versions.
+    fn migrate(&mut self) {
+        if self.schema_version < 2 {
+            // v1 → v2: capabilities, network fields added.
+            // If capabilities is empty (old config didn't have it), set default.
+            if self.capabilities.is_empty() {
+                self.capabilities = vec!["client".to_string(), "storage".to_string()];
+            }
+            info!("Migrated config from v{} to v{}", self.schema_version, SCHEMA_VERSION);
+        }
+        self.schema_version = SCHEMA_VERSION;
+    }
+
+    /// Apply environment variable overrides (developer escape hatches only).
     fn apply_env_overrides(&mut self) {
+        if let Ok(val) = std::env::var("CRAFTEC_CAPABILITIES") {
+            let caps: Vec<String> = val.split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !caps.is_empty() {
+                debug!("CRAFTEC_CAPABILITIES override: {:?}", caps);
+                self.capabilities = caps;
+            }
+        }
         if let Ok(val) = std::env::var("DATACRAFT_CAPABILITY_ANNOUNCE_INTERVAL") {
             if let Ok(secs) = val.parse::<u64>() {
                 debug!("DATACRAFT_CAPABILITY_ANNOUNCE_INTERVAL={}", secs);
@@ -103,7 +177,25 @@ impl DaemonConfig {
     }
 
     /// Merge partial JSON values into this config (for set-config IPC).
-    pub fn merge(&mut self, partial: &serde_json::Value) {
+    pub fn merge(&mut self, partial: &Value) {
+        if let Some(v) = partial.get("capabilities").and_then(|v| v.as_array()) {
+            self.capabilities = v.iter()
+                .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        if let Some(v) = partial.get("listen_port").and_then(|v| v.as_u64()) {
+            self.listen_port = v as u16;
+        }
+        if let Some(v) = partial.get("ws_port").and_then(|v| v.as_u64()) {
+            self.ws_port = v as u16;
+        }
+        if let Some(v) = partial.get("socket_path") {
+            if v.is_null() {
+                self.socket_path = None;
+            } else if let Some(s) = v.as_str() {
+                self.socket_path = Some(s.to_string());
+            }
+        }
         if let Some(v) = partial.get("capability_announce_interval_secs").and_then(|v| v.as_u64()) {
             self.capability_announce_interval_secs = v;
         }
@@ -120,6 +212,14 @@ impl DaemonConfig {
                 self.challenger_interval_secs = Some(secs);
             }
         }
+        if let Some(v) = partial.get("max_storage_bytes").and_then(|v| v.as_u64()) {
+            self.max_storage_bytes = v;
+        }
+    }
+
+    /// Fields that require a daemon restart to take effect.
+    pub fn restart_required_fields() -> &'static [&'static str] {
+        &["capabilities", "listen_port", "ws_port", "socket_path"]
     }
 }
 
@@ -130,10 +230,14 @@ mod tests {
     #[test]
     fn test_default_values() {
         let config = DaemonConfig::default();
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        assert_eq!(config.capabilities, vec!["client", "storage"]);
         assert_eq!(config.capability_announce_interval_secs, 300);
         assert_eq!(config.reannounce_interval_secs, 600);
         assert_eq!(config.reannounce_threshold_secs, 1200);
         assert!(config.challenger_interval_secs.is_none());
+        assert_eq!(config.ws_port, 9091);
+        assert_eq!(config.listen_port, 0);
     }
 
     #[test]
@@ -156,10 +260,13 @@ mod tests {
 
         let mut config = DaemonConfig::default();
         config.reannounce_interval_secs = 42;
+        config.capabilities = vec!["client".to_string()];
         config.save(&dir).unwrap();
 
         let loaded = DaemonConfig::load(&dir);
         assert_eq!(loaded.reannounce_interval_secs, 42);
+        assert_eq!(loaded.capabilities, vec!["client"]);
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -170,11 +277,72 @@ mod tests {
         let partial = serde_json::json!({
             "reannounce_interval_secs": 999,
             "challenger_interval_secs": 120,
+            "capabilities": ["client", "aggregator"],
         });
         config.merge(&partial);
         assert_eq!(config.reannounce_interval_secs, 999);
         assert_eq!(config.challenger_interval_secs, Some(120));
+        assert_eq!(config.capabilities, vec!["client", "aggregator"]);
         // Unchanged
         assert_eq!(config.capability_announce_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_unknown_fields_preserved() {
+        let json = r#"{
+            "schema_version": 2,
+            "capabilities": ["client"],
+            "capability_announce_interval_secs": 300,
+            "reannounce_interval_secs": 600,
+            "reannounce_threshold_secs": 1200,
+            "future_field": "hello",
+            "another_future": 42
+        }"#;
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-config-test-extra-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), json).unwrap();
+
+        let config = DaemonConfig::load(&dir);
+        assert_eq!(config.extra.get("future_field").unwrap().as_str().unwrap(), "hello");
+        assert_eq!(config.extra.get("another_future").unwrap().as_u64().unwrap(), 42);
+
+        // Save and reload — extra fields should survive
+        config.save(&dir).unwrap();
+        let reloaded = DaemonConfig::load(&dir);
+        assert_eq!(reloaded.extra.get("future_field").unwrap().as_str().unwrap(), "hello");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v1_migration() {
+        // Simulate a v1 config (no capabilities, no schema_version)
+        let json = r#"{
+            "capability_announce_interval_secs": 300,
+            "reannounce_interval_secs": 600,
+            "reannounce_threshold_secs": 1200
+        }"#;
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-config-test-migrate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), json).unwrap();
+
+        let config = DaemonConfig::load(&dir);
+        // Should have migrated to v2 with default capabilities
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        assert_eq!(config.capabilities, vec!["client", "storage"]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
