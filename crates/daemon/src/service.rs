@@ -173,8 +173,8 @@ pub async fn run_daemon(
             .expect("failed to open channel store"),
     ));
 
-    // Initialize settlement client (dry-run mode by default)
-    let settlement_config = crate::settlement::SettlementConfig::default();
+    // Initialize settlement client (env-driven: set DATACRAFT_SOLANA_RPC_URL for real RPC)
+    let settlement_config = crate::settlement::SettlementConfig::from_env();
     let mut settlement_client = crate::settlement::SolanaClient::new(settlement_config)
         .expect("failed to create settlement client");
     if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {

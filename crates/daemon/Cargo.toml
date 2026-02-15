@@ -35,3 +35,8 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }
 craftec-settlement = { workspace = true }
+async-trait = { workspace = true }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }

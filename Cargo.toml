@@ -82,6 +82,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utils
 hex = "0.4"
 bincode = "1"
+async-trait = "0.1"
+
+# Solana
+solana-sdk = "2"
+solana-client = "2"
+spl-token = "8"
+spl-associated-token-account = "7"
 
 [profile.release]
 overflow-checks = true
