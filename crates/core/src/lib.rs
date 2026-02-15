@@ -3,8 +3,10 @@
 //! Content types and protocol primitives for DataCraft:
 //! content-addressed distributed storage with erasure coding.
 
+pub mod access;
 pub mod economics;
 pub mod payment_channel;
+pub mod pre;
 pub mod signing;
 
 use craftec_erasure::ErasureConfig;

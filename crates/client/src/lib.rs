@@ -428,6 +428,50 @@ mod tests {
     }
 
     #[test]
+    fn test_publish_encrypted_fetch_without_key_gets_ciphertext() {
+        let dir = test_dir();
+        let mut client = DataCraftClient::new(&dir).unwrap();
+
+        let file_path = dir.join("secret2.txt");
+        let plaintext = b"this is secret content that should be encrypted";
+        std::fs::write(&file_path, plaintext).unwrap();
+
+        let result = client
+            .publish(
+                &file_path,
+                &PublishOptions {
+                    encrypted: true,
+                    erasure_config: None,
+                },
+            )
+            .unwrap();
+        assert!(result.encryption_key.is_some());
+
+        // Reconstruct WITHOUT key — should get ciphertext (not plaintext)
+        let output_no_key = dir.join("no_key_output.bin");
+        client
+            .reconstruct(&result.content_id, &output_no_key, None)
+            .unwrap();
+        let raw = std::fs::read(&output_no_key).unwrap();
+        assert_ne!(raw, plaintext);
+        // The raw data should be nonce (12) + ciphertext
+        assert!(raw.len() > plaintext.len());
+
+        // Reconstruct WITH key — should get plaintext
+        let output_with_key = dir.join("with_key_output.bin");
+        client
+            .reconstruct(
+                &result.content_id,
+                &output_with_key,
+                result.encryption_key.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&output_with_key).unwrap(), plaintext);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_pin_unpin() {
         let dir = test_dir();
         let mut client = DataCraftClient::new(&dir).unwrap();

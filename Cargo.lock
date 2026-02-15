@@ -646,8 +646,11 @@ dependencies = [
 name = "datacraft-core"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "chacha20poly1305",
  "craftec-core",
  "craftec-erasure",
+ "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "libp2p",
@@ -656,6 +659,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "x25519-dalek",
 ]
 
 [[package]]

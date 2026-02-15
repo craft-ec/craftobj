@@ -225,6 +225,51 @@ pub fn protocol_fee(amount: u64, fee_bps: u16) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol Egress Pricing
+// ---------------------------------------------------------------------------
+
+/// Fixed protocol-wide egress price: USDC lamports per byte.
+///
+/// All nodes charge the same rate — competition is on performance, not price.
+/// 1 USDC lamport = 0.000001 USDC, so 1 lamport/byte ≈ $1/MB ≈ $0.001/KB.
+pub const PROTOCOL_EGRESS_PRICE_PER_BYTE: u64 = 1;
+
+/// Compute the egress cost for a given number of bytes.
+pub fn compute_egress_cost(bytes: u64) -> u64 {
+    bytes.saturating_mul(PROTOCOL_EGRESS_PRICE_PER_BYTE)
+}
+
+/// Egress pricing helper with the protocol rate constant.
+#[derive(Debug, Clone, Copy)]
+pub struct EgressPricing {
+    /// USDC lamports per byte.
+    pub rate_per_byte: u64,
+}
+
+impl Default for EgressPricing {
+    fn default() -> Self {
+        Self { rate_per_byte: PROTOCOL_EGRESS_PRICE_PER_BYTE }
+    }
+}
+
+impl EgressPricing {
+    /// Create with the default protocol rate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compute cost for the given byte count.
+    pub fn cost(&self, bytes: u64) -> u64 {
+        bytes.saturating_mul(self.rate_per_byte)
+    }
+
+    /// Check if a voucher amount covers the given byte count.
+    pub fn covers(&self, voucher_amount: u64, bytes: u64) -> bool {
+        voucher_amount >= self.cost(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Eviction
 // ---------------------------------------------------------------------------
 
@@ -506,6 +551,42 @@ mod tests {
     }
 
     // -- Eviction tests --
+
+    // -- Egress pricing tests --
+
+    #[test]
+    fn test_egress_price_constant() {
+        assert_eq!(PROTOCOL_EGRESS_PRICE_PER_BYTE, 1);
+    }
+
+    #[test]
+    fn test_compute_egress_cost() {
+        assert_eq!(compute_egress_cost(0), 0);
+        assert_eq!(compute_egress_cost(1024), 1024); // 1KB = 1024 lamports
+        assert_eq!(compute_egress_cost(1_000_000), 1_000_000); // 1MB = 1 USDC
+    }
+
+    #[test]
+    fn test_compute_egress_cost_overflow() {
+        // Should saturate, not panic
+        assert_eq!(compute_egress_cost(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_egress_pricing_struct() {
+        let pricing = EgressPricing::new();
+        assert_eq!(pricing.rate_per_byte, PROTOCOL_EGRESS_PRICE_PER_BYTE);
+        assert_eq!(pricing.cost(65536), 65536);
+    }
+
+    #[test]
+    fn test_egress_pricing_covers() {
+        let pricing = EgressPricing::new();
+        assert!(pricing.covers(100, 100));
+        assert!(pricing.covers(200, 100));
+        assert!(!pricing.covers(50, 100));
+        assert!(pricing.covers(0, 0));
+    }
 
     #[test]
     fn test_eviction_excludes_funded() {
