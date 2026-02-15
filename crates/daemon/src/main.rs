@@ -1,25 +1,110 @@
 //! DataCraft Daemon entry point
+//!
+//! Usage:
+//!   datacraft-daemon [OPTIONS]
+//!
+//! Options:
+//!   --listen <ADDR>     Listen address (default: /ip4/0.0.0.0/tcp/0)
+//!   --data-dir <PATH>   Data directory (default: platform-specific)
+//!   --socket <PATH>     IPC socket path (default: /tmp/datacraft.sock)
+//!   --log-level <LEVEL> Log level: trace, debug, info, warn, error (default: info)
 
 use datacraft_daemon::service;
 use craftec_network::NetworkConfig;
 use libp2p::identity::Keypair;
 use tracing::info;
 
+fn parse_args() -> (String, std::path::PathBuf, String, String) {
+    let args: Vec<String> = std::env::args().collect();
+    let mut listen = String::new();
+    let mut data_dir: Option<std::path::PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut log_level = "info".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--listen" => {
+                i += 1;
+                if i < args.len() { listen = args[i].clone(); }
+            }
+            "--data-dir" => {
+                i += 1;
+                if i < args.len() { data_dir = Some(std::path::PathBuf::from(&args[i])); }
+            }
+            "--socket" => {
+                i += 1;
+                if i < args.len() { socket = Some(args[i].clone()); }
+            }
+            "--log-level" => {
+                i += 1;
+                if i < args.len() { log_level = args[i].clone(); }
+            }
+            "--help" | "-h" => {
+                eprintln!("DataCraft Daemon");
+                eprintln!();
+                eprintln!("Usage: datacraft-daemon [OPTIONS]");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --listen <ADDR>      Listen multiaddr (default: /ip4/0.0.0.0/tcp/0)");
+                eprintln!("  --data-dir <PATH>    Data directory");
+                eprintln!("  --socket <PATH>      IPC socket path (default: /tmp/datacraft.sock)");
+                eprintln!("  --log-level <LEVEL>  Log level (default: info)");
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("Unknown argument: {}", other);
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let data_dir = data_dir.unwrap_or_else(service::default_data_dir);
+    let socket = socket.unwrap_or_else(service::default_socket_path);
+
+    (listen, data_dir, socket, log_level)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (listen, data_dir, socket_path, log_level) = parse_args();
+
     // Initialize logging
-    craftec_logging::init(craftec_logging::LogLevel::Info);
+    let level = match log_level.as_str() {
+        "trace" => craftec_logging::LogLevel::Trace,
+        "debug" => craftec_logging::LogLevel::Debug,
+        "warn" => craftec_logging::LogLevel::Warn,
+        "error" => craftec_logging::LogLevel::Error,
+        _ => craftec_logging::LogLevel::Info,
+    };
+    craftec_logging::init(level);
 
-    info!("DataCraft daemon starting...");
+    // Ensure data directory exists
+    std::fs::create_dir_all(&data_dir)?;
 
+    // Generate or load keypair
     let keypair = Keypair::generate_ed25519();
-    let data_dir = service::default_data_dir();
-    let socket_path = service::default_socket_path();
+    let peer_id = keypair.public().to_peer_id();
 
-    let network_config = NetworkConfig {
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  DataCraft Daemon                                          ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Peer ID:    {}  ║", &peer_id.to_string()[..46]);
+    eprintln!("║  Data dir:   {:<47}║", data_dir.display());
+    eprintln!("║  IPC socket: {:<47}║", &socket_path);
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
+
+    let mut network_config = NetworkConfig {
         protocol_prefix: "datacraft".to_string(),
         ..Default::default()
     };
+
+    if !listen.is_empty() {
+        network_config.listen_addrs = vec![listen.parse()?];
+    }
+
+    info!("DataCraft daemon starting with peer ID {}", peer_id);
 
     service::run_daemon(keypair, data_dir, socket_path, network_config).await
 }
