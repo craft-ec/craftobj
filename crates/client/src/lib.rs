@@ -49,6 +49,7 @@ pub struct ContentInfo {
 pub struct NodeStatus {
     pub stored_bytes: u64,
     pub content_count: usize,
+    pub shard_count: usize,
     pub pinned_count: usize,
 }
 
@@ -316,9 +317,16 @@ impl DataCraftClient {
                 stored_bytes += manifest.content_size;
             }
         }
+        let mut shard_count = 0usize;
+        for cid in &content {
+            if let Ok(manifest) = self.store.get_manifest(cid) {
+                shard_count += manifest.chunk_count;
+            }
+        }
         Ok(NodeStatus {
             stored_bytes,
             content_count: content.len(),
+            shard_count,
             pinned_count: self.pin_manager.list_pinned().len(),
         })
     }
