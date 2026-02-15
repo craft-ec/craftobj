@@ -5,6 +5,7 @@
 //! - IPC server for desktop/CLI clients
 //! - Content routing and transfer
 
+pub mod api_key;
 pub mod challenger;
 pub mod channel_store;
 pub mod commands;

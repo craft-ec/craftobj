@@ -253,11 +253,16 @@ pub async fn run_daemon(
     challenger_mgr.set_persistent_store(receipt_store.clone());
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
+    // Load or generate API key for WebSocket authentication
+    let api_key = crate::api_key::load_or_generate(&data_dir)
+        .map_err(|e| format!("Failed to load/generate API key: {}", e))?;
+    info!("API key loaded for WebSocket authentication");
+
     // Start WebSocket server if enabled
     let ws_handler = handler.clone();
     let ws_future = async {
         if ws_port > 0 {
-            if let Err(e) = crate::ws_server::run_ws_server(ws_port, ws_handler).await {
+            if let Err(e) = crate::ws_server::run_ws_server(ws_port, ws_handler, api_key).await {
                 error!("WebSocket server error: {}", e);
             }
         } else {

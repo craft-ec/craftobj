@@ -45,3 +45,6 @@ solana-sdk = { workspace = true }
 solana-client = { workspace = true }
 spl-token = { workspace = true }
 spl-associated-token-account = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

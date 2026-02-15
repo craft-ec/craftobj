@@ -2,6 +2,7 @@
 //!
 //! Accepts WebSocket connections at `/ws` and routes JSON-RPC requests
 //! through the same `IpcHandler` used by the Unix socket IPC server.
+//! Connections must authenticate via `?key=<api_key>` query parameter.
 
 use std::sync::Arc;
 
@@ -16,10 +17,11 @@ use tracing::{debug, error, info, warn};
 ///
 /// Listens on the given port and upgrades HTTP connections at `/ws` to WebSocket.
 /// Each incoming text message is parsed as a JSON-RPC 2.0 request and dispatched
-/// to the shared `handler`.
+/// to the shared `handler`. Connections must include `?key=<api_key>` in the URI.
 pub async fn run_ws_server(
     port: u16,
     handler: Arc<dyn IpcHandler>,
+    api_key: String,
 ) -> std::io::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
@@ -29,20 +31,37 @@ pub async fn run_ws_server(
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let handler = handler.clone();
+                let api_key = api_key.clone();
                 tokio::spawn(async move {
-                    // Perform WebSocket handshake with a path check callback
+                    // Perform WebSocket handshake with path + API key check
                     let ws_stream = match tokio_tungstenite::accept_hdr_async(
                         stream,
                         |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
                          resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                            let path = req.uri().path();
-                            if path == "/ws" || path == "/ws/" {
-                                Ok(resp)
-                            } else {
-                                use tokio_tungstenite::tungstenite::handshake::server::ErrorResponse;
-                                let mut err = ErrorResponse::new(Some("Not Found".into()));
+                            let uri = req.uri();
+                            let path = uri.path();
+                            if path != "/ws" && path != "/ws/" {
+                                let mut err = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some("Not Found".into()));
                                 *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
-                                Err(err)
+                                return Err(err);
+                            }
+
+                            // Validate API key from query string
+                            let query = uri.query().unwrap_or("");
+                            let key_value = query
+                                .split('&')
+                                .find_map(|pair| {
+                                    let (k, v) = pair.split_once('=')?;
+                                    if k == "key" { Some(v.to_string()) } else { None }
+                                });
+
+                            match key_value {
+                                Some(ref k) if k == &api_key => Ok(resp),
+                                _ => {
+                                    let mut err = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some("Unauthorized".into()));
+                                    *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+                                    Err(err)
+                                }
                             }
                         },
                     )
