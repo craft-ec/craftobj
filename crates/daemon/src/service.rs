@@ -583,7 +583,11 @@ async fn handle_command(
                     {
                         debug!("Failed to publish capabilities: {:?}", e);
                     } else {
-                        let _ = event_tx.send(DaemonEvent::CapabilityPublished { capabilities: cap_strings });
+                        let _ = event_tx.send(DaemonEvent::CapabilityPublished {
+                            capabilities: cap_strings,
+                            storage_committed: storage_committed_bytes,
+                            storage_used: storage_used_bytes,
+                        });
                     }
                 }
                 Err(e) => {
