@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use craftec_erasure::ErasureCoder;
 use datacraft_core::{
-    ChunkManifest, ContentId, DataCraftError, PublishOptions, Result,
+    ChunkManifest, ContentId, DataCraftError, PublishOptions, RemovalNotice, Result,
     access::{self, AccessEntry},
     default_erasure_config,
     pre::{self, EncryptedContentKey, ReEncryptedKey, ReKeyEntry},
@@ -153,6 +153,9 @@ impl DataCraftClient {
         };
         self.store.put_manifest(&manifest)?;
 
+        // Sign manifest if keypair provided (handled by publish_signed)
+        // For unsigned publish, creator/signature remain empty
+
         // Auto-pin published content
         self.pin_manager.pin(&content_id)?;
 
@@ -164,6 +167,45 @@ impl DataCraftClient {
             total_size,
             chunk_count,
         })
+    }
+
+    /// Publish a file with creator signing.
+    ///
+    /// Same as `publish()` but signs the manifest with the creator's keypair,
+    /// setting the `creator` DID and `signature` fields.
+    pub fn publish_signed(
+        &mut self,
+        path: &Path,
+        options: &PublishOptions,
+        keypair: &ed25519_dalek::SigningKey,
+    ) -> Result<PublishResult> {
+        let result = self.publish(path, options)?;
+
+        // Re-read the manifest, sign it, and re-store
+        let mut manifest = self.store.get_manifest(&result.content_id)?;
+        manifest.sign(keypair);
+        self.store.put_manifest(&manifest)?;
+
+        Ok(result)
+    }
+
+    /// Create a removal notice for content, signed by the creator.
+    ///
+    /// Returns the RemovalNotice for DHT posting. The caller (daemon) is
+    /// responsible for publishing to DHT and gossipsub.
+    pub fn remove_content(
+        &mut self,
+        keypair: &ed25519_dalek::SigningKey,
+        content_id: &ContentId,
+        reason: Option<String>,
+    ) -> Result<RemovalNotice> {
+        let notice = RemovalNotice::sign(keypair, *content_id, reason);
+
+        // Unpin locally
+        let _ = self.pin_manager.unpin(content_id);
+
+        info!("Created removal notice for {}", content_id);
+        Ok(notice)
     }
 
     /// Reconstruct content from locally stored shards.
@@ -294,7 +336,7 @@ impl DataCraftClient {
         let mut opts = options.clone();
         opts.encrypted = true;
 
-        let result = self.publish(path, &opts)?;
+        let result = self.publish_signed(path, &opts, creator_keypair)?;
         let content_key = result
             .encryption_key
             .as_ref()
@@ -877,6 +919,89 @@ mod tests {
         let status = client.status().unwrap();
         assert_eq!(status.content_count, 1);
         assert!(status.stored_bytes > 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_publish_signed_and_verify() {
+        use ed25519_dalek::SigningKey;
+
+        let dir = test_dir();
+        let mut client = DataCraftClient::new(&dir).unwrap();
+        let keypair = SigningKey::generate(&mut rand::thread_rng());
+
+        let file_path = dir.join("signed_test.txt");
+        std::fs::write(&file_path, b"signed content").unwrap();
+
+        let result = client
+            .publish_signed(&file_path, &PublishOptions::default(), &keypair)
+            .unwrap();
+
+        // Verify the manifest was signed
+        let manifest = client.store().get_manifest(&result.content_id).unwrap();
+        assert!(!manifest.creator.is_empty());
+        assert!(manifest.verify_creator());
+        assert_eq!(
+            manifest.creator_pubkey().unwrap(),
+            keypair.verifying_key().to_bytes()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_remove_content_creates_valid_notice() {
+        use ed25519_dalek::SigningKey;
+
+        let dir = test_dir();
+        let mut client = DataCraftClient::new(&dir).unwrap();
+        let keypair = SigningKey::generate(&mut rand::thread_rng());
+
+        let file_path = dir.join("to_remove.txt");
+        std::fs::write(&file_path, b"content to remove").unwrap();
+
+        let result = client
+            .publish_signed(&file_path, &PublishOptions::default(), &keypair)
+            .unwrap();
+        assert!(client.is_pinned(&result.content_id));
+
+        let notice = client
+            .remove_content(&keypair, &result.content_id, Some("testing".into()))
+            .unwrap();
+
+        assert!(notice.verify());
+        assert_eq!(notice.cid, result.content_id);
+        assert!(!client.is_pinned(&result.content_id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_removal_notice_wrong_creator_detectable() {
+        use ed25519_dalek::SigningKey;
+
+        let dir = test_dir();
+        let mut client = DataCraftClient::new(&dir).unwrap();
+        let creator = SigningKey::generate(&mut rand::thread_rng());
+        let attacker = SigningKey::generate(&mut rand::thread_rng());
+
+        let file_path = dir.join("protected.txt");
+        std::fs::write(&file_path, b"protected content").unwrap();
+
+        let result = client
+            .publish_signed(&file_path, &PublishOptions::default(), &creator)
+            .unwrap();
+
+        // Attacker tries to create removal notice
+        let notice = client
+            .remove_content(&attacker, &result.content_id, None)
+            .unwrap();
+
+        // Notice is valid (signed by attacker), but creator doesn't match manifest
+        assert!(notice.verify());
+        let manifest = client.store().get_manifest(&result.content_id).unwrap();
+        assert_ne!(notice.creator, manifest.creator);
 
         std::fs::remove_dir_all(&dir).ok();
     }

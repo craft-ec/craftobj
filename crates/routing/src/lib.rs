@@ -9,8 +9,9 @@
 use std::time::Duration;
 
 use datacraft_core::{
-    ChunkManifest, ContentId, DataCraftError, Result,
+    ChunkManifest, ContentId, DataCraftError, RemovalNotice, Result,
     MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,
+    REMOVAL_DHT_PREFIX,
     access::AccessList,
     pre::ReKeyEntry,
 };
@@ -26,6 +27,9 @@ pub const MANIFEST_RECORD_TTL: Duration = Duration::from_secs(1800);
 
 /// TTL for access metadata records (1 hour).
 pub const ACCESS_RECORD_TTL: Duration = Duration::from_secs(3600);
+
+/// TTL for removal notice records (24 hours — long-lived to ensure propagation).
+pub const REMOVAL_RECORD_TTL: Duration = Duration::from_secs(86400);
 
 /// Build DHT key for content providers.
 pub fn providers_dht_key(content_id: &ContentId) -> Vec<u8> {
@@ -45,6 +49,11 @@ pub fn access_dht_key(content_id: &ContentId) -> Vec<u8> {
 /// Build DHT key for a re-encryption key entry.
 pub fn rekey_dht_key(content_id: &ContentId, recipient_did: &[u8; 32]) -> Vec<u8> {
     format!("{}{}/{}", REKEY_DHT_PREFIX, content_id.to_hex(), hex::encode(recipient_did)).into_bytes()
+}
+
+/// Build DHT key for a removal notice.
+pub fn removal_dht_key(content_id: &ContentId) -> Vec<u8> {
+    format!("{}{}", REMOVAL_DHT_PREFIX, content_id.to_hex()).into_bytes()
 }
 
 /// Content router — wraps CraftBehaviour's generic DHT methods
@@ -167,6 +176,36 @@ impl ContentRouter {
         behaviour.get_record(&key)
     }
 
+    /// Store a removal notice in the DHT.
+    pub fn put_removal_notice(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+        notice: &RemovalNotice,
+        local_peer_id: &libp2p::PeerId,
+    ) -> Result<kad::QueryId> {
+        let key = removal_dht_key(content_id);
+        let value = bincode::serialize(notice)
+            .map_err(|e| DataCraftError::StorageError(format!("serialize removal notice: {e}")))?;
+        debug!(
+            "Publishing removal notice for {} ({} bytes)",
+            content_id,
+            value.len(),
+        );
+        behaviour
+            .put_record(&key, value, local_peer_id, Some(REMOVAL_RECORD_TTL))
+            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+    }
+
+    /// Fetch a removal notice from the DHT.
+    pub fn get_removal_notice(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+    ) -> kad::QueryId {
+        let key = removal_dht_key(content_id);
+        debug!("Checking removal notice for {}", content_id);
+        behaviour.get_record(&key)
+    }
+
     /// Remove a re-encryption key entry from the DHT.
     ///
     /// Note: Kademlia doesn't natively support record removal. We overwrite
@@ -200,6 +239,15 @@ pub fn parse_manifest_record(value: &[u8]) -> Result<ChunkManifest> {
 pub fn parse_access_list_record(value: &[u8]) -> Result<AccessList> {
     bincode::deserialize(value)
         .map_err(|e| DataCraftError::EncryptionError(format!("deserialize access list: {e}")))
+}
+
+/// Parse a removal notice from a DHT record value.
+pub fn parse_removal_record(value: &[u8]) -> Result<RemovalNotice> {
+    if value.is_empty() {
+        return Err(DataCraftError::StorageError("removal record is empty".into()));
+    }
+    bincode::deserialize(value)
+        .map_err(|e| DataCraftError::StorageError(format!("deserialize removal notice: {e}")))
 }
 
 /// Parse a re-key entry from a DHT record value.
@@ -290,6 +338,34 @@ mod tests {
         let parsed = parse_rekey_record(&bytes).unwrap();
         assert_eq!(parsed.recipient_did, entry.recipient_did);
         assert_eq!(parsed.re_key.transform_key, entry.re_key.transform_key);
+    }
+
+    #[test]
+    fn test_removal_dht_key() {
+        let cid = ContentId::from_bytes(b"removal test");
+        let key = removal_dht_key(&cid);
+        let key_str = String::from_utf8(key).unwrap();
+        assert!(key_str.starts_with("/datacraft/removal/"));
+        assert_eq!(key_str.len(), "/datacraft/removal/".len() + 64);
+    }
+
+    #[test]
+    fn test_parse_removal_record() {
+        use ed25519_dalek::SigningKey;
+
+        let keypair = SigningKey::generate(&mut rand::thread_rng());
+        let cid = ContentId::from_bytes(b"removal parse test");
+        let notice = datacraft_core::RemovalNotice::sign(&keypair, cid, Some("test".into()));
+
+        let bytes = bincode::serialize(&notice).unwrap();
+        let parsed = parse_removal_record(&bytes).unwrap();
+        assert_eq!(parsed.cid, cid);
+        assert!(parsed.verify());
+    }
+
+    #[test]
+    fn test_parse_removal_record_empty() {
+        assert!(parse_removal_record(&[]).is_err());
     }
 
     #[test]
