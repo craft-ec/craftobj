@@ -38,7 +38,8 @@ crates/
 - **DHT access metadata**: AccessList and ReKeyEntry stored/retrieved via DHT (`/datacraft/access/<cid>`, `/datacraft/rekey/<cid>/<did>`). ContentRouter methods: `put_access_list`, `get_access_list`, `put_re_key`, `get_re_key`, `remove_re_key`. Bincode serialization. Tombstone pattern for revocation.
 - **Access IPC handlers**: `access.grant` (generates ReKeyEntry + ReEncryptedKey, stores in DHT), `access.revoke` (tombstones re-key), `access.revoke_rotate` (revoke + rotate content key + re-encrypt content + re-grant remaining users), `access.list` (fetches AccessList from DHT, returns authorized DIDs). Full async DHT round-trip via protocol event flow.
 - **Content revocation with key rotation**: `revoke_and_rotate()` in client generates new content key, re-encrypts content (new CID), re-grants remaining users via PRE. `access.revoke_rotate` IPC handler orchestrates full flow: tombstone old re-key → rotate → re-grant → store in DHT → announce new CID.
-- **Not yet implemented**: StorageReceipt generation (requires PDP challenger), settlement on-chain, payment channel on-chain settlement
+- **StorageReceipt generation wired into PDP challenger**: ChallengerManager signs receipts with ed25519 after successful PDP challenges, persists to PersistentReceiptStore. `receipt.storage.list` IPC handler with pagination/filters. Challenger runs periodically in daemon event loop.
+- **Not yet implemented**: settlement on-chain, payment channel on-chain settlement
 
 ## Key Design Decisions (from recent discussions)
 
