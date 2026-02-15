@@ -148,6 +148,8 @@ impl DataCraftClient {
             chunk_count,
             erasure_config: config,
             content_size: total_size,
+            creator: String::new(),
+            signature: vec![],
         };
         self.store.put_manifest(&manifest)?;
 
@@ -435,6 +437,8 @@ impl DataCraftClient {
             chunk_count,
             erasure_config: config,
             content_size: total_size,
+            creator: String::new(),
+            signature: vec![],
         };
         self.store.put_manifest(&new_manifest)?;
         self.pin_manager.pin(&new_content_id)?;

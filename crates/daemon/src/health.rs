@@ -489,6 +489,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: config.clone(),
             content_size: content.len() as u64,
+            creator: String::new(),
+            signature: vec![],
         };
         store.put_manifest(&manifest).unwrap();
 
@@ -530,6 +532,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: config.clone(),
             content_size: content.len() as u64,
+            creator: String::new(),
+            signature: vec![],
         };
 
         let providers: Vec<ProviderInfo> = (0..8)
@@ -596,6 +600,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: config.clone(),
             content_size: content.len() as u64,
+            creator: String::new(),
+            signature: vec![],
         };
 
         // 8 providers, but 3 fail (return None response)
@@ -672,6 +678,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: config.clone(),
             content_size: content.len() as u64,
+            creator: String::new(),
+            signature: vec![],
         };
 
         // Only 2 of 5 providers pass — but free CID, no healing

@@ -311,6 +311,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: default_erasure_config(),
             content_size: 1024,
+            creator: String::new(),
+            signature: vec![],
         };
         let value = serde_json::to_vec(&manifest).unwrap();
         let parsed = parse_manifest_record(&value).unwrap();

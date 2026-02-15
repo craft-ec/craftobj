@@ -220,6 +220,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: config,
             content_size: content.len() as u64,
+            creator: String::new(),
+            signature: vec![],
         };
         store.put_manifest(&manifest).unwrap();
 

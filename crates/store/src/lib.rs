@@ -378,6 +378,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: default_erasure_config(),
             content_size: 1000,
+            creator: String::new(),
+            signature: vec![],
         };
 
         store.put_manifest(&manifest).unwrap();
@@ -407,6 +409,8 @@ mod tests {
                 chunk_count: 1,
                 erasure_config: default_erasure_config(),
                 content_size: 100,
+            creator: String::new(),
+            signature: vec![],
             };
             store.put_manifest(&manifest).unwrap();
             store.put_shard(cid, 0, 0, b"data").unwrap();
@@ -478,6 +482,8 @@ mod tests {
                 chunk_count: 1,
                 erasure_config: default_erasure_config(),
                 content_size: 100,
+            creator: String::new(),
+            signature: vec![],
             };
             store.put_manifest(&manifest).unwrap();
         }

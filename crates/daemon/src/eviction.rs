@@ -282,6 +282,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: default_erasure_config(),
             content_size: shard_data.len() as u64,
+            creator: String::new(),
+            signature: vec![],
         };
         store.put_manifest(&manifest).unwrap();
         store.put_shard(cid, 0, 0, shard_data).unwrap();

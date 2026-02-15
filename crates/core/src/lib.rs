@@ -77,6 +77,156 @@ pub struct ChunkManifest {
     pub erasure_config: ErasureConfig,
     /// Total size in bytes of the original content (needed for truncation after decode).
     pub content_size: u64,
+    /// Creator's DID string (e.g., `did:craftec:<hex_pubkey>`).
+    /// Empty string for unsigned manifests (backwards compat).
+    #[serde(default)]
+    pub creator: String,
+    /// Creator's ed25519 signature over the manifest (excluding this field).
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl ChunkManifest {
+    /// Data to sign: serialized manifest fields excluding the signature.
+    pub fn signable_data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.content_id.0);
+        data.extend_from_slice(&self.content_hash);
+        data.extend_from_slice(&self.k.to_le_bytes());
+        data.extend_from_slice(&self.chunk_size.to_le_bytes());
+        data.extend_from_slice(&self.chunk_count.to_le_bytes());
+        data.extend_from_slice(&self.erasure_config.data_shards.to_le_bytes());
+        data.extend_from_slice(&self.erasure_config.parity_shards.to_le_bytes());
+        data.extend_from_slice(&self.erasure_config.chunk_size.to_le_bytes());
+        data.extend_from_slice(&self.content_size.to_le_bytes());
+        data.extend_from_slice(self.creator.as_bytes());
+        data
+    }
+
+    /// Sign this manifest with the creator's keypair. Sets both `creator` and `signature`.
+    pub fn sign(&mut self, keypair: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let pubkey = keypair.verifying_key();
+        self.creator = format!("did:craftec:{}", hex::encode(pubkey.to_bytes()));
+        let data = self.signable_data();
+        let sig = keypair.sign(&data);
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify the creator's signature. Returns false if unsigned or invalid.
+    pub fn verify_creator(&self) -> bool {
+        if self.creator.is_empty() || self.signature.len() != 64 {
+            return false;
+        }
+        let pubkey_bytes = match extract_pubkey_from_did(&self.creator) {
+            Some(b) => b,
+            None => return false,
+        };
+        let pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(&self.signature);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let data = self.signable_data();
+        pubkey.verify_strict(&data, &sig).is_ok()
+    }
+
+    /// Extract creator's public key bytes from the DID, if present and valid.
+    pub fn creator_pubkey(&self) -> Option<[u8; 32]> {
+        extract_pubkey_from_did(&self.creator)
+    }
+}
+
+/// Extract ed25519 public key bytes from a `did:craftec:<hex>` string.
+pub fn extract_pubkey_from_did(did: &str) -> Option<[u8; 32]> {
+    let hex_str = did.strip_prefix("did:craftec:")?;
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Some(key)
+}
+
+/// Build a DID string from an ed25519 public key.
+pub fn did_from_pubkey(pubkey: &ed25519_dalek::VerifyingKey) -> String {
+    format!("did:craftec:{}", hex::encode(pubkey.to_bytes()))
+}
+
+/// Content removal notice — signed by the creator to request removal of content.
+///
+/// Stored in the DHT so storage nodes can check before serving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovalNotice {
+    /// Content ID to remove.
+    pub cid: ContentId,
+    /// Creator's DID string (must match the manifest's creator).
+    pub creator: String,
+    /// Unix timestamp (seconds) when the removal was requested.
+    pub timestamp: u64,
+    /// Optional reason for removal.
+    pub reason: Option<String>,
+    /// Creator's ed25519 signature over the notice (excluding this field).
+    pub signature: Vec<u8>,
+}
+
+impl RemovalNotice {
+    /// Data to sign: all fields except signature.
+    pub fn signable_data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.cid.0);
+        data.extend_from_slice(self.creator.as_bytes());
+        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        if let Some(ref reason) = self.reason {
+            data.extend_from_slice(reason.as_bytes());
+        }
+        data
+    }
+
+    /// Create and sign a removal notice.
+    pub fn sign(keypair: &ed25519_dalek::SigningKey, cid: ContentId, reason: Option<String>) -> Self {
+        use ed25519_dalek::Signer;
+        let pubkey = keypair.verifying_key();
+        let creator = format!("did:craftec:{}", hex::encode(pubkey.to_bytes()));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut notice = Self {
+            cid,
+            creator,
+            timestamp,
+            reason,
+            signature: vec![],
+        };
+        let data = notice.signable_data();
+        let sig = keypair.sign(&data);
+        notice.signature = sig.to_bytes().to_vec();
+        notice
+    }
+
+    /// Verify the signature on this removal notice.
+    pub fn verify(&self) -> bool {
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let pubkey_bytes = match extract_pubkey_from_did(&self.creator) {
+            Some(b) => b,
+            None => return false,
+        };
+        let pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(&self.signature);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let data = self.signable_data();
+        pubkey.verify_strict(&data, &sig).is_ok()
+    }
 }
 
 /// Options for publishing content.
@@ -215,6 +365,9 @@ pub const ACCESS_DHT_PREFIX: &str = "/datacraft/access/";
 /// DHT key prefix for re-encryption keys (per CID + recipient DID).
 pub const REKEY_DHT_PREFIX: &str = "/datacraft/rekey/";
 
+/// DHT key prefix for content removal notices.
+pub const REMOVAL_DHT_PREFIX: &str = "/datacraft/removal/";
+
 /// Gossipsub topic for node status heartbeats.
 pub const NODE_STATUS_TOPIC: &str = "datacraft/node-status/1.0.0";
 
@@ -223,6 +376,9 @@ pub const PROOFS_TOPIC: &str = "datacraft/proofs/1.0.0";
 
 /// Gossipsub topic for capability announcements.
 pub const CAPABILITIES_TOPIC: &str = "datacraft/capabilities/1.0.0";
+
+/// Gossipsub topic for content removal notices (fast propagation).
+pub const REMOVAL_TOPIC: &str = "datacraft/removal/1.0.0";
 
 /// Capabilities a DataCraft node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -585,6 +741,8 @@ mod tests {
             chunk_count: 1,
             erasure_config: default_erasure_config(),
             content_size: 1024,
+            creator: String::new(),
+            signature: vec![],
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: ChunkManifest = serde_json::from_str(&json).unwrap();
@@ -592,5 +750,159 @@ mod tests {
         assert_eq!(parsed.content_hash, cid.0);
         assert_eq!(parsed.k, 4);
         assert_eq!(parsed.content_size, 1024);
+    }
+
+    #[test]
+    fn test_chunk_manifest_sign_verify() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair = SigningKey::generate(&mut OsRng);
+        let cid = ContentId::from_bytes(b"signed manifest test");
+        let mut manifest = ChunkManifest {
+            content_id: cid,
+            content_hash: cid.0,
+            k: 4,
+            chunk_size: 65536,
+            chunk_count: 1,
+            erasure_config: default_erasure_config(),
+            content_size: 2048,
+            creator: String::new(),
+            signature: vec![],
+        };
+
+        manifest.sign(&keypair);
+        assert!(!manifest.creator.is_empty());
+        assert_eq!(manifest.signature.len(), 64);
+        assert!(manifest.verify_creator());
+
+        // Tamper → invalid
+        manifest.content_size = 9999;
+        assert!(!manifest.verify_creator());
+    }
+
+    #[test]
+    fn test_chunk_manifest_wrong_key_fails() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair1 = SigningKey::generate(&mut OsRng);
+        let keypair2 = SigningKey::generate(&mut OsRng);
+        let cid = ContentId::from_bytes(b"wrong key test");
+        let mut manifest = ChunkManifest {
+            content_id: cid,
+            content_hash: cid.0,
+            k: 4,
+            chunk_size: 65536,
+            chunk_count: 1,
+            erasure_config: default_erasure_config(),
+            content_size: 1024,
+            creator: String::new(),
+            signature: vec![],
+        };
+
+        manifest.sign(&keypair1);
+        // Overwrite creator with keypair2's DID but keep keypair1's signature
+        manifest.creator = did_from_pubkey(&keypair2.verifying_key());
+        assert!(!manifest.verify_creator());
+    }
+
+    #[test]
+    fn test_chunk_manifest_unsigned_verify_false() {
+        let cid = ContentId::from_bytes(b"unsigned");
+        let manifest = ChunkManifest {
+            content_id: cid,
+            content_hash: cid.0,
+            k: 4,
+            chunk_size: 65536,
+            chunk_count: 1,
+            erasure_config: default_erasure_config(),
+            content_size: 1024,
+            creator: String::new(),
+            signature: vec![],
+        };
+        assert!(!manifest.verify_creator());
+    }
+
+    #[test]
+    fn test_removal_notice_sign_verify() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair = SigningKey::generate(&mut OsRng);
+        let cid = ContentId::from_bytes(b"remove me");
+
+        let notice = RemovalNotice::sign(&keypair, cid, Some("test removal".into()));
+        assert!(notice.verify());
+        assert_eq!(notice.cid, cid);
+        assert!(notice.reason.as_deref() == Some("test removal"));
+    }
+
+    #[test]
+    fn test_removal_notice_tampered() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair = SigningKey::generate(&mut OsRng);
+        let cid = ContentId::from_bytes(b"tamper test");
+
+        let mut notice = RemovalNotice::sign(&keypair, cid, None);
+        assert!(notice.verify());
+
+        notice.timestamp += 1;
+        assert!(!notice.verify());
+    }
+
+    #[test]
+    fn test_removal_notice_wrong_creator() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair1 = SigningKey::generate(&mut OsRng);
+        let keypair2 = SigningKey::generate(&mut OsRng);
+        let cid = ContentId::from_bytes(b"wrong creator");
+
+        let mut notice = RemovalNotice::sign(&keypair1, cid, None);
+        notice.creator = did_from_pubkey(&keypair2.verifying_key());
+        assert!(!notice.verify());
+    }
+
+    #[test]
+    fn test_removal_notice_bincode_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair = SigningKey::generate(&mut OsRng);
+        let cid = ContentId::from_bytes(b"bincode test");
+        let notice = RemovalNotice::sign(&keypair, cid, Some("reason".into()));
+
+        let bytes = bincode::serialize(&notice).unwrap();
+        let parsed: RemovalNotice = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(parsed.cid, notice.cid);
+        assert_eq!(parsed.creator, notice.creator);
+        assert!(parsed.verify());
+    }
+
+    #[test]
+    fn test_extract_pubkey_from_did() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let keypair = SigningKey::generate(&mut OsRng);
+        let did = did_from_pubkey(&keypair.verifying_key());
+        let extracted = extract_pubkey_from_did(&did).unwrap();
+        assert_eq!(extracted, keypair.verifying_key().to_bytes());
+
+        assert!(extract_pubkey_from_did("invalid").is_none());
+        assert!(extract_pubkey_from_did("did:craftec:short").is_none());
+    }
+
+    #[test]
+    fn test_chunk_manifest_serde_backwards_compat() {
+        // Manifests without creator/signature fields should deserialize with defaults
+        let json = r#"{"content_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"content_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"k":4,"chunk_size":65536,"chunk_count":1,"erasure_config":{"data_shards":4,"parity_shards":4,"chunk_size":65536},"content_size":1024}"#;
+        let manifest: ChunkManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.creator, "");
+        assert!(manifest.signature.is_empty());
     }
 }
