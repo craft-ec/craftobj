@@ -192,8 +192,27 @@ pub async fn run_daemon(
 
     info!("Starting IPC server on {}", socket_path);
 
-    // Own capabilities (default: Storage + Client)
-    let own_capabilities = vec![DataCraftCapability::Storage, DataCraftCapability::Client];
+    // Own capabilities — read from CRAFTEC_CAPABILITIES env (comma-separated)
+    // e.g., CRAFTEC_CAPABILITIES=storage,client,aggregator
+    // Default: Storage + Client
+    let own_capabilities = match std::env::var("CRAFTEC_CAPABILITIES") {
+        Ok(caps) => {
+            let mut result = Vec::new();
+            for cap in caps.split(',').map(|s| s.trim().to_lowercase()) {
+                match cap.as_str() {
+                    "storage" => result.push(DataCraftCapability::Storage),
+                    "client" => result.push(DataCraftCapability::Client),
+                    _ => warn!("Unknown capability '{}', skipping", cap),
+                }
+            }
+            if result.is_empty() {
+                vec![DataCraftCapability::Client]
+            } else {
+                result
+            }
+        }
+        Err(_) => vec![DataCraftCapability::Storage, DataCraftCapability::Client],
+    };
 
     // Create challenger manager
     let local_pubkey = crate::pdp::peer_id_to_local_pubkey(&local_peer_id);
