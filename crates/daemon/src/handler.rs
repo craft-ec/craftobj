@@ -496,10 +496,26 @@ impl DataCraftHandler {
                     "capabilities": cap_strings,
                     "score": peer_score.score(),
                     "avg_latency_ms": peer_score.avg_latency_ms,
+                    "storage_committed_bytes": peer_score.storage_committed_bytes,
+                    "storage_used_bytes": peer_score.storage_used_bytes,
                 }),
             );
         }
         Ok(Value::Object(result))
+    }
+
+    async fn handle_network_storage(&self) -> Result<Value, String> {
+        let scorer = match &self.peer_scorer {
+            Some(ps) => ps.lock().await,
+            None => return Ok(serde_json::json!({
+                "total_committed": 0,
+                "total_used": 0,
+                "total_available": 0,
+                "storage_node_count": 0
+            })),
+        };
+        let summary = scorer.network_storage_summary();
+        serde_json::to_value(summary).map_err(|e| e.to_string())
     }
 
     /// Extend a CID by generating a new parity shard.
@@ -1412,6 +1428,7 @@ impl IpcHandler for DataCraftHandler {
                 "status" => self.handle_status().await,
                 "peers" => self.handle_peers().await,
                 "node.capabilities" => self.handle_node_capabilities().await,
+                "network.storage" => self.handle_network_storage().await,
                 "extend" => self.handle_extend(params).await,
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
