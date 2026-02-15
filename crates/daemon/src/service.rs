@@ -327,7 +327,20 @@ pub async fn run_daemon_with_config(
         }
     };
 
-    let _ = event_tx.send(DaemonEvent::DaemonStarted);
+    let _ = event_tx.send(DaemonEvent::DaemonStarted { listen_addresses: vec![] });
+
+    // Emit startup sequence events
+    let _ = event_tx.send(DaemonEvent::DiscoveryStatus {
+        total_peers: 0,
+        storage_peers: 0,
+        action: format!("Starting mDNS discovery and Kademlia bootstrap"),
+    });
+
+    if ws_port > 0 {
+        let _ = event_tx.send(DaemonEvent::ListeningOn {
+            address: format!("ws://0.0.0.0:{}", ws_port),
+        });
+    }
 
     // Run all components concurrently
     tokio::select! {
@@ -402,20 +415,44 @@ async fn drive_swarm(
                         info!("Listening on {}", address);
                         let _ = event_tx.send(DaemonEvent::ListeningOn { address: address.to_string() });
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        info!("Connected to {}", peer_id);
-                        let _ = event_tx.send(DaemonEvent::PeerConnected { peer_id: peer_id.to_string() });
-                        // Announce capabilities immediately so the new peer learns about us
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        let total = swarm.connected_peers().count();
+                        info!("Connected to {} ({} peers total)", peer_id, total);
+                        let _ = event_tx.send(DaemonEvent::PeerConnected {
+                            peer_id: peer_id.to_string(),
+                            address: endpoint.get_remote_address().to_string(),
+                            total_peers: total,
+                        });
+                        // Announce capabilities: immediately + delayed retry after gossipsub mesh forms
                         let used = client.lock().await.store().disk_usage().unwrap_or(0);
                         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
                             capabilities: own_capabilities.clone(),
                             storage_committed_bytes: max_storage_bytes,
                             storage_used_bytes: used,
                         });
+                        // Gossipsub mesh formation takes ~1-3s after connection.
+                        // Retry to ensure the new peer receives our announcement.
+                        let delayed_caps = own_capabilities.clone();
+                        let delayed_tx = command_tx.clone();
+                        let delayed_client = client.clone();
+                        let delayed_max = max_storage_bytes;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            let used = delayed_client.lock().await.store().disk_usage().unwrap_or(0);
+                            let _ = delayed_tx.send(DataCraftCommand::PublishCapabilities {
+                                capabilities: delayed_caps,
+                                storage_committed_bytes: delayed_max,
+                                storage_used_bytes: used,
+                            });
+                        });
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        info!("Disconnected from {}", peer_id);
-                        let _ = event_tx.send(DaemonEvent::PeerDisconnected { peer_id: peer_id.to_string() });
+                        let remaining = swarm.connected_peers().count();
+                        info!("Disconnected from {} ({} peers remaining)", peer_id, remaining);
+                        let _ = event_tx.send(DaemonEvent::PeerDisconnected {
+                            peer_id: peer_id.to_string(),
+                            remaining_peers: remaining,
+                        });
                     }
                     SwarmEvent::Behaviour(event) => {
                         debug!("Behaviour event: {:?}", event);
@@ -725,6 +762,8 @@ async fn handle_gossipsub_capability(
                         let _ = event_tx.send(DaemonEvent::CapabilityAnnounced {
                             peer_id: peer_id.to_string(),
                             capabilities: cap_strings,
+                            storage_committed: ann.storage_committed_bytes,
+                            storage_used: ann.storage_used_bytes,
                         });
                         let mut scorer = peer_scorer.lock().await;
                         // Check if this is a NEW storage peer (not previously known)
@@ -933,6 +972,7 @@ async fn handle_protocol_events(
                 let _ = daemon_event_tx.send(DaemonEvent::DhtError {
                     content_id: content_id.to_hex(),
                     error: error.clone(),
+                    next_action: "Will re-announce in next maintenance cycle".to_string(),
                 });
                 
                 // Find and respond to any waiting request with error

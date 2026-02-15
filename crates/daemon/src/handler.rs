@@ -155,6 +155,8 @@ impl DataCraftHandler {
         .await
         .map_err(|e| format!("publish task panicked: {}", e))??;
 
+        let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+
         // Track in content tracker
         if let Some(ref tracker) = self.content_tracker {
             let mut t = tracker.lock().await;
@@ -201,6 +203,7 @@ impl DataCraftHandler {
                 content_id: result.content_id.to_hex(),
                 size: result.total_size,
                 chunks: result.chunk_count as u32,
+                shards: total_shards,
             });
         }
 

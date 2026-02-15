@@ -59,6 +59,19 @@ pub async fn run_maintenance_cycle(
         t.needs_announcement()
     };
 
+    let needs_dist_preview = {
+        let t = tracker.lock().await;
+        t.needs_distribution()
+    };
+
+    let needs_announce_count = needs_announce.len();
+
+    let _ = event_tx.send(DaemonEvent::MaintenanceCycleStarted {
+        content_count: needs_announce_count + needs_dist_preview.len(),
+        needs_announce: needs_announce_count,
+        needs_distribute: needs_dist_preview.len(),
+    });
+
     if !needs_announce.is_empty() {
         info!("Content maintenance: {} items need (re-)announcement", needs_announce.len());
     }
@@ -79,6 +92,12 @@ pub async fn run_maintenance_cycle(
     for content_id in needs_dist {
         check_providers(&content_id, tracker, command_tx).await;
     }
+
+    let _ = event_tx.send(DaemonEvent::MaintenanceCycleCompleted {
+        announced: needs_announce_count,
+        distributed: needs_dist_preview.len(),
+        next_run_secs: 0, // caller knows the interval
+    });
 }
 
 /// Re-announce a single content item to the DHT.
@@ -205,6 +224,10 @@ async fn distribute_content(
 
     if storage_peers.is_empty() {
         info!("Distribution: no storage peers known — skipping");
+        let _ = event_tx.send(DaemonEvent::DistributionSkipped {
+            reason: "No storage peers available".to_string(),
+            retry_secs: 600,
+        });
         return;
     }
 
@@ -299,6 +322,8 @@ async fn distribute_content(
             let _ = event_tx.send(DaemonEvent::ContentDistributed {
                 content_id: content_id.to_hex(),
                 shards_pushed: pushed_count,
+                total_shards: total_shards * manifest.chunk_count as usize,
+                target_peers: ranked_peers.len(),
             });
             let mut t = tracker.lock().await;
             t.update_shard_progress(&content_id, pushed_count);

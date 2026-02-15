@@ -12,14 +12,23 @@ use tokio::sync::broadcast;
 #[serde(rename_all = "snake_case")]
 pub enum DaemonEvent {
     // -- Global / Network events --
-    PeerConnected { peer_id: String },
-    PeerDisconnected { peer_id: String },
+    PeerConnected { peer_id: String, address: String, total_peers: usize },
+    PeerDisconnected { peer_id: String, remaining_peers: usize },
     PeerDiscovered { peer_id: String, address: String },
-    DaemonStarted,
+    DaemonStarted { listen_addresses: Vec<String> },
     ListeningOn { address: String },
 
+    // -- Discovery status --
+    /// Periodic summary of network discovery state
+    DiscoveryStatus {
+        total_peers: usize,
+        storage_peers: usize,
+        /// What the node is currently doing to find peers
+        action: String,
+    },
+
     // -- Announcements --
-    CapabilityAnnounced { peer_id: String, capabilities: Vec<String> },
+    CapabilityAnnounced { peer_id: String, capabilities: Vec<String>, storage_committed: u64, storage_used: u64 },
     CapabilityPublished { capabilities: Vec<String> },
     ProviderAnnounced { content_id: String },
     ContentReannounced { content_id: String },
@@ -29,7 +38,7 @@ pub enum DaemonEvent {
     RemovalNoticeReceived { content_id: String, creator: String, valid: bool },
 
     // -- Actions (user-initiated) --
-    ContentPublished { content_id: String, size: u64, chunks: u32 },
+    ContentPublished { content_id: String, size: u64, chunks: u32, shards: usize },
     AccessGranted { content_id: String, recipient: String },
     AccessRevoked { content_id: String, recipient: String },
     ChannelOpened { channel_id: String, receiver: String, amount: u64 },
@@ -40,10 +49,17 @@ pub enum DaemonEvent {
     // -- DHT results --
     ProvidersResolved { content_id: String, count: usize },
     ManifestRetrieved { content_id: String, chunks: u32 },
-    DhtError { content_id: String, error: String },
+    DhtError { content_id: String, error: String, /// What happens next
+        next_action: String },
 
     // -- Distribution --
-    ContentDistributed { content_id: String, shards_pushed: usize },
+    ContentDistributed { content_id: String, shards_pushed: usize, total_shards: usize, target_peers: usize },
+    /// Distribution not possible — explains why and when retry happens
+    DistributionSkipped { reason: String, retry_secs: u64 },
+
+    // -- Maintenance --
+    MaintenanceCycleStarted { content_count: usize, needs_announce: usize, needs_distribute: usize },
+    MaintenanceCycleCompleted { announced: usize, distributed: usize, next_run_secs: u64 },
 
     // -- PDP --
     ChallengerRoundCompleted { rounds: u32 },
