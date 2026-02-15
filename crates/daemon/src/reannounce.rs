@@ -6,13 +6,14 @@
 use std::sync::Arc;
 
 use datacraft_client::DataCraftClient;
-use datacraft_core::ContentId;
+use datacraft_core::{ContentId, DataCraftCapability};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::commands::DataCraftCommand;
 use crate::content_tracker::ContentTracker;
 use crate::events::{DaemonEvent, EventSender};
+use crate::peer_scorer::PeerScorer;
 
 /// Default maintenance interval in seconds (10 minutes).
 /// Prefer using `DaemonConfig::reannounce_interval_secs` instead.
@@ -28,6 +29,7 @@ pub async fn content_maintenance_loop(
     client: Arc<Mutex<DataCraftClient>>,
     interval_secs: u64,
     event_tx: EventSender,
+    peer_scorer: Arc<Mutex<PeerScorer>>,
 ) {
     use std::time::Duration;
 
@@ -37,7 +39,7 @@ pub async fn content_maintenance_loop(
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
-        run_maintenance_cycle(&tracker, &command_tx, &client, &event_tx).await;
+        run_maintenance_cycle(&tracker, &command_tx, &client, &event_tx, &peer_scorer).await;
     }
 }
 
@@ -47,6 +49,7 @@ pub async fn run_maintenance_cycle(
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
     client: &Arc<Mutex<DataCraftClient>>,
     event_tx: &EventSender,
+    peer_scorer: &Arc<Mutex<PeerScorer>>,
 ) {
     // Phase 1: Re-announce content that needs it
     let needs_announce = {
@@ -62,7 +65,10 @@ pub async fn run_maintenance_cycle(
         reannounce_content(&content_id, tracker, command_tx, client, event_tx).await;
     }
 
-    // Phase 2: Check distribution status by resolving providers
+    // Phase 2: Distribute shards to storage peers
+    distribute_content(tracker, command_tx, client, peer_scorer, event_tx).await;
+
+    // Phase 3: Check distribution status by resolving providers
     let needs_dist = {
         let t = tracker.lock().await;
         t.needs_distribution()
@@ -164,14 +170,137 @@ async fn check_providers(
     }
 }
 
-/// Trigger immediate re-announcement of all content that needs it.
-/// Called when the first storage peer connects.
+/// Distribute undistributed content to storage peers.
+///
+/// For each content item needing distribution, reads local shards and pushes
+/// them to available storage peers in a round-robin fashion.
+async fn distribute_content(
+    tracker: &Arc<Mutex<ContentTracker>>,
+    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
+    client: &Arc<Mutex<DataCraftClient>>,
+    peer_scorer: &Arc<Mutex<PeerScorer>>,
+    event_tx: &EventSender,
+) {
+    // Get storage peers
+    let storage_peers: Vec<libp2p::PeerId> = {
+        let scorer = peer_scorer.lock().await;
+        scorer
+            .iter()
+            .filter(|(_, score)| score.capabilities.contains(&DataCraftCapability::Storage))
+            .map(|(peer_id, _)| *peer_id)
+            .collect()
+    };
+
+    if storage_peers.is_empty() {
+        return;
+    }
+
+    // Rank them by score
+    let ranked_peers = {
+        let scorer = peer_scorer.lock().await;
+        scorer.rank_peers(&storage_peers)
+    };
+
+    let needs_dist = {
+        let t = tracker.lock().await;
+        t.needs_distribution()
+    };
+
+    if needs_dist.is_empty() {
+        return;
+    }
+
+    info!(
+        "Distributing {} content items to {} storage peers",
+        needs_dist.len(),
+        ranked_peers.len()
+    );
+
+    for content_id in needs_dist {
+        // Get manifest to know total shards
+        let manifest = {
+            let c = client.lock().await;
+            match c.store().get_manifest(&content_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Cannot distribute {}: manifest not found: {}", content_id, e);
+                    continue;
+                }
+            }
+        };
+
+        let total_shards =
+            manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+        let mut pushed_count = 0usize;
+        let mut peer_idx = 0usize;
+
+        for chunk_idx in 0..manifest.chunk_count as u32 {
+            for shard_idx in 0..total_shards as u8 {
+                // Read shard from local store
+                let shard_data = {
+                    let c = client.lock().await;
+                    match c.store().get_shard(&content_id, chunk_idx, shard_idx) {
+                        Ok(data) => data,
+                        Err(_) => continue, // Skip shards we don't have
+                    }
+                };
+
+                // Pick next peer (round-robin)
+                let peer = ranked_peers[peer_idx % ranked_peers.len()];
+                peer_idx += 1;
+
+                // Push shard — fire and forget (don't block on each one)
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let cmd = DataCraftCommand::PushShard {
+                    peer_id: peer,
+                    content_id,
+                    chunk_index: chunk_idx,
+                    shard_index: shard_idx,
+                    shard_data,
+                    reply_tx,
+                };
+
+                if command_tx.send(cmd).is_err() {
+                    warn!("Failed to send push command for {}/{}/{}", content_id, chunk_idx, shard_idx);
+                    continue;
+                }
+
+                // Await result but don't block the whole loop on failure
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        pushed_count += 1;
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Push {}/{}/{} to {} failed: {}", content_id, chunk_idx, shard_idx, peer, e);
+                    }
+                    Err(_) => {
+                        debug!("Push reply channel closed for {}/{}/{}", content_id, chunk_idx, shard_idx);
+                    }
+                }
+            }
+        }
+
+        if pushed_count > 0 {
+            info!("Distributed {}/{} shards for {}", pushed_count, total_shards * manifest.chunk_count as usize, content_id);
+            let _ = event_tx.send(DaemonEvent::ContentDistributed {
+                content_id: content_id.to_hex(),
+                shards_pushed: pushed_count,
+            });
+            let mut t = tracker.lock().await;
+            t.update_shard_progress(&content_id, pushed_count);
+        }
+    }
+}
+
+/// Trigger immediate re-announcement and distribution of all content.
+/// Called when a new storage peer connects.
 pub async fn trigger_immediate_reannounce(
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
     client: &Arc<Mutex<DataCraftClient>>,
     event_tx: &EventSender,
+    peer_scorer: &Arc<Mutex<PeerScorer>>,
 ) {
-    info!("Triggering immediate re-announcement (first storage peer connected)");
-    run_maintenance_cycle(tracker, command_tx, client, event_tx).await;
+    info!("Triggering immediate re-announcement and distribution (storage peer connected)");
+    run_maintenance_cycle(tracker, command_tx, client, event_tx, peer_scorer).await;
 }

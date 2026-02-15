@@ -87,4 +87,13 @@ pub enum DataCraftCommand {
     BroadcastStorageReceipt {
         receipt_data: Vec<u8>,
     },
+    /// Push a shard to a remote storage peer (proactive distribution).
+    PushShard {
+        peer_id: PeerId,
+        content_id: ContentId,
+        chunk_index: u32,
+        shard_index: u8,
+        shard_data: Vec<u8>,
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
 }

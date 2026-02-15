@@ -444,6 +444,8 @@ pub enum WireMessageType {
     ManifestResponse = 3,
     /// TransferReceipt sent by requester after receiving a shard.
     Receipt = 4,
+    /// Push a shard to a storage peer (proactive distribution).
+    ShardPush = 5,
 }
 
 impl WireMessageType {
@@ -454,6 +456,7 @@ impl WireMessageType {
             2 => Some(Self::ManifestRequest),
             3 => Some(Self::ManifestResponse),
             4 => Some(Self::Receipt),
+            5 => Some(Self::ShardPush),
             _ => None,
         }
     }

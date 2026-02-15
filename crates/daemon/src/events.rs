@@ -42,6 +42,9 @@ pub enum DaemonEvent {
     ManifestRetrieved { content_id: String, chunks: u32 },
     DhtError { content_id: String, error: String },
 
+    // -- Distribution --
+    ContentDistributed { content_id: String, shards_pushed: usize },
+
     // -- PDP --
     ChallengerRoundCompleted { rounds: u32 },
     ShardRequested { content_id: String, peer_id: String, chunk: u32, shard: u32 },

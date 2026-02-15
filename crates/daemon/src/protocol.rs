@@ -562,6 +562,128 @@ impl DataCraftProtocol {
         debug!("Responded to shard-coord query for {}: {:?}", content_id, response);
     }
 
+    /// Handle an incoming shard push from a peer.
+    ///
+    /// We already read REQUEST_HEADER_SIZE bytes; need to read the remaining push header
+    /// bytes (payload_len:4) plus the payload itself, then store.
+    async fn handle_incoming_push(&self, mut stream: libp2p::Stream, initial_header: &[u8]) {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+        use datacraft_transfer::PUSH_HEADER_SIZE;
+
+        // We've read REQUEST_HEADER_SIZE (42) bytes. Push header is PUSH_HEADER_SIZE (46).
+        // Need 4 more bytes for payload_len.
+        let mut extra = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut extra).await {
+            error!("Failed to read push header remainder: {}", e);
+            return;
+        }
+
+        // Reconstruct full header
+        let mut full_header = vec![0u8; PUSH_HEADER_SIZE];
+        full_header[..REQUEST_HEADER_SIZE].copy_from_slice(initial_header);
+        full_header[REQUEST_HEADER_SIZE..].copy_from_slice(&extra);
+
+        let (content_id, chunk_index, shard_index, payload_len) =
+            match datacraft_transfer::decode_shard_push_header(&full_header) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Failed to decode push header: {}", e);
+                    let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                    return;
+                }
+            };
+
+        // Sanity check payload size (max 16MB per shard)
+        if payload_len > 16 * 1024 * 1024 {
+            warn!("Push payload too large: {} bytes", payload_len);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        // Read payload
+        let mut payload = vec![0u8; payload_len as usize];
+        if let Err(e) = stream.read_exact(&mut payload).await {
+            error!("Failed to read push payload: {}", e);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        // Check removal cache
+        if let Some(ref cache) = self.removal_cache {
+            let cache = cache.lock().await;
+            if cache.is_removed(&content_id) {
+                warn!("Refusing pushed shard for removed content: {}", content_id);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                return;
+            }
+        }
+
+        // Store the shard
+        {
+            let store = self.store.lock().await;
+            match store.put_shard(&content_id, chunk_index, shard_index, &payload) {
+                Ok(()) => {
+                    info!(
+                        "Stored pushed shard {}/{}/{} ({} bytes)",
+                        content_id, chunk_index, shard_index, payload.len()
+                    );
+                    let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
+                }
+                Err(e) => {
+                    error!("Failed to store pushed shard: {}", e);
+                    let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                }
+            }
+        }
+    }
+
+    /// Push a shard to a remote peer for storage.
+    ///
+    /// Wire format: `[magic:4][type:1(ShardPush=5)][content_id:32][chunk_index:4][shard_index:1][payload_len:4][payload]`
+    /// Response: `[status:1]` (0=Ok, 2=Error)
+    pub async fn push_shard_to_peer(
+        &self,
+        behaviour: &mut CraftBehaviour,
+        peer_id: libp2p::PeerId,
+        content_id: &ContentId,
+        chunk_index: u32,
+        shard_index: u8,
+        shard_data: &[u8],
+    ) -> Result<(), String> {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        debug!(
+            "Pushing shard {}/{}/{} ({} bytes) to peer {}",
+            content_id, chunk_index, shard_index, shard_data.len(), peer_id
+        );
+
+        let mut control = behaviour.stream_control();
+        let mut stream = control
+            .open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL))
+            .await
+            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
+
+        // Send push message
+        let msg = datacraft_transfer::encode_shard_push(content_id, chunk_index, shard_index, shard_data);
+        stream.write_all(&msg).await.map_err(|e| {
+            format!("Failed to send push to {}: {}", peer_id, e)
+        })?;
+
+        // Read single-byte status response
+        let mut status = [0u8; 1];
+        stream.read_exact(&mut status).await.map_err(|e| {
+            format!("Failed to read push response from {}: {}", peer_id, e)
+        })?;
+
+        match datacraft_core::WireStatus::from_u8(status[0]) {
+            Some(datacraft_core::WireStatus::Ok) => {
+                debug!("Successfully pushed shard {}/{}/{} to {}", content_id, chunk_index, shard_index, peer_id);
+                Ok(())
+            }
+            _ => Err(format!("Push rejected by peer {} with status {}", peer_id, status[0])),
+        }
+    }
+
     /// Handle an incoming transfer stream from a peer.
     ///
     /// After serving a shard successfully, reads a TransferReceipt from the
@@ -575,6 +697,12 @@ impl DataCraftProtocol {
         let mut header = [0u8; REQUEST_HEADER_SIZE];
         if let Err(e) = stream.read_exact(&mut header).await {
             error!("Failed to read request header: {}", e);
+            return;
+        }
+
+        // Check if this is a ShardPush message (type byte at offset 4)
+        if header[4] == datacraft_core::WireMessageType::ShardPush as u8 {
+            self.handle_incoming_push(stream, &header).await;
             return;
         }
 

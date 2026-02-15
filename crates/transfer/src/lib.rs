@@ -60,6 +60,53 @@ pub fn decode_shard_request(buf: &[u8]) -> Result<(ContentId, u32, u8)> {
     Ok((ContentId(cid_bytes), chunk_index, shard_index))
 }
 
+/// Size of a shard push header (same as request but type=ShardPush, plus 4-byte payload length).
+pub const PUSH_HEADER_SIZE: usize = 46; // 4 + 1 + 32 + 4 + 1 + 4
+
+/// Encode a shard push message into wire format.
+///
+/// Wire format: `[magic:4][type:1(ShardPush=5)][content_id:32][chunk_index:4][shard_index:1][payload_len:4][payload]`
+pub fn encode_shard_push(
+    content_id: &ContentId,
+    chunk_index: u32,
+    shard_index: u8,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(PUSH_HEADER_SIZE + data.len());
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::ShardPush as u8);
+    buf.extend_from_slice(&content_id.0);
+    buf.extend_from_slice(&chunk_index.to_be_bytes());
+    buf.push(shard_index);
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Decode a shard push header from wire format (first PUSH_HEADER_SIZE bytes).
+///
+/// Returns (content_id, chunk_index, shard_index, payload_len).
+pub fn decode_shard_push_header(buf: &[u8]) -> Result<(ContentId, u32, u8, u32)> {
+    if buf.len() < PUSH_HEADER_SIZE {
+        return Err(DataCraftError::TransferError("push header too short".into()));
+    }
+    if buf[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic".into()));
+    }
+    if buf[4] != WireMessageType::ShardPush as u8 {
+        return Err(DataCraftError::TransferError(format!(
+            "expected ShardPush type (5), got {}",
+            buf[4]
+        )));
+    }
+    let mut cid_bytes = [0u8; 32];
+    cid_bytes.copy_from_slice(&buf[5..37]);
+    let chunk_index = u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]);
+    let shard_index = buf[41];
+    let payload_len = u32::from_be_bytes([buf[42], buf[43], buf[44], buf[45]]);
+    Ok((ContentId(cid_bytes), chunk_index, shard_index, payload_len))
+}
+
 /// Encode a response with status and payload.
 pub fn encode_response(status: WireStatus, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(RESPONSE_HEADER_SIZE + payload.len());

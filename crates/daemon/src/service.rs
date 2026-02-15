@@ -363,6 +363,7 @@ pub async fn run_daemon_with_config(
             client.clone(),
             daemon_config.reannounce_interval_secs,
             event_tx.clone(),
+            peer_scorer.clone(),
         ) => {
             info!("Content maintenance loop ended");
         }
@@ -626,6 +627,16 @@ async fn handle_command(
                 .publish_to_topic(datacraft_core::STORAGE_RECEIPT_TOPIC, receipt_data) {
                 warn!("Failed to broadcast StorageReceipt via gossipsub: {:?}", e);
             }
+        }
+
+        DataCraftCommand::PushShard { peer_id, content_id, chunk_index, shard_index, shard_data, reply_tx } => {
+            debug!("Handling push shard command: {}/{}/{} to {}", content_id, chunk_index, shard_index, peer_id);
+            
+            let result = protocol
+                .push_shard_to_peer(swarm.behaviour_mut(), peer_id, &content_id, chunk_index, shard_index, &shard_data)
+                .await;
+            
+            let _ = reply_tx.send(result);
         }
 
         DataCraftCommand::CheckRemoval { content_id, reply_tx } => {
