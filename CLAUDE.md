@@ -35,7 +35,9 @@ crates/
 - **Access control (access.rs)**: `AccessEntry`/`AccessList` types. ECDH(ephemeral, recipient_x25519) + ChaCha20 key wrapping. Signed by creator. Bincode serialization for DHT.
 - **Proxy Re-Encryption (pre.rs)**: Client-side PRE using x25519 ECDH. `encrypt_content_key` (to creator), `generate_re_key` (creator→recipient), `re_encrypt_with_content_key`, `decrypt_re_encrypted`. Ed25519→x25519 via SHA-512 clamping (secret) + Edwards→Montgomery (public).
 - **Client PRE API**: `publish_with_pre()`, `grant_access()` (returns ReKeyEntry + ReEncryptedKey for DHT), `reconstruct_with_pre()` (recipient decrypts via PRE).
-- **Not yet implemented**: StorageReceipt generation (requires PDP challenger), settlement on-chain, payment channel on-chain settlement, DHT storage of access metadata
+- **DHT access metadata**: AccessList and ReKeyEntry stored/retrieved via DHT (`/datacraft/access/<cid>`, `/datacraft/rekey/<cid>/<did>`). ContentRouter methods: `put_access_list`, `get_access_list`, `put_re_key`, `get_re_key`, `remove_re_key`. Bincode serialization. Tombstone pattern for revocation.
+- **Access IPC handlers**: `access.grant` (generates ReKeyEntry + ReEncryptedKey, stores in DHT), `access.revoke` (tombstones re-key), `access.list` (fetches AccessList from DHT, returns authorized DIDs). Full async DHT round-trip via protocol event flow.
+- **Not yet implemented**: StorageReceipt generation (requires PDP challenger), settlement on-chain, payment channel on-chain settlement
 
 ## Key Design Decisions (from recent discussions)
 
