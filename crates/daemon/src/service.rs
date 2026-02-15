@@ -497,13 +497,15 @@ async fn drive_swarm(
                 if let Some(cmd) = command {
                     match cmd {
                         DataCraftCommand::TriggerDistribution => {
-                            info!("Received TriggerDistribution command — running maintenance cycle");
+                            info!("Received TriggerDistribution command — scheduling distribution in 5s");
                             let ct = content_tracker.clone();
                             let ctx = command_tx.clone();
                             let cl = client.clone();
                             let etx = event_tx.clone();
                             let ps = peer_scorer.clone();
                             tokio::spawn(async move {
+                                // Short delay to let gossipsub capability announcements arrive first
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 crate::reannounce::trigger_immediate_reannounce(&ct, &ctx, &cl, &etx, &ps).await;
                             });
                         }

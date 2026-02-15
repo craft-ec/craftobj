@@ -223,9 +223,18 @@ async fn distribute_content(
     };
 
     if storage_peers.is_empty() {
-        info!("Distribution: no storage peers known — skipping");
+        let total_known = {
+            let scorer = peer_scorer.lock().await;
+            scorer.iter().count()
+        };
+        let reason = if total_known == 0 {
+            "No peers connected — waiting for network discovery".to_string()
+        } else {
+            format!("{} peers connected but none have Storage capability", total_known)
+        };
+        info!("Distribution: {} — skipping", reason);
         let _ = event_tx.send(DaemonEvent::DistributionSkipped {
-            reason: "No storage peers available".to_string(),
+            reason,
             retry_secs: 600,
         });
         return;
