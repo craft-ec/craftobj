@@ -495,7 +495,22 @@ async fn drive_swarm(
             // Handle commands from IPC handler
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
-                    handle_command(swarm, &protocol, cmd, pending_requests.clone(), &event_tx).await;
+                    match cmd {
+                        DataCraftCommand::TriggerDistribution => {
+                            info!("Received TriggerDistribution command — running maintenance cycle");
+                            let ct = content_tracker.clone();
+                            let ctx = command_tx.clone();
+                            let cl = client.clone();
+                            let etx = event_tx.clone();
+                            let ps = peer_scorer.clone();
+                            tokio::spawn(async move {
+                                crate::reannounce::trigger_immediate_reannounce(&ct, &ctx, &cl, &etx, &ps).await;
+                            });
+                        }
+                        other => {
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &event_tx).await;
+                        }
+                    }
                 }
             }
         }
@@ -715,6 +730,10 @@ async fn handle_command(
             );
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
+        }
+        DataCraftCommand::TriggerDistribution => {
+            // Handled in drive_swarm before dispatch — should not reach here
+            unreachable!("TriggerDistribution should be intercepted in drive_swarm");
         }
     }
 }

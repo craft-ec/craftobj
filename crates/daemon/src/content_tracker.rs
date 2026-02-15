@@ -242,6 +242,33 @@ impl ContentTracker {
         imported
     }
 
+    /// Build a human-readable status summary for a content item.
+    pub fn status_summary(&self, content_id: &ContentId) -> Option<(ContentState, String)> {
+        let state = self.states.get(content_id)?;
+        let summary = match state.stage {
+            ContentStage::Chunked => {
+                "Stored locally only — needs to be announced to DHT so storage nodes can find it".to_string()
+            }
+            ContentStage::Announced => {
+                if state.remote_shards == 0 {
+                    format!("Announced to DHT — waiting for distribution to storage nodes ({} local shards ready to push)", state.local_shards)
+                } else {
+                    format!("Announced — {}/{} shards distributed, needs more storage nodes", state.remote_shards, state.total_shards)
+                }
+            }
+            ContentStage::Distributing => {
+                format!("Distributing — {}/{} shards pushed to storage nodes ({} providers)", state.remote_shards, state.total_shards, state.provider_count)
+            }
+            ContentStage::Distributed => {
+                format!("Fully distributed — {}/{} shards on {} storage nodes ✓", state.remote_shards, state.total_shards, state.provider_count)
+            }
+            ContentStage::Degraded => {
+                format!("DEGRADED — only {}/{} shards available, needs self-healing", state.remote_shards, state.total_shards)
+            }
+        };
+        Some((state.clone(), summary))
+    }
+
     /// Persist state to disk.
     pub fn save(&self) {
         let entries: Vec<&ContentState> = self.states.values().collect();

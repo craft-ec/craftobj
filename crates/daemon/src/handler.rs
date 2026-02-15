@@ -207,6 +207,31 @@ impl DataCraftHandler {
             });
         }
 
+        // Emit content status so UI shows the full picture
+        if let Some(ref tracker) = self.content_tracker {
+            if let Some(ref tx) = self.event_sender {
+                let t = tracker.lock().await;
+                if let Some((state, summary)) = t.status_summary(&result.content_id) {
+                    let _ = tx.send(DaemonEvent::ContentStatus {
+                        content_id: result.content_id.to_hex(),
+                        name: state.name,
+                        size: state.size,
+                        stage: state.stage.to_string(),
+                        local_shards: state.local_shards,
+                        remote_shards: state.remote_shards,
+                        total_shards: state.total_shards,
+                        provider_count: state.provider_count,
+                        summary,
+                    });
+                }
+            }
+        }
+
+        // Trigger immediate distribution to push shards to storage peers
+        if let Some(ref command_tx) = self.command_tx {
+            let _ = command_tx.send(DataCraftCommand::TriggerDistribution);
+        }
+
         let mut response = serde_json::json!({
             "cid": result.content_id.to_hex(),
             "size": result.total_size,

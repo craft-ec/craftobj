@@ -52,6 +52,21 @@ pub enum DaemonEvent {
     DhtError { content_id: String, error: String, /// What happens next
         next_action: String },
 
+    // -- Content status --
+    /// Full status update for a content item — emitted after publish, announce, distribute, or provider check
+    ContentStatus {
+        content_id: String,
+        name: String,
+        size: u64,
+        stage: String,
+        local_shards: usize,
+        remote_shards: usize,
+        total_shards: usize,
+        provider_count: usize,
+        /// Human-readable summary of what this means and what's next
+        summary: String,
+    },
+
     // -- Distribution --
     ContentDistributed { content_id: String, shards_pushed: usize, total_shards: usize, target_peers: usize },
     /// Distribution not possible — explains why and when retry happens

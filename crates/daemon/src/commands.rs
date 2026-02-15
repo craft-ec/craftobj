@@ -89,6 +89,8 @@ pub enum DataCraftCommand {
     BroadcastStorageReceipt {
         receipt_data: Vec<u8>,
     },
+    /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
+    TriggerDistribution,
     /// Push a shard to a remote storage peer (proactive distribution).
     PushShard {
         peer_id: PeerId,

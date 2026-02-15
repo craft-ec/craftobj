@@ -327,6 +327,20 @@ async fn distribute_content(
             });
             let mut t = tracker.lock().await;
             t.update_shard_progress(&content_id, pushed_count);
+            // Emit content status update
+            if let Some((state, summary)) = t.status_summary(&content_id) {
+                let _ = event_tx.send(DaemonEvent::ContentStatus {
+                    content_id: content_id.to_hex(),
+                    name: state.name,
+                    size: state.size,
+                    stage: state.stage.to_string(),
+                    local_shards: state.local_shards,
+                    remote_shards: state.remote_shards,
+                    total_shards: state.total_shards,
+                    provider_count: state.provider_count,
+                    summary,
+                });
+            }
         }
     }
 }
