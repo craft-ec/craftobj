@@ -623,6 +623,7 @@ dependencies = [
 name = "datacraft-client"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "chacha20poly1305",
  "craftec-crypto",
  "craftec-erasure",
@@ -631,6 +632,7 @@ dependencies = [
  "datacraft-routing",
  "datacraft-store",
  "datacraft-transfer",
+ "ed25519-dalek",
  "hex",
  "libp2p",
  "rand 0.8.5",

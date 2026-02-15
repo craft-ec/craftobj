@@ -25,13 +25,17 @@ crates/
 ## Current State
 
 - **P2P pipeline working**: Publish → DHT announce → DHT resolve → libp2p-stream transfer → fetch complete
-- **119 tests passing**, build + clippy clean
+- **166 tests passing**, build + clippy clean
 - **Capability announcements wired**: Nodes subscribe to gossipsub topic, broadcast capabilities periodically (every 5 min), track peer capabilities in memory
 - **TransferReceipts generated on shard transfers**: Requester signs receipt with ed25519 key after receiving shard data, sends back to server. Server verifies signature and stores in PersistentReceiptStore (append-only binary file with in-memory indices, dedup, CID/node/time queries)
 - **Signing module active**: `crates/core/src/signing.rs` provides `sign_transfer_receipt`, `verify_transfer_receipt`, `peer_id_to_ed25519_pubkey`
 - **Payment channel persistence**: `ChannelStore` (daemon) manages open channels on disk (one JSON per channel in `~/.datacraft/channels/`). Full voucher validation (sig verify, nonce, cumulative amounts). IPC handlers (`channel.open`, `channel.voucher`, `channel.close`, `channel.list`) wired to ChannelStore.
 - **Protocol egress pricing**: Fixed rate `PROTOCOL_EGRESS_PRICE_PER_BYTE` (1 USDC lamport/byte) in `economics.rs`. `EgressPricing` struct with `cost()` and `covers()` helpers. Nodes compete on performance, not price.
-- **Not yet implemented**: StorageReceipt generation (requires PDP challenger), settlement on-chain, payment channel on-chain settlement
+- **Content encryption**: ChaCha20-Poly1305 per-content key, nonce prepended. Publish with `encrypted=true` → `(CID, content_key)`. Reconstruct with key → plaintext, without → ciphertext.
+- **Access control (access.rs)**: `AccessEntry`/`AccessList` types. ECDH(ephemeral, recipient_x25519) + ChaCha20 key wrapping. Signed by creator. Bincode serialization for DHT.
+- **Proxy Re-Encryption (pre.rs)**: Client-side PRE using x25519 ECDH. `encrypt_content_key` (to creator), `generate_re_key` (creator→recipient), `re_encrypt_with_content_key`, `decrypt_re_encrypted`. Ed25519→x25519 via SHA-512 clamping (secret) + Edwards→Montgomery (public).
+- **Client PRE API**: `publish_with_pre()`, `grant_access()` (returns ReKeyEntry + ReEncryptedKey for DHT), `reconstruct_with_pre()` (recipient decrypts via PRE).
+- **Not yet implemented**: StorageReceipt generation (requires PDP challenger), settlement on-chain, payment channel on-chain settlement, DHT storage of access metadata
 
 ## Key Design Decisions (from recent discussions)
 

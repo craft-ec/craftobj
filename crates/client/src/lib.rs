@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use craftec_erasure::ErasureCoder;
 use datacraft_core::{
     ChunkManifest, ContentId, DataCraftError, PublishOptions, Result,
+    access::{self, AccessEntry},
     default_erasure_config,
+    pre::{self, EncryptedContentKey, ReEncryptedKey, ReKeyEntry},
 };
 use datacraft_store::{FsStore, PinManager};
 use tracing::info;
@@ -260,6 +262,81 @@ impl DataCraftClient {
         })
     }
 
+    /// Publish with PRE: encrypts content and stores encrypted content key
+    /// for the creator. Returns the encrypted content key alongside the publish result.
+    ///
+    /// The encrypted content key should be stored in DHT metadata.
+    pub fn publish_with_pre(
+        &mut self,
+        path: &Path,
+        options: &PublishOptions,
+        creator_keypair: &ed25519_dalek::SigningKey,
+    ) -> Result<(PublishResult, EncryptedContentKey)> {
+        let mut opts = options.clone();
+        opts.encrypted = true;
+
+        let result = self.publish(path, &opts)?;
+        let content_key = result
+            .encryption_key
+            .as_ref()
+            .ok_or_else(|| DataCraftError::EncryptionError("no encryption key".into()))?;
+
+        let encrypted_ck = pre::encrypt_content_key(creator_keypair, content_key)?;
+        Ok((result, encrypted_ck))
+    }
+
+    /// Grant access to a recipient: generates a re-encryption key and
+    /// re-encrypted content key that the recipient can decrypt.
+    ///
+    /// Returns (ReKeyEntry, ReEncryptedKey) to store in DHT.
+    pub fn grant_access(
+        &self,
+        creator_keypair: &ed25519_dalek::SigningKey,
+        recipient_pubkey: &ed25519_dalek::VerifyingKey,
+        content_key: &[u8],
+    ) -> Result<(ReKeyEntry, ReEncryptedKey)> {
+        let re_key = pre::generate_re_key(creator_keypair, recipient_pubkey)?;
+        let re_encrypted = pre::re_encrypt_with_content_key(content_key, &re_key)?;
+        let entry = ReKeyEntry {
+            recipient_did: recipient_pubkey.to_bytes(),
+            re_key,
+        };
+        Ok((entry, re_encrypted))
+    }
+
+    /// Grant access via AccessList (direct key encryption, not PRE).
+    ///
+    /// Creates an AccessEntry for the recipient.
+    pub fn grant_access_direct(
+        &self,
+        content_id: &ContentId,
+        creator_keypair: &ed25519_dalek::SigningKey,
+        recipient_pubkey: &ed25519_dalek::VerifyingKey,
+        content_key: &[u8],
+    ) -> Result<AccessEntry> {
+        access::grant_access(content_id, creator_keypair, recipient_pubkey, content_key)
+    }
+
+    /// Reconstruct content using a re-encrypted content key (PRE flow).
+    ///
+    /// The recipient fetches the re-encrypted key from DHT, decrypts it
+    /// with their private key, then uses the content key to decrypt content.
+    pub fn reconstruct_with_pre(
+        &self,
+        content_id: &ContentId,
+        dest: &Path,
+        re_encrypted_key: &ReEncryptedKey,
+        recipient_keypair: &ed25519_dalek::SigningKey,
+        creator_pubkey: &ed25519_dalek::VerifyingKey,
+    ) -> Result<()> {
+        let content_key = pre::decrypt_re_encrypted(
+            re_encrypted_key,
+            recipient_keypair,
+            creator_pubkey,
+        )?;
+        self.reconstruct(content_id, dest, Some(&content_key))
+    }
+
     /// Access the underlying store.
     pub fn store(&self) -> &FsStore {
         &self.store
@@ -483,6 +560,62 @@ mod tests {
 
         client.unpin(&cid).unwrap();
         assert!(!client.is_pinned(&cid));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_publish_with_pre_and_grant_access() {
+        use ed25519_dalek::SigningKey;
+
+        let dir = test_dir();
+        let mut client = DataCraftClient::new(&dir).unwrap();
+
+        let creator = SigningKey::generate(&mut rand::thread_rng());
+        let recipient = SigningKey::generate(&mut rand::thread_rng());
+
+        // Publish with PRE
+        let file_path = dir.join("pre_test.txt");
+        let content = b"pre-encrypted content for access control testing";
+        std::fs::write(&file_path, content).unwrap();
+
+        let (result, _encrypted_ck) = client
+            .publish_with_pre(&file_path, &PublishOptions::default(), &creator)
+            .unwrap();
+
+        let content_key = result.encryption_key.as_ref().unwrap();
+
+        // Grant access to recipient
+        let (_re_key_entry, re_encrypted) = client
+            .grant_access(&creator, &recipient.verifying_key(), content_key)
+            .unwrap();
+
+        // Recipient decrypts using PRE
+        let output = dir.join("pre_output.txt");
+        client
+            .reconstruct_with_pre(
+                &result.content_id,
+                &output,
+                &re_encrypted,
+                &recipient,
+                &creator.verifying_key(),
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+
+        // Wrong recipient cannot decrypt
+        let wrong = SigningKey::generate(&mut rand::thread_rng());
+        let output2 = dir.join("pre_output_wrong.txt");
+        let err = client
+            .reconstruct_with_pre(
+                &result.content_id,
+                &output2,
+                &re_encrypted,
+                &wrong,
+                &creator.verifying_key(),
+            );
+        assert!(err.is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
