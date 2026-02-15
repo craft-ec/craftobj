@@ -259,10 +259,12 @@ pub async fn run_daemon_with_config(
             &data_dir,
             daemon_config.reannounce_threshold_secs,
         );
-        let c = client.blocking_lock();
-        let imported = tracker.import_from_store(c.store());
-        if imported > 0 {
-            info!("Imported {} existing content items into tracker on startup", imported);
+        // Import existing content — use a temporary FsStore to avoid locking the async client
+        if let Ok(tmp_store) = datacraft_store::FsStore::new(&data_dir) {
+            let imported = tracker.import_from_store(&tmp_store);
+            if imported > 0 {
+                info!("Imported {} existing content items into tracker on startup", imported);
+            }
         }
         Arc::new(Mutex::new(tracker))
     };
