@@ -150,10 +150,18 @@ async fn handle_ws_connection(
                 match event {
                     Ok(daemon_event) => {
                         // Send as JSON-RPC notification (no id)
+                        // Use the serde tag ("type" field) as the method name
+                        // so clients can route by event type directly.
+                        let event_value = serde_json::to_value(&daemon_event).unwrap_or_default();
+                        let method = event_value.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("event")
+                            .to_string();
+                        let params = event_value.get("data").cloned().unwrap_or(serde_json::Value::Null);
                         let notification = serde_json::json!({
                             "jsonrpc": "2.0",
-                            "method": "event",
-                            "params": daemon_event,
+                            "method": method,
+                            "params": params,
                         });
                         let json = serde_json::to_string(&notification).unwrap_or_default();
                         if sink.send(Message::Text(json)).await.is_err() {
