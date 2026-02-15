@@ -725,6 +725,14 @@ async fn handle_command(
             let _ = reply_tx.send(result);
         }
 
+        DataCraftCommand::PushManifest { peer_id, content_id, manifest_json, reply_tx } => {
+            debug!("Handling push manifest command for {} to {}", content_id, peer_id);
+            let result = protocol
+                .push_manifest_to_peer(swarm.behaviour_mut(), peer_id, &content_id, &manifest_json)
+                .await;
+            let _ = reply_tx.send(result);
+        }
+
         DataCraftCommand::CheckRemoval { content_id, reply_tx } => {
             debug!("Handling check removal command for {}", content_id);
             // For now, just start a DHT query. Full async response would need pending request tracking.

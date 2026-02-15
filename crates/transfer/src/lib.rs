@@ -107,6 +107,39 @@ pub fn decode_shard_push_header(buf: &[u8]) -> Result<(ContentId, u32, u8, u32)>
     Ok((ContentId(cid_bytes), chunk_index, shard_index, payload_len))
 }
 
+/// Manifest push header size: magic(4) + type(1) + content_id(32) + payload_len(4) = 41
+pub const MANIFEST_PUSH_HEADER_SIZE: usize = 41;
+
+/// Encode a manifest push message.
+/// Wire format: `[magic:4][type:1(ManifestPush=6)][content_id:32][payload_len:4][manifest_json]`
+pub fn encode_manifest_push(content_id: &ContentId, manifest_json: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(MANIFEST_PUSH_HEADER_SIZE + manifest_json.len());
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::ManifestPush as u8);
+    buf.extend_from_slice(&content_id.0);
+    buf.extend_from_slice(&(manifest_json.len() as u32).to_be_bytes());
+    buf.extend_from_slice(manifest_json);
+    buf
+}
+
+/// Decode a manifest push header.
+/// Returns (content_id, payload_len).
+pub fn decode_manifest_push_header(buf: &[u8]) -> Result<(ContentId, u32)> {
+    if buf.len() < MANIFEST_PUSH_HEADER_SIZE {
+        return Err(DataCraftError::TransferError("manifest push header too short".into()));
+    }
+    if buf[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic".into()));
+    }
+    if buf[4] != WireMessageType::ManifestPush as u8 {
+        return Err(DataCraftError::TransferError(format!("expected ManifestPush type (6), got {}", buf[4])));
+    }
+    let mut cid_bytes = [0u8; 32];
+    cid_bytes.copy_from_slice(&buf[5..37]);
+    let payload_len = u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]);
+    Ok((ContentId(cid_bytes), payload_len))
+}
+
 /// Encode a response with status and payload.
 pub fn encode_response(status: WireStatus, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(RESPONSE_HEADER_SIZE + payload.len());

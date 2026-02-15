@@ -641,6 +641,93 @@ impl DataCraftProtocol {
     ///
     /// Wire format: `[magic:4][type:1(ShardPush=5)][content_id:32][chunk_index:4][shard_index:1][payload_len:4][payload]`
     /// Response: `[status:1]` (0=Ok, 2=Error)
+    async fn handle_incoming_manifest_push(&self, mut stream: libp2p::Stream, initial_header: &[u8]) {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        // We read REQUEST_HEADER_SIZE (42) bytes. ManifestPush header is 41 bytes.
+        // So initial_header[0..41] is the full header, initial_header[41] is first payload byte.
+        let header = &initial_header[..datacraft_transfer::MANIFEST_PUSH_HEADER_SIZE];
+        let (content_id, payload_len) = match datacraft_transfer::decode_manifest_push_header(header) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to decode manifest push header: {}", e);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                return;
+            }
+        };
+
+        // Sanity check (max 10MB manifest)
+        if payload_len > 10 * 1024 * 1024 {
+            warn!("Manifest push payload too large: {} bytes", payload_len);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        // Read remaining payload (we already have 1 byte from the initial header read)
+        let mut payload = vec![0u8; payload_len as usize];
+        payload[0] = initial_header[datacraft_transfer::MANIFEST_PUSH_HEADER_SIZE]; // the extra byte
+        if payload_len > 1 {
+            if let Err(e) = stream.read_exact(&mut payload[1..]).await {
+                error!("Failed to read manifest push payload: {}", e);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                return;
+            }
+        }
+
+        // Parse and store manifest
+        match serde_json::from_slice::<datacraft_core::ChunkManifest>(&payload) {
+            Ok(manifest) => {
+                let store = self.store.lock().await;
+                match store.put_manifest(&manifest) {
+                    Ok(()) => {
+                        info!("Stored pushed manifest for {} ({} bytes)", content_id, payload_len);
+                        let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to store pushed manifest: {}", e);
+                        let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse pushed manifest for {}: {}", content_id, e);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            }
+        }
+    }
+
+    pub async fn push_manifest_to_peer(
+        &self,
+        behaviour: &mut CraftBehaviour,
+        peer_id: libp2p::PeerId,
+        content_id: &ContentId,
+        manifest_json: &[u8],
+    ) -> Result<(), String> {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        debug!("Pushing manifest for {} ({} bytes) to peer {}", content_id, manifest_json.len(), peer_id);
+
+        let mut control = behaviour.stream_control();
+        let mut stream = control
+            .open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL))
+            .await
+            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
+
+        let msg = datacraft_transfer::encode_manifest_push(content_id, manifest_json);
+        stream.write_all(&msg).await.map_err(|e| format!("Failed to send manifest push to {}: {}", peer_id, e))?;
+
+        let mut status = [0u8; 1];
+        stream.read_exact(&mut status).await.map_err(|e| format!("Failed to read manifest push response from {}: {}", peer_id, e))?;
+
+        match datacraft_core::WireStatus::from_u8(status[0]) {
+            Some(datacraft_core::WireStatus::Ok) => {
+                debug!("Successfully pushed manifest for {} to {}", content_id, peer_id);
+                Ok(())
+            }
+            _ => Err(format!("Manifest push rejected by peer {} with status {}", peer_id, status[0])),
+        }
+    }
+
     pub async fn push_shard_to_peer(
         &self,
         behaviour: &mut CraftBehaviour,
@@ -703,6 +790,12 @@ impl DataCraftProtocol {
         // Check if this is a ShardPush message (type byte at offset 4)
         if header[4] == datacraft_core::WireMessageType::ShardPush as u8 {
             self.handle_incoming_push(stream, &header).await;
+            return;
+        }
+
+        // Check if this is a ManifestPush message
+        if header[4] == datacraft_core::WireMessageType::ManifestPush as u8 {
+            self.handle_incoming_manifest_push(stream, &header).await;
             return;
         }
 

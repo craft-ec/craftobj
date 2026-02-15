@@ -277,6 +277,32 @@ async fn distribute_content(
 
         let total_shards =
             manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+
+        // Push manifest to all storage peers first so they can track the content
+        let manifest_json = match serde_json::to_vec(&manifest) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Cannot serialize manifest for {}: {}", content_id, e);
+                continue;
+            }
+        };
+        for &peer in &ranked_peers {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = DataCraftCommand::PushManifest {
+                peer_id: peer,
+                content_id,
+                manifest_json: manifest_json.clone(),
+                reply_tx,
+            };
+            if command_tx.send(cmd).is_ok() {
+                match reply_rx.await {
+                    Ok(Ok(())) => debug!("Pushed manifest for {} to {}", content_id, peer),
+                    Ok(Err(e)) => debug!("Manifest push to {} failed: {}", peer, e),
+                    Err(_) => {}
+                }
+            }
+        }
+
         let mut pushed_count = 0usize;
         let mut peer_idx = 0usize;
 

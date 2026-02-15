@@ -91,6 +91,13 @@ pub enum DataCraftCommand {
     },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
+    /// Push a manifest to a remote storage peer.
+    PushManifest {
+        peer_id: PeerId,
+        content_id: ContentId,
+        manifest_json: Vec<u8>,
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
     /// Push a shard to a remote storage peer (proactive distribution).
     PushShard {
         peer_id: PeerId,
