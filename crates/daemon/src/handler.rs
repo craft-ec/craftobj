@@ -1306,9 +1306,16 @@ impl DataCraftHandler {
     }
 
     async fn handle_set_config(&self, params: Option<Value>) -> Result<Value, String> {
-        let partial = params.ok_or("missing params")?;
+        let params = params.ok_or("missing params")?;
         let config_arc = self.daemon_config.as_ref().ok_or("daemon config not available")?;
         let data_dir = self.data_dir.as_ref().ok_or("data dir not available")?;
+
+        // Client may send {config: "<json string>"} or direct fields
+        let partial = if let Some(config_str) = params.get("config").and_then(|v| v.as_str()) {
+            serde_json::from_str::<Value>(config_str).map_err(|e| format!("invalid config JSON: {}", e))?
+        } else {
+            params
+        };
 
         let mut config = config_arc.lock().await;
         config.merge(&partial);
