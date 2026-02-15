@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 
 use crate::channel_store::ChannelStore;
 use crate::commands::DataCraftCommand;
+use crate::content_tracker::ContentTracker;
 use crate::protocol::DataCraftProtocol;
 use crate::receipt_store::PersistentReceiptStore;
 use crate::settlement::SolanaClient;
@@ -36,6 +37,7 @@ pub struct DataCraftHandler {
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     channel_store: Option<Arc<Mutex<ChannelStore>>>,
     settlement_client: Option<Arc<Mutex<SolanaClient>>>,
+    content_tracker: Option<Arc<Mutex<ContentTracker>>>,
 }
 
 impl DataCraftHandler {
@@ -55,12 +57,18 @@ impl DataCraftHandler {
             receipt_store: Some(receipt_store),
             channel_store: Some(channel_store),
             settlement_client: None,
+            content_tracker: None,
         }
     }
 
     /// Set the settlement client for on-chain operations.
     pub fn set_settlement_client(&mut self, client: Arc<Mutex<SolanaClient>>) {
         self.settlement_client = Some(client);
+    }
+
+    /// Set the content tracker.
+    pub fn set_content_tracker(&mut self, tracker: Arc<Mutex<ContentTracker>>) {
+        self.content_tracker = Some(tracker);
     }
 
     /// Create handler without protocol (for testing).
@@ -73,6 +81,7 @@ impl DataCraftHandler {
             receipt_store: None,
             channel_store: None,
             settlement_client: None,
+            content_tracker: None,
         }
     }
 
@@ -92,6 +101,11 @@ impl DataCraftHandler {
             erasure_config: None,
         };
 
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         let mut client = self.client.lock().await;
         let result = client
             .publish(&PathBuf::from(path), &options)
@@ -104,6 +118,12 @@ impl DataCraftHandler {
             .map_err(|e| format!("Failed to get manifest: {}", e))?;
         
         drop(client); // Release the lock
+
+        // Track in content tracker
+        if let Some(ref tracker) = self.content_tracker {
+            let mut t = tracker.lock().await;
+            t.track_published(result.content_id, &manifest, file_name, encrypted);
+        }
 
         // Announce to DHT after successful publish (Milestone 1)
         if let Some(ref command_tx) = self.command_tx {
@@ -123,6 +143,10 @@ impl DataCraftHandler {
                 match reply_rx.await {
                     Ok(Ok(())) => {
                         debug!("Successfully announced {} to DHT", result.content_id);
+                        if let Some(ref tracker) = self.content_tracker {
+                            let mut t = tracker.lock().await;
+                            t.mark_announced(&result.content_id);
+                        }
                     }
                     Ok(Err(e)) => {
                         warn!("Failed to announce {} to DHT: {}", result.content_id, e);
@@ -260,6 +284,34 @@ impl DataCraftHandler {
     async fn handle_list(&self) -> Result<Value, String> {
         let client = self.client.lock().await;
         let items = client.list().map_err(|e| e.to_string())?;
+        drop(client);
+
+        // Merge with tracker data if available
+        if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            let mut result = Vec::new();
+            for item in &items {
+                let mut obj = serde_json::json!({
+                    "content_id": item.content_id.to_hex(),
+                    "total_size": item.total_size,
+                    "chunk_count": item.chunk_count,
+                    "pinned": item.pinned,
+                });
+                if let Some(state) = t.get(&item.content_id) {
+                    obj["name"] = serde_json::json!(state.name);
+                    obj["encrypted"] = serde_json::json!(state.encrypted);
+                    obj["stage"] = serde_json::json!(state.stage.to_string());
+                    obj["total_shards"] = serde_json::json!(state.total_shards);
+                    obj["local_shards"] = serde_json::json!(state.local_shards);
+                    obj["remote_shards"] = serde_json::json!(state.remote_shards);
+                    obj["provider_count"] = serde_json::json!(state.provider_count);
+                    obj["last_announced"] = serde_json::json!(state.last_announced);
+                }
+                result.push(obj);
+            }
+            return Ok(serde_json::json!(result));
+        }
+
         serde_json::to_value(items).map_err(|e| e.to_string())
     }
 

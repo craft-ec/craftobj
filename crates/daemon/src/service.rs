@@ -113,6 +113,7 @@ pub async fn run_daemon(
     // Create command channel for IPC → swarm communication
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<DataCraftCommand>();
     let command_tx_for_caps = command_tx.clone();
+    let command_tx_for_maintenance = command_tx.clone();
     
     // Create pending requests tracker for DHT operations
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
@@ -208,8 +209,14 @@ pub async fn run_daemon(
     }
     let settlement_client = Arc::new(Mutex::new(settlement_client));
 
+    // Content lifecycle tracker
+    let content_tracker = Arc::new(Mutex::new(
+        crate::content_tracker::ContentTracker::new(&data_dir),
+    ));
+
     let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store);
     handler.set_settlement_client(settlement_client);
+    handler.set_content_tracker(content_tracker.clone());
     let handler = Arc::new(handler);
 
     info!("Starting IPC server on {}", socket_path);
@@ -298,6 +305,14 @@ pub async fn run_daemon(
         }
         _ = run_challenger_loop(challenger_mgr, store.clone()) => {
             info!("Challenger loop ended");
+        }
+        _ = crate::reannounce::content_maintenance_loop(
+            content_tracker,
+            command_tx_for_maintenance,
+            client.clone(),
+            crate::reannounce::DEFAULT_INTERVAL_SECS,
+        ) => {
+            info!("Content maintenance loop ended");
         }
     }
 
