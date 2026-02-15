@@ -415,6 +415,12 @@ pub struct CapabilityAnnouncement {
     pub timestamp: u64,
     /// Signature over (peer_id || capabilities || timestamp) by the announcing node.
     pub signature: Vec<u8>,
+    /// Storage committed (max_storage_bytes from config). 0 if not a storage node.
+    #[serde(default)]
+    pub storage_committed_bytes: u64,
+    /// Storage currently used. 0 if not a storage node.
+    #[serde(default)]
+    pub storage_used_bytes: u64,
 }
 
 impl CapabilityAnnouncement {
@@ -426,6 +432,8 @@ impl CapabilityAnnouncement {
             data.push(*cap as u8);
         }
         data.extend_from_slice(&self.timestamp.to_le_bytes());
+        data.extend_from_slice(&self.storage_committed_bytes.to_le_bytes());
+        data.extend_from_slice(&self.storage_used_bytes.to_le_bytes());
         data
     }
 }
@@ -702,6 +710,8 @@ mod tests {
             capabilities: vec![DataCraftCapability::Storage, DataCraftCapability::Client],
             timestamp: 1700000000,
             signature: vec![0xAA, 0xBB],
+            storage_committed_bytes: 10_000_000_000,
+            storage_used_bytes: 5_000_000_000,
         };
         let json = serde_json::to_string(&ann).unwrap();
         let parsed: CapabilityAnnouncement = serde_json::from_str(&json).unwrap();
@@ -718,10 +728,12 @@ mod tests {
             capabilities: vec![DataCraftCapability::Storage, DataCraftCapability::Client],
             timestamp: 100,
             signature: vec![],
+            storage_committed_bytes: 0,
+            storage_used_bytes: 0,
         };
         let data = ann.signable_data();
-        // 2 (peer_id) + 2 (capability bytes) + 8 (timestamp) = 12
-        assert_eq!(data.len(), 12);
+        // 2 (peer_id) + 2 (capability bytes) + 8 (timestamp) + 8 (committed) + 8 (used) = 28
+        assert_eq!(data.len(), 28);
         // Deterministic
         assert_eq!(data, ann.signable_data());
     }

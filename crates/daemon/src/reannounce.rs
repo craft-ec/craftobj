@@ -51,6 +51,8 @@ pub async fn run_maintenance_cycle(
     event_tx: &EventSender,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
 ) {
+    info!("Content maintenance cycle starting");
+
     // Phase 1: Re-announce content that needs it
     let needs_announce = {
         let t = tracker.lock().await;
@@ -184,14 +186,25 @@ async fn distribute_content(
     // Get storage peers
     let storage_peers: Vec<libp2p::PeerId> = {
         let scorer = peer_scorer.lock().await;
-        scorer
+        let total_peers = scorer.iter().count();
+        let peers: Vec<_> = scorer
             .iter()
             .filter(|(_, score)| score.capabilities.contains(&DataCraftCapability::Storage))
             .map(|(peer_id, _)| *peer_id)
-            .collect()
+            .collect();
+        info!(
+            "Distribution: peer_scorer has {} total peers, {} with Storage capability",
+            total_peers,
+            peers.len()
+        );
+        for (peer_id, score) in scorer.iter() {
+            info!("  peer {} — capabilities: {:?}", peer_id, score.capabilities);
+        }
+        peers
     };
 
     if storage_peers.is_empty() {
+        info!("Distribution: no storage peers known — skipping");
         return;
     }
 
@@ -207,6 +220,7 @@ async fn distribute_content(
     };
 
     if needs_dist.is_empty() {
+        info!("Distribution: all content already distributed — nothing to do");
         return;
     }
 

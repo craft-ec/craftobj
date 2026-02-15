@@ -172,6 +172,34 @@ impl FsStore {
         &self.data_dir
     }
 
+    /// Calculate total disk usage of all stored shards and manifests in bytes.
+    pub fn disk_usage(&self) -> Result<u64> {
+        let mut total = 0u64;
+        let chunks_dir = self.data_dir.join("chunks");
+        if chunks_dir.exists() {
+            total += dir_size(&chunks_dir)?;
+        }
+        let manifests_dir = self.data_dir.join("manifests");
+        if manifests_dir.exists() {
+            total += dir_size(&manifests_dir)?;
+        }
+        Ok(total)
+    }
+
+    /// Calculate disk usage for a specific content ID.
+    pub fn cid_disk_usage(&self, content_id: &ContentId) -> u64 {
+        let mut total = 0u64;
+        let chunk_dir = self.data_dir.join("chunks").join(content_id.to_hex());
+        if chunk_dir.exists() {
+            total += dir_size(&chunk_dir).unwrap_or(0);
+        }
+        let manifest_path = self.data_dir.join("manifests").join(format!("{}.json", content_id.to_hex()));
+        if manifest_path.exists() {
+            total += std::fs::metadata(&manifest_path).map(|m| m.len()).unwrap_or(0);
+        }
+        total
+    }
+
     /// Return the maximum shard index stored locally for a given content/chunk pair.
     /// Returns `None` if no shards are stored for this chunk.
     pub fn max_shard_index(&self, content_id: &ContentId, chunk_index: u32) -> Option<u8> {
@@ -498,4 +526,19 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// Recursively calculate the size of a directory.
+fn dir_size(path: &std::path::Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
 }

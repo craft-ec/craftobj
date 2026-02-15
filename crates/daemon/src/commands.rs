@@ -38,6 +38,8 @@ pub enum DataCraftCommand {
     /// Publish a capability announcement via gossipsub.
     PublishCapabilities {
         capabilities: Vec<DataCraftCapability>,
+        storage_committed_bytes: u64,
+        storage_used_bytes: u64,
     },
     /// Query a peer for their max shard index for a CID.
     QueryMaxShardIndex {

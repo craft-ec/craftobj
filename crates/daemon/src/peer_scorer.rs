@@ -10,6 +10,16 @@ use std::time::{Duration, Instant};
 
 use datacraft_core::DataCraftCapability;
 use libp2p::PeerId;
+use serde::Serialize;
+
+/// Network-wide storage summary aggregated from peer announcements.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkStorageSummary {
+    pub total_committed: u64,
+    pub total_used: u64,
+    pub total_available: u64,
+    pub storage_node_count: u64,
+}
 
 /// Decay factor applied on each score update (0.95 = 5% decay per interaction).
 const DECAY_FACTOR: f64 = 0.95;
@@ -44,6 +54,10 @@ pub struct PeerScore {
     pub last_interaction: Option<Instant>,
     /// Exponential moving average of response latency in milliseconds.
     pub avg_latency_ms: f64,
+    /// Storage committed by this peer (from capability announcement).
+    pub storage_committed_bytes: u64,
+    /// Storage currently used by this peer (from capability announcement).
+    pub storage_used_bytes: u64,
 }
 
 impl PeerScore {
@@ -56,6 +70,8 @@ impl PeerScore {
             timeouts: 0.0,
             last_interaction: None,
             avg_latency_ms: 0.0,
+            storage_committed_bytes: 0,
+            storage_used_bytes: 0,
         }
     }
 
@@ -155,6 +171,18 @@ impl PeerScorer {
         capabilities: Vec<DataCraftCapability>,
         _timestamp: u64,
     ) {
+        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0);
+    }
+
+    /// Update capabilities and storage info from a gossipsub announcement.
+    pub fn update_capabilities_with_storage(
+        &mut self,
+        peer: &PeerId,
+        capabilities: Vec<DataCraftCapability>,
+        _timestamp: u64,
+        storage_committed_bytes: u64,
+        storage_used_bytes: u64,
+    ) {
         let now = Instant::now();
         let entry = self.scores.entry(*peer).or_insert_with(|| {
             PeerScore::new(capabilities.clone(), now)
@@ -163,6 +191,28 @@ impl PeerScorer {
         // (the caller already filters by timestamp freshness)
         entry.capabilities = capabilities;
         entry.last_announcement = now;
+        entry.storage_committed_bytes = storage_committed_bytes;
+        entry.storage_used_bytes = storage_used_bytes;
+    }
+
+    /// Get network-wide storage summary from all known peers.
+    pub fn network_storage_summary(&self) -> NetworkStorageSummary {
+        let mut total_committed = 0u64;
+        let mut total_used = 0u64;
+        let mut storage_node_count = 0u64;
+        for score in self.scores.values() {
+            if score.capabilities.contains(&DataCraftCapability::Storage) {
+                storage_node_count += 1;
+                total_committed += score.storage_committed_bytes;
+                total_used += score.storage_used_bytes;
+            }
+        }
+        NetworkStorageSummary {
+            total_committed,
+            total_used,
+            total_available: total_committed.saturating_sub(total_used),
+            storage_node_count,
+        }
     }
 
     /// Remove peers whose last announcement exceeds the given TTL.
@@ -354,6 +404,8 @@ mod tests {
                 timeouts: 0.0,
                 last_interaction: None,
                 avg_latency_ms: 0.0,
+                storage_committed_bytes: 0,
+                storage_used_bytes: 0,
             },
         );
 

@@ -339,7 +339,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -351,7 +351,7 @@ pub async fn run_daemon_with_config(
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone()) => {
             info!("Protocol events handler ended");
         }
-        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs) => {
+        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes) => {
             info!("Capability announcement loop ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
@@ -386,6 +386,9 @@ async fn drive_swarm(
     own_capabilities: Vec<DataCraftCapability>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     event_tx: EventSender,
+    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    client: Arc<Mutex<datacraft_client::DataCraftClient>>,
+    max_storage_bytes: u64,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -403,8 +406,11 @@ async fn drive_swarm(
                         info!("Connected to {}", peer_id);
                         let _ = event_tx.send(DaemonEvent::PeerConnected { peer_id: peer_id.to_string() });
                         // Announce capabilities immediately so the new peer learns about us
+                        let used = client.lock().await.store().disk_usage().unwrap_or(0);
                         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
                             capabilities: own_capabilities.clone(),
+                            storage_committed_bytes: max_storage_bytes,
+                            storage_used_bytes: used,
                         });
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -416,11 +422,23 @@ async fn drive_swarm(
                         // Handle mDNS discovery: add discovered peers to Kademlia and dial them
                         handle_mdns_event(swarm, &event, &event_tx);
                         // Try to extract gossipsub capability announcements before passing through
-                        handle_gossipsub_capability(&event, &peer_scorer, &event_tx).await;
+                        let new_storage_peer = handle_gossipsub_capability(&event, &peer_scorer, &event_tx).await;
                         // Evict stale peers after processing announcements
                         {
                             let mut scorer = peer_scorer.lock().await;
                             scorer.evict_stale(std::time::Duration::from_secs(900)); // 15min TTL (3x announce interval)
+                        }
+                        // Trigger immediate distribution when a new storage peer appears
+                        if new_storage_peer {
+                            info!("New storage peer detected — triggering immediate content distribution");
+                            let ct = content_tracker.clone();
+                            let ctx = command_tx.clone();
+                            let cl = client.clone();
+                            let etx = event_tx.clone();
+                            let ps = peer_scorer.clone();
+                            tokio::spawn(async move {
+                                crate::reannounce::trigger_immediate_reannounce(&ct, &ctx, &cl, &etx, &ps).await;
+                            });
                         }
                         handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
                         handle_gossipsub_storage_receipt(&event, &event_tx).await;
@@ -505,7 +523,7 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::PublishCapabilities { capabilities } => {
+        DataCraftCommand::PublishCapabilities { capabilities, storage_committed_bytes, storage_used_bytes } => {
             let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
             let local_peer_id = *swarm.local_peer_id();
             let timestamp = std::time::SystemTime::now()
@@ -517,6 +535,8 @@ async fn handle_command(
                 capabilities,
                 timestamp,
                 signature: vec![], // TODO: sign with node keypair
+                storage_committed_bytes,
+                storage_used_bytes,
             };
             match serde_json::to_vec(&announcement) {
                 Ok(data) => {
@@ -678,11 +698,12 @@ fn handle_mdns_event(
 }
 
 /// Handle gossipsub capability announcement messages.
+/// Returns `true` if a new peer with `Storage` capability was discovered.
 async fn handle_gossipsub_capability(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     peer_scorer: &SharedPeerScorer,
     event_tx: &EventSender,
-) {
+) -> bool {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
 
@@ -695,8 +716,9 @@ async fn handle_gossipsub_capability(
             match serde_json::from_slice::<CapabilityAnnouncement>(&message.data) {
                 Ok(ann) => {
                     if let Ok(peer_id) = libp2p::PeerId::from_bytes(&ann.peer_id) {
+                        let has_storage = ann.capabilities.contains(&DataCraftCapability::Storage);
                         let cap_strings: Vec<String> = ann.capabilities.iter().map(|c| c.to_string()).collect();
-                        debug!(
+                        info!(
                             "Received capability announcement from {}: {:?}",
                             peer_id, ann.capabilities
                         );
@@ -705,14 +727,23 @@ async fn handle_gossipsub_capability(
                             capabilities: cap_strings,
                         });
                         let mut scorer = peer_scorer.lock().await;
+                        // Check if this is a NEW storage peer (not previously known)
+                        let is_new = scorer.get(&peer_id).is_none();
                         // Only update if newer
                         let dominated = scorer
                             .get(&peer_id)
                             .map(|_| true) // Always accept since scorer tracks announcement time
                             .unwrap_or(true);
                         if dominated {
-                            scorer.update_capabilities(&peer_id, ann.capabilities, ann.timestamp);
+                            scorer.update_capabilities_with_storage(
+                                &peer_id,
+                                ann.capabilities,
+                                ann.timestamp,
+                                ann.storage_committed_bytes,
+                                ann.storage_used_bytes,
+                            );
                         }
+                        return is_new && has_storage;
                     }
                 }
                 Err(e) => {
@@ -721,6 +752,7 @@ async fn handle_gossipsub_capability(
             }
         }
     }
+    false
 }
 
 /// Handle gossipsub removal notice messages.
@@ -806,6 +838,8 @@ async fn announce_capabilities_periodically(
     capabilities: Vec<DataCraftCapability>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     interval_secs: u64,
+    client: Arc<Mutex<datacraft_client::DataCraftClient>>,
+    max_storage_bytes: u64,
 ) {
     use std::time::Duration;
 
@@ -815,9 +849,12 @@ async fn announce_capabilities_periodically(
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
-        debug!("Publishing capability announcement");
+        let used = client.lock().await.store().disk_usage().unwrap_or(0);
+        debug!("Publishing capability announcement (storage: {}/{} bytes)", used, max_storage_bytes);
         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
             capabilities: capabilities.clone(),
+            storage_committed_bytes: max_storage_bytes,
+            storage_used_bytes: used,
         });
     }
 }
