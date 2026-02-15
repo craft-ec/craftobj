@@ -15,6 +15,7 @@ pub mod commands;
 pub mod handler;
 pub mod health;
 pub mod pdp;
+pub mod peer_scorer;
 pub mod protocol;
 pub mod reannounce;
 pub mod receipt_store;

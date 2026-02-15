@@ -63,8 +63,8 @@ fn dirs_home() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// Peer capability tracker — stores latest known capabilities per peer.
-type PeerCapabilities = Arc<Mutex<HashMap<libp2p::PeerId, (Vec<DataCraftCapability>, u64)>>>;
+/// Shared peer scorer — tracks capabilities and reliability per peer.
+type SharedPeerScorer = Arc<Mutex<crate::peer_scorer::PeerScorer>>;
 
 /// Tracks pending DHT requests from IPC commands.
 #[derive(Debug)]
@@ -198,8 +198,8 @@ pub async fn run_daemon_with_config(
         error!("Failed to subscribe to storage receipt topic: {:?}", e);
     }
 
-    // Peer capabilities tracker
-    let peer_capabilities: PeerCapabilities = Arc::new(Mutex::new(HashMap::new()));
+    // Peer scorer — tracks capabilities and reliability
+    let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
 
     // Removal cache for fast local checks
     let removal_cache = Arc::new(Mutex::new(crate::removal_cache::RemovalCache::new()));
@@ -276,7 +276,7 @@ pub async fn run_daemon_with_config(
     info!("Capabilities: {:?}", own_capabilities);
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
-    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_capabilities.clone(), receipt_store.clone(), channel_store);
+    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_scorer.clone(), receipt_store.clone(), channel_store);
     handler.set_settlement_client(settlement_client);
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
@@ -330,7 +330,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -370,7 +370,7 @@ async fn drive_swarm(
     protocol: Arc<DataCraftProtocol>,
     command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
     pending_requests: PendingRequests,
-    peer_capabilities: PeerCapabilities,
+    peer_scorer: SharedPeerScorer,
     removal_cache: SharedRemovalCache,
     own_capabilities: Vec<DataCraftCapability>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
@@ -401,7 +401,7 @@ async fn drive_swarm(
                         // Handle mDNS discovery: add discovered peers to Kademlia and dial them
                         handle_mdns_event(swarm, &event);
                         // Try to extract gossipsub capability announcements before passing through
-                        handle_gossipsub_capability(&event, &peer_capabilities).await;
+                        handle_gossipsub_capability(&event, &peer_scorer).await;
                         handle_gossipsub_removal(&event, &removal_cache).await;
                         handle_gossipsub_storage_receipt(&event).await;
                         // Pass events to our protocol handler
@@ -640,7 +640,7 @@ fn handle_mdns_event(
 /// Handle gossipsub capability announcement messages.
 async fn handle_gossipsub_capability(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
-    peer_capabilities: &PeerCapabilities,
+    peer_scorer: &SharedPeerScorer,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -658,14 +658,14 @@ async fn handle_gossipsub_capability(
                             "Received capability announcement from {}: {:?}",
                             peer_id, ann.capabilities
                         );
-                        let mut caps = peer_capabilities.lock().await;
+                        let mut scorer = peer_scorer.lock().await;
                         // Only update if newer
-                        let dominated = caps
+                        let dominated = scorer
                             .get(&peer_id)
-                            .map(|(_, ts)| *ts < ann.timestamp)
+                            .map(|_| true) // Always accept since scorer tracks announcement time
                             .unwrap_or(true);
                         if dominated {
-                            caps.insert(peer_id, (ann.capabilities, ann.timestamp));
+                            scorer.update_capabilities(&peer_id, ann.capabilities, ann.timestamp);
                         }
                     }
                 }

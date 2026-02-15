@@ -24,17 +24,18 @@ use crate::settlement::SolanaClient;
 
 use datacraft_core::DataCraftCapability;
 use ed25519_dalek;
-use std::collections::HashMap;
 
-/// Peer capability tracker type alias.
-type PeerCapabilities = Arc<Mutex<HashMap<libp2p::PeerId, (Vec<DataCraftCapability>, u64)>>>;
+use crate::peer_scorer::PeerScorer;
+
+/// Shared peer scorer type alias.
+type SharedPeerScorer = Arc<Mutex<PeerScorer>>;
 
 /// DataCraft IPC handler wrapping a DataCraftClient and protocol.
 pub struct DataCraftHandler {
     client: Arc<Mutex<DataCraftClient>>,
     _protocol: Option<Arc<DataCraftProtocol>>,
     command_tx: Option<mpsc::UnboundedSender<DataCraftCommand>>,
-    peer_capabilities: Option<PeerCapabilities>,
+    peer_scorer: Option<SharedPeerScorer>,
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     channel_store: Option<Arc<Mutex<ChannelStore>>>,
     settlement_client: Option<Arc<Mutex<SolanaClient>>>,
@@ -49,7 +50,7 @@ impl DataCraftHandler {
         client: Arc<Mutex<DataCraftClient>>,
         protocol: Arc<DataCraftProtocol>,
         command_tx: mpsc::UnboundedSender<DataCraftCommand>,
-        peer_capabilities: PeerCapabilities,
+        peer_scorer: SharedPeerScorer,
         receipt_store: Arc<Mutex<PersistentReceiptStore>>,
         channel_store: Arc<Mutex<ChannelStore>>,
     ) -> Self {
@@ -57,7 +58,7 @@ impl DataCraftHandler {
             client, 
             _protocol: Some(protocol),
             command_tx: Some(command_tx),
-            peer_capabilities: Some(peer_capabilities),
+            peer_scorer: Some(peer_scorer),
             receipt_store: Some(receipt_store),
             channel_store: Some(channel_store),
             settlement_client: None,
@@ -95,7 +96,7 @@ impl DataCraftHandler {
             client, 
             _protocol: None,
             command_tx: None,
-            peer_capabilities: None,
+            peer_scorer: None,
             receipt_store: None,
             channel_store: None,
             settlement_client: None,
@@ -465,18 +466,19 @@ impl DataCraftHandler {
     }
 
     async fn handle_peers(&self) -> Result<Value, String> {
-        let caps = match &self.peer_capabilities {
-            Some(pc) => pc.lock().await,
+        let scorer = match &self.peer_scorer {
+            Some(ps) => ps.lock().await,
             None => return Ok(serde_json::json!({})),
         };
         let mut result = serde_json::Map::new();
-        for (peer_id, (capabilities, timestamp)) in caps.iter() {
-            let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
+        for (peer_id, peer_score) in scorer.iter() {
+            let cap_strings: Vec<String> = peer_score.capabilities.iter().map(|c| c.to_string()).collect();
             result.insert(
                 peer_id.to_string(),
                 serde_json::json!({
                     "capabilities": cap_strings,
-                    "last_seen": timestamp,
+                    "score": peer_score.score(),
+                    "avg_latency_ms": peer_score.avg_latency_ms,
                 }),
             );
         }
