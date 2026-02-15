@@ -316,6 +316,56 @@ impl DataCraftHandler {
         Ok(serde_json::json!({ "receipts": results }))
     }
 
+    async fn handle_storage_receipt_list(&self, params: Option<Value>) -> Result<Value, String> {
+        let store = self.receipt_store.as_ref().ok_or("receipt store not available")?;
+        let store = store.lock().await;
+        let params = params.unwrap_or(serde_json::json!({}));
+
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        // Optional filters
+        let receipts: Vec<&datacraft_core::StorageReceipt> =
+            if let Some(cid_hex) = params.get("cid").and_then(|v| v.as_str()) {
+                let cid = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+                store.query_by_cid(&cid).into_iter().filter_map(|e| match e {
+                    crate::receipt_store::ReceiptEntry::Storage(r) => Some(r),
+                    _ => None,
+                }).collect()
+            } else if let Some(node_hex) = params.get("node").and_then(|v| v.as_str()) {
+                let node = parse_pubkey(node_hex)?;
+                store.query_by_node(&node).into_iter().filter_map(|e| match e {
+                    crate::receipt_store::ReceiptEntry::Storage(r) => Some(r),
+                    _ => None,
+                }).collect()
+            } else {
+                store.all_storage_receipts().iter().collect()
+            };
+
+        let total = receipts.len();
+        let items: Vec<Value> = receipts.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|r| serde_json::json!({
+                "cid": r.content_id.to_hex(),
+                "storage_node": hex::encode(r.storage_node),
+                "challenger": hex::encode(r.challenger),
+                "shard_index": r.shard_index,
+                "timestamp": r.timestamp,
+                "nonce": hex::encode(r.nonce),
+                "proof_hash": hex::encode(r.proof_hash),
+                "signed": !r.signature.is_empty(),
+            }))
+            .collect();
+
+        Ok(serde_json::json!({
+            "receipts": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }))
+    }
+
     async fn handle_peers(&self) -> Result<Value, String> {
         let caps = match &self.peer_capabilities {
             Some(pc) => pc.lock().await,
@@ -656,6 +706,110 @@ impl DataCraftHandler {
         }
     }
 
+    /// Revoke access with key rotation: revoke user, rotate content key, re-grant remaining users.
+    async fn handle_access_revoke_rotate(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+        let creator_secret_hex = params.get("creator_secret").and_then(|v| v.as_str()).ok_or("missing 'creator_secret'")?;
+        let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
+        let content_key_hex = params.get("content_key").and_then(|v| v.as_str()).ok_or("missing 'content_key'")?;
+
+        // Parse authorized users list
+        let authorized_arr = params.get("authorized").and_then(|v| v.as_array()).ok_or("missing 'authorized' array")?;
+        let mut all_authorized = Vec::new();
+        for val in authorized_arr {
+            let hex_str = val.as_str().ok_or("authorized entry must be hex string")?;
+            let bytes = parse_pubkey(hex_str)?;
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+                .map_err(|e| format!("invalid authorized pubkey: {e}"))?;
+            all_authorized.push(vk);
+        }
+
+        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
+        if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(
+            creator_bytes.as_slice().try_into().unwrap()
+        );
+        let revoked_bytes = parse_pubkey(recipient_pubkey_hex)?;
+        let revoked_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&revoked_bytes)
+            .map_err(|e| format!("invalid recipient pubkey: {e}"))?;
+        let content_key = hex::decode(content_key_hex).map_err(|e| e.to_string())?;
+
+        // 1. Revoke: tombstone the old re-key
+        if let Some(ref command_tx) = self.command_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::RemoveReKey {
+                content_id,
+                recipient_did: revoked_bytes,
+                reply_tx,
+            }).map_err(|e| e.to_string())?;
+            reply_rx.await.map_err(|e| e.to_string())??;
+        }
+
+        // 2. Rotate key + re-encrypt content + re-grant remaining users
+        let revocation = {
+            let mut client = self.client.lock().await;
+            client.revoke_and_rotate(
+                &content_id,
+                &content_key,
+                &creator_key,
+                &revoked_pubkey,
+                &all_authorized,
+            ).map_err(|e| e.to_string())?
+        };
+
+        // 3. Store new re-keys in DHT and announce new CID
+        if let Some(ref command_tx) = self.command_tx {
+            // Store re-keys for remaining users
+            for (entry, _re_enc) in &revocation.re_grants {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                command_tx.send(DataCraftCommand::PutReKey {
+                    content_id: revocation.new_content_id,
+                    entry: entry.clone(),
+                    reply_tx,
+                }).map_err(|e| e.to_string())?;
+                reply_rx.await.map_err(|e| e.to_string())??;
+            }
+
+            // Announce new CID as provider
+            let manifest = {
+                let client = self.client.lock().await;
+                client.store().get_manifest(&revocation.new_content_id)
+                    .map_err(|e| e.to_string())?
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::AnnounceProvider {
+                content_id: revocation.new_content_id,
+                manifest,
+                reply_tx,
+            }).map_err(|e| e.to_string())?;
+            let _ = reply_rx.await;
+        }
+
+        // Build response with re-grant info
+        let re_grants_json: Vec<Value> = revocation.re_grants.iter().map(|(entry, re_enc)| {
+            serde_json::json!({
+                "recipient": hex::encode(entry.recipient_did),
+                "re_encrypted_key": {
+                    "ephemeral_public": hex::encode(re_enc.ephemeral_public),
+                    "nonce": hex::encode(re_enc.nonce),
+                    "ciphertext": hex::encode(&re_enc.ciphertext),
+                },
+            })
+        }).collect();
+
+        Ok(serde_json::json!({
+            "old_cid": cid_hex,
+            "new_cid": revocation.new_content_id.to_hex(),
+            "new_key": hex::encode(&revocation.new_encryption_key),
+            "new_size": revocation.new_total_size,
+            "new_chunks": revocation.new_chunk_count as u64,
+            "revoked": recipient_pubkey_hex,
+            "re_grants": re_grants_json,
+        }))
+    }
+
     // -- Payment channel IPC handlers --
 
     async fn handle_channel_open(&self, params: Option<Value>) -> Result<Value, String> {
@@ -820,8 +974,10 @@ impl IpcHandler for DataCraftHandler {
                 "extend" => self.handle_extend(params).await,
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
+                "receipt.storage.list" => self.handle_storage_receipt_list(params).await,
                 "access.grant" => self.handle_access_grant(params).await,
                 "access.revoke" => self.handle_access_revoke(params).await,
+                "access.revoke_rotate" => self.handle_access_revoke_rotate(params).await,
                 "access.list" => self.handle_access_list(params).await,
                 "channel.open" => self.handle_channel_open(params).await,
                 "channel.voucher" => self.handle_channel_voucher(params).await,

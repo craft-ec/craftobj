@@ -52,6 +52,23 @@ pub struct NodeStatus {
     pub pinned_count: usize,
 }
 
+/// Result of a revoke-and-rotate operation.
+#[derive(Debug, Clone)]
+pub struct RevocationResult {
+    /// New content ID (hash of re-encrypted content).
+    pub new_content_id: ContentId,
+    /// New encryption key.
+    pub new_encryption_key: Vec<u8>,
+    /// Total size of re-encrypted content.
+    pub new_total_size: u64,
+    /// Number of chunks.
+    pub new_chunk_count: usize,
+    /// Content key encrypted to creator (for DHT AccessList).
+    pub encrypted_content_key: pre::EncryptedContentKey,
+    /// Re-key entries + re-encrypted keys for remaining authorized users.
+    pub re_grants: Vec<(pre::ReKeyEntry, pre::ReEncryptedKey)>,
+}
+
 /// DataCraft client for local operations (publish, fetch, pin/unpin).
 ///
 /// Network operations (announce to DHT, download from peers) are handled
@@ -337,6 +354,120 @@ impl DataCraftClient {
         self.reconstruct(content_id, dest, Some(&content_key))
     }
 
+    /// Revoke a user's access and rotate the content key.
+    ///
+    /// This is the secure revocation flow:
+    /// 1. Generate a new content key
+    /// 2. Decrypt the original content, re-encrypt with the new key → new CID
+    /// 3. Re-grant access to all remaining authorized users with the new key
+    /// 4. Return the new publish result, encrypted content key, and re-key entries for remaining users
+    ///
+    /// The caller is responsible for:
+    /// - Removing the revoked user's re-key from DHT (tombstone)
+    /// - Storing the new AccessList + re-keys in DHT
+    /// - Announcing the new CID to DHT
+    pub fn revoke_and_rotate(
+        &mut self,
+        old_content_id: &ContentId,
+        old_content_key: &[u8],
+        creator_keypair: &ed25519_dalek::SigningKey,
+        revoked_pubkey: &ed25519_dalek::VerifyingKey,
+        all_authorized: &[ed25519_dalek::VerifyingKey],
+    ) -> Result<RevocationResult> {
+        // 1. Reconstruct original plaintext
+        let manifest = self.store.get_manifest(old_content_id)?;
+        let coder = ErasureCoder::with_config(&manifest.erasure_config)
+            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+        let total_shards =
+            manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+
+        let mut ciphertext = Vec::with_capacity(manifest.content_size as usize);
+        for chunk_idx in 0..manifest.chunk_count as u32 {
+            let chunk_size = if (chunk_idx as usize) < manifest.chunk_count - 1 {
+                manifest.chunk_size
+            } else {
+                manifest.content_size as usize - (chunk_idx as usize * manifest.chunk_size)
+            };
+            let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
+            for shard_idx in 0..total_shards {
+                match self.store.get_shard(old_content_id, chunk_idx, shard_idx as u8) {
+                    Ok(data) => shards.push(Some(data)),
+                    Err(_) => shards.push(None),
+                }
+            }
+            let decoded = coder
+                .decode(&mut shards, chunk_size)
+                .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+            ciphertext.extend_from_slice(&decoded);
+        }
+
+        // Decrypt to get plaintext
+        let plaintext = decrypt_content(&ciphertext, old_content_key)?;
+
+        // 2. Generate new content key and re-encrypt
+        let new_key = generate_content_key();
+        let new_ciphertext = encrypt_content(&plaintext, &new_key)?;
+        let new_content_id = ContentId::from_bytes(&new_ciphertext);
+        let total_size = new_ciphertext.len() as u64;
+
+        // Chunk and erasure-encode
+        let config = manifest.erasure_config;
+        let chunks = chunk_data(&new_ciphertext, config.chunk_size);
+        let chunk_count = chunks.len();
+        let new_coder = ErasureCoder::with_config(&config)
+            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let shards = new_coder
+                .encode(chunk)
+                .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+            for (shard_idx, shard) in shards.iter().enumerate() {
+                self.store
+                    .put_shard(&new_content_id, chunk_idx as u32, shard_idx as u8, shard)?;
+            }
+        }
+
+        let new_manifest = ChunkManifest {
+            content_id: new_content_id,
+            content_hash: new_content_id.0,
+            k: config.data_shards,
+            chunk_size: config.chunk_size,
+            chunk_count,
+            erasure_config: config,
+            content_size: total_size,
+        };
+        self.store.put_manifest(&new_manifest)?;
+        self.pin_manager.pin(&new_content_id)?;
+
+        // 3. Encrypt content key to creator
+        let encrypted_ck = pre::encrypt_content_key(creator_keypair, &new_key)?;
+
+        // 4. Re-grant access to remaining users (excluding revoked)
+        let revoked_bytes = revoked_pubkey.to_bytes();
+        let mut re_grants = Vec::new();
+        for pubkey in all_authorized {
+            if pubkey.to_bytes() == revoked_bytes {
+                continue;
+            }
+            let (entry, re_encrypted) = self.grant_access(creator_keypair, pubkey, &new_key)?;
+            re_grants.push((entry, re_encrypted));
+        }
+
+        info!(
+            "Revoked access and rotated key: {} -> {} ({} remaining users)",
+            old_content_id, new_content_id, re_grants.len()
+        );
+
+        Ok(RevocationResult {
+            new_content_id,
+            new_encryption_key: new_key,
+            new_total_size: total_size,
+            new_chunk_count: chunk_count,
+            encrypted_content_key: encrypted_ck,
+            re_grants,
+        })
+    }
+
     /// Access the underlying store.
     pub fn store(&self) -> &FsStore {
         &self.store
@@ -616,6 +747,111 @@ mod tests {
                 &creator.verifying_key(),
             );
         assert!(err.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_revoke_and_rotate_full_round_trip() {
+        use ed25519_dalek::SigningKey;
+
+        let dir = test_dir();
+        let mut client = DataCraftClient::new(&dir).unwrap();
+
+        let creator = SigningKey::generate(&mut rand::thread_rng());
+        let user_a = SigningKey::generate(&mut rand::thread_rng());
+        let user_b = SigningKey::generate(&mut rand::thread_rng());
+        let user_c = SigningKey::generate(&mut rand::thread_rng());
+
+        // Publish encrypted content with PRE
+        let file_path = dir.join("revoke_test.txt");
+        let content = b"secret content for revocation testing with key rotation";
+        std::fs::write(&file_path, content).unwrap();
+
+        let (result, _encrypted_ck) = client
+            .publish_with_pre(&file_path, &PublishOptions::default(), &creator)
+            .unwrap();
+        let content_key = result.encryption_key.as_ref().unwrap().clone();
+
+        // Grant access to all 3 users
+        let all_users = vec![
+            user_a.verifying_key(),
+            user_b.verifying_key(),
+            user_c.verifying_key(),
+        ];
+        let mut re_encrypted_keys = Vec::new();
+        for user in &all_users {
+            let (_entry, re_enc) = client
+                .grant_access(&creator, user, &content_key)
+                .unwrap();
+            re_encrypted_keys.push(re_enc);
+        }
+
+        // Verify all 3 users can decrypt
+        for (i, user) in [&user_a, &user_b, &user_c].iter().enumerate() {
+            let out = dir.join(format!("pre_revoke_{}.txt", i));
+            client
+                .reconstruct_with_pre(
+                    &result.content_id,
+                    &out,
+                    &re_encrypted_keys[i],
+                    user,
+                    &creator.verifying_key(),
+                )
+                .unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), content);
+        }
+
+        // Revoke user_b and rotate
+        let revocation = client
+            .revoke_and_rotate(
+                &result.content_id,
+                &content_key,
+                &creator,
+                &user_b.verifying_key(),
+                &all_users,
+            )
+            .unwrap();
+
+        // Verify: 2 remaining users got re-grants (not user_b)
+        assert_eq!(revocation.re_grants.len(), 2);
+
+        // Verify remaining users (A and C) can decrypt the NEW content
+        for (entry, re_enc) in &revocation.re_grants {
+            let recipient_key = if entry.recipient_did == user_a.verifying_key().to_bytes() {
+                &user_a
+            } else {
+                &user_c
+            };
+            let out = dir.join(format!("post_revoke_{}.txt", hex::encode(&entry.recipient_did[..4])));
+            client
+                .reconstruct_with_pre(
+                    &revocation.new_content_id,
+                    &out,
+                    re_enc,
+                    recipient_key,
+                    &creator.verifying_key(),
+                )
+                .unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), content);
+        }
+
+        // Verify user_b CANNOT decrypt new content with old re-encrypted key
+        let out_revoked = dir.join("post_revoke_b.txt");
+        let err = client.reconstruct_with_pre(
+            &revocation.new_content_id,
+            &out_revoked,
+            &re_encrypted_keys[1], // user_b's old re-encrypted key
+            &user_b,
+            &creator.verifying_key(),
+        );
+        assert!(err.is_err());
+
+        // Verify user_b cannot decrypt even if they try old CID with old key
+        // (old content still exists, but that's expected — the point is new content is protected)
+
+        // Verify new CID is different from old
+        assert_ne!(result.content_id, revocation.new_content_id);
 
         std::fs::remove_dir_all(&dir).ok();
     }
