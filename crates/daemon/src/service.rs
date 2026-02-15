@@ -140,9 +140,18 @@ pub async fn run_daemon(
     {
         error!("Failed to subscribe to capabilities topic: {:?}", e);
     }
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .subscribe_topic(datacraft_core::REMOVAL_TOPIC)
+    {
+        error!("Failed to subscribe to removal topic: {:?}", e);
+    }
 
     // Peer capabilities tracker
     let peer_capabilities: PeerCapabilities = Arc::new(Mutex::new(HashMap::new()));
+
+    // Removal cache for fast local checks
+    let removal_cache = Arc::new(Mutex::new(crate::removal_cache::RemovalCache::new()));
 
     // Start IPC server with enhanced handler
     let ipc_server = IpcServer::new(&socket_path);
@@ -159,6 +168,9 @@ pub async fn run_daemon(
 
     // Wire persistent receipt store into the protocol handler
     protocol.set_persistent_receipt_store(receipt_store.clone());
+
+    // Wire removal cache into the protocol for pre-serve checks
+    protocol.set_removal_cache(removal_cache.clone());
 
     let protocol = Arc::new(protocol);
 
@@ -238,7 +250,7 @@ pub async fn run_daemon(
                 error!("IPC server error: {}", e);
             }
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_capabilities.clone(), removal_cache.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -262,12 +274,16 @@ pub async fn run_daemon(
 }
 
 /// Drive the swarm event loop.
+/// Type alias for shared removal cache.
+type SharedRemovalCache = Arc<Mutex<crate::removal_cache::RemovalCache>>;
+
 async fn drive_swarm(
     swarm: &mut craftec_network::CraftSwarm,
     protocol: Arc<DataCraftProtocol>,
     command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
     pending_requests: PendingRequests,
     peer_capabilities: PeerCapabilities,
+    removal_cache: SharedRemovalCache,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -290,6 +306,7 @@ async fn drive_swarm(
                         debug!("Behaviour event: {:?}", event);
                         // Try to extract gossipsub capability announcements before passing through
                         handle_gossipsub_capability(&event, &peer_capabilities).await;
+                        handle_gossipsub_removal(&event, &removal_cache).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -461,6 +478,37 @@ async fn handle_command(
                 }
             }
         }
+
+        DataCraftCommand::PublishRemoval { content_id, notice, reply_tx } => {
+            debug!("Handling publish removal command for {}", content_id);
+            let local_peer_id = *swarm.local_peer_id();
+
+            // Store in DHT
+            let dht_result = datacraft_routing::ContentRouter::put_removal_notice(
+                swarm.behaviour_mut(), &content_id, &notice, &local_peer_id,
+            ).map(|_| ()).map_err(|e| e.to_string());
+
+            // Broadcast via gossipsub
+            if let Ok(data) = bincode::serialize(&notice) {
+                if let Err(e) = swarm.behaviour_mut()
+                    .publish_to_topic(datacraft_core::REMOVAL_TOPIC, data) {
+                    warn!("Failed to broadcast removal notice via gossipsub: {:?}", e);
+                }
+            }
+
+            let _ = reply_tx.send(dht_result);
+        }
+
+        DataCraftCommand::CheckRemoval { content_id, reply_tx } => {
+            debug!("Handling check removal command for {}", content_id);
+            // For now, just start a DHT query. Full async response would need pending request tracking.
+            // This is a simplified version — the RemovalCache handles most checks locally.
+            let _ = datacraft_routing::ContentRouter::get_removal_notice(
+                swarm.behaviour_mut(), &content_id,
+            );
+            // Reply immediately with None — the cache should be checked first by the caller.
+            let _ = reply_tx.send(Ok(None));
+        }
     }
 }
 
@@ -498,6 +546,41 @@ async fn handle_gossipsub_capability(
                 }
                 Err(e) => {
                     debug!("Failed to parse capability announcement: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Handle gossipsub removal notice messages.
+async fn handle_gossipsub_removal(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+    removal_cache: &SharedRemovalCache,
+) {
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    use libp2p::gossipsub;
+
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        message, ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::REMOVAL_TOPIC {
+            match bincode::deserialize::<datacraft_core::RemovalNotice>(&message.data) {
+                Ok(notice) => {
+                    if notice.verify() {
+                        debug!(
+                            "Received removal notice for {} from {}",
+                            notice.cid, notice.creator
+                        );
+                        let mut cache = removal_cache.lock().await;
+                        cache.insert(notice);
+                    } else {
+                        debug!("Received invalid removal notice, ignoring");
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to parse removal notice: {}", e);
                 }
             }
         }

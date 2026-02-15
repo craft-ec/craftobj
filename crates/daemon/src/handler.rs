@@ -819,6 +819,72 @@ impl DataCraftHandler {
         }))
     }
 
+    // -- Content removal IPC handler --
+
+    async fn handle_data_remove(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+        let creator_secret_hex = params.get("creator_secret").and_then(|v| v.as_str())
+            .ok_or("missing 'creator_secret'")?;
+        let reason = params.get("reason").and_then(|v| v.as_str()).map(String::from);
+
+        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
+        if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(
+            creator_bytes.as_slice().try_into().unwrap()
+        );
+
+        // Verify creator matches manifest (if we have it locally)
+        {
+            let client = self.client.lock().await;
+            if let Ok(manifest) = client.store().get_manifest(&content_id) {
+                if !manifest.creator.is_empty() {
+                    let expected_did = datacraft_core::did_from_pubkey(&creator_key.verifying_key());
+                    if manifest.creator != expected_did {
+                        return Err("creator key does not match manifest creator".into());
+                    }
+                }
+            }
+        }
+
+        // Create removal notice via client
+        let notice = {
+            let mut client = self.client.lock().await;
+            client.remove_content(&creator_key, &content_id, reason)
+                .map_err(|e| e.to_string())?
+        };
+
+        // Publish to DHT + gossipsub
+        if let Some(ref command_tx) = self.command_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx.send(DataCraftCommand::PublishRemoval {
+                content_id,
+                notice: notice.clone(),
+                reply_tx,
+            }).map_err(|e| e.to_string())?;
+
+            match reply_rx.await {
+                Ok(Ok(())) => {
+                    debug!("Successfully published removal notice for {}", content_id);
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to publish removal notice: {}", e);
+                }
+                Err(e) => {
+                    warn!("Removal notice channel closed: {}", e);
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "cid": cid_hex,
+            "removed": true,
+            "creator": notice.creator,
+            "timestamp": notice.timestamp,
+        }))
+    }
+
     // -- Payment channel IPC handlers --
 
     async fn handle_channel_open(&self, params: Option<Value>) -> Result<Value, String> {
@@ -1129,6 +1195,7 @@ impl IpcHandler for DataCraftHandler {
                 "receipts.count" => self.handle_receipts_count().await,
                 "receipts.query" => self.handle_receipts_query(params).await,
                 "receipt.storage.list" => self.handle_storage_receipt_list(params).await,
+                "data.remove" => self.handle_data_remove(params).await,
                 "access.grant" => self.handle_access_grant(params).await,
                 "access.revoke" => self.handle_access_revoke(params).await,
                 "access.revoke_rotate" => self.handle_access_revoke_rotate(params).await,

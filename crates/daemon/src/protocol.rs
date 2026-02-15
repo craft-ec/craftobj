@@ -91,6 +91,8 @@ pub struct DataCraftProtocol {
     persistent_receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     /// Node's signing key for creating TransferReceipts when requesting shards.
     signing_key: Option<Arc<SigningKey>>,
+    /// Shared removal cache — checked before serving shards.
+    removal_cache: Option<Arc<Mutex<crate::removal_cache::RemovalCache>>>,
 }
 
 /// Tracks what we're waiting for from a DHT query.
@@ -114,12 +116,18 @@ impl DataCraftProtocol {
             receipt_store: Arc::new(Mutex::new(ReceiptStore::new())),
             persistent_receipt_store: None,
             signing_key: None,
+            removal_cache: None,
         }
     }
 
     /// Set the persistent receipt store for durable storage.
     pub fn set_persistent_receipt_store(&mut self, store: Arc<Mutex<PersistentReceiptStore>>) {
         self.persistent_receipt_store = Some(store);
+    }
+
+    /// Set the removal cache for pre-serve checks.
+    pub fn set_removal_cache(&mut self, cache: Arc<Mutex<crate::removal_cache::RemovalCache>>) {
+        self.removal_cache = Some(cache);
     }
 
     /// Set the node's signing key for creating signed TransferReceipts.
@@ -583,6 +591,19 @@ impl DataCraftProtocol {
             "Serving shard request: {} chunk={} shard={}",
             content_id, chunk_index, shard_index
         );
+
+        // Pre-serve check: reject if content has been removed
+        if let Some(ref cache) = self.removal_cache {
+            let cache = cache.lock().await;
+            if cache.is_removed(&content_id) {
+                warn!("Refusing to serve removed content: {}", content_id);
+                let response = datacraft_transfer::encode_response(datacraft_core::WireStatus::NotFound, b"");
+                if let Err(e) = stream.write_all(&response).await {
+                    error!("Failed to write removal-rejected response: {}", e);
+                }
+                return;
+            }
+        }
 
         // Serve the shard from local store
         let served_ok;

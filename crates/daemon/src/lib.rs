@@ -13,5 +13,6 @@ pub mod health;
 pub mod pdp;
 pub mod protocol;
 pub mod receipt_store;
+pub mod removal_cache;
 pub mod service;
 pub mod settlement;

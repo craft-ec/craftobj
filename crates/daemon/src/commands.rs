@@ -72,4 +72,15 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<datacraft_core::access::AccessList, String>>,
     },
+    /// Publish a removal notice to DHT and gossipsub.
+    PublishRemoval {
+        content_id: ContentId,
+        notice: datacraft_core::RemovalNotice,
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Check if content has been removed (check local cache first, then DHT).
+    CheckRemoval {
+        content_id: ContentId,
+        reply_tx: oneshot::Sender<Result<Option<datacraft_core::RemovalNotice>, String>>,
+    },
 }
