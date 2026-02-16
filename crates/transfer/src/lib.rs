@@ -1,110 +1,162 @@
 //! DataCraft Transfer
 //!
-//! Piece exchange protocol for DataCraft.
+//! Piece exchange protocol for DataCraft using RLNC coding.
 //!
-//! Protocol: `/datacraft/transfer/1.0.0`
+//! Protocol: `/datacraft/transfer/2.0.0`
 //!
 //! Wire format:
 //! ```text
-//! Request:  [magic:4][type:1][content_id:32][chunk_index:4][shard_index:1] = 42 bytes
-//! Response: [status:1][len:4][payload]
+//! PieceRequest:  [magic:4][type:1][content_id:32][segment_index:4][piece_id:32] = 73 bytes
+//! PieceResponse: [status:1][coeff_len:4][coefficients][data_len:4][data]
+//! PiecePush:     [magic:4][type:1][content_id:32][segment_index:4][piece_id:32][coeff_len:4][coeff][data_len:4][data]
 //! ```
 
 use datacraft_core::{
-    ContentId, DataCraftError, Result, TransferReceipt, WireMessageType, WireStatus, WIRE_MAGIC,
+    ContentId, DataCraftError, Result, WireMessageType, WireStatus, WIRE_MAGIC,
 };
 use datacraft_store::FsStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-/// Size of a wire request header.
-pub const REQUEST_HEADER_SIZE: usize = 42; // 4 + 1 + 32 + 4 + 1
+/// Size of a piece request header.
+pub const PIECE_REQUEST_SIZE: usize = 73; // 4 + 1 + 32 + 4 + 32
 
-/// Size of a wire response header.
-pub const RESPONSE_HEADER_SIZE: usize = 5; // 1 + 4
+/// Size of a piece response header (status + coeff_len).
+pub const PIECE_RESPONSE_HEADER_SIZE: usize = 5; // 1 + 4
 
-/// Encode a shard request into wire format.
-pub fn encode_shard_request(
+/// Encode a piece request into wire format.
+///
+/// `piece_id` of all zeros means "any random piece for this segment".
+pub fn encode_piece_request(
     content_id: &ContentId,
-    chunk_index: u32,
-    shard_index: u8,
+    segment_index: u32,
+    piece_id: &[u8; 32],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(REQUEST_HEADER_SIZE);
+    let mut buf = Vec::with_capacity(PIECE_REQUEST_SIZE);
     buf.extend_from_slice(&WIRE_MAGIC);
-    buf.push(WireMessageType::ShardRequest as u8);
+    buf.push(WireMessageType::PieceRequest as u8);
     buf.extend_from_slice(&content_id.0);
-    buf.extend_from_slice(&chunk_index.to_be_bytes());
-    buf.push(shard_index);
+    buf.extend_from_slice(&segment_index.to_be_bytes());
+    buf.extend_from_slice(piece_id);
     buf
 }
 
-/// Decode a shard request from wire format.
-pub fn decode_shard_request(buf: &[u8]) -> Result<(ContentId, u32, u8)> {
-    if buf.len() < REQUEST_HEADER_SIZE {
+/// Decode a piece request from wire format.
+///
+/// Returns (content_id, segment_index, piece_id).
+/// piece_id of all zeros means "any piece".
+pub fn decode_piece_request(buf: &[u8]) -> Result<(ContentId, u32, [u8; 32])> {
+    if buf.len() < PIECE_REQUEST_SIZE {
         return Err(DataCraftError::TransferError("request too short".into()));
     }
     if buf[0..4] != WIRE_MAGIC {
         return Err(DataCraftError::TransferError("invalid magic".into()));
     }
-    let msg_type = buf[4];
-    if msg_type != WireMessageType::ShardRequest as u8 {
+    if buf[4] != WireMessageType::PieceRequest as u8 {
         return Err(DataCraftError::TransferError(format!(
-            "expected ShardRequest, got {}",
-            msg_type
-        )));
-    }
-    let mut cid_bytes = [0u8; 32];
-    cid_bytes.copy_from_slice(&buf[5..37]);
-    let chunk_index = u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]);
-    let shard_index = buf[41];
-    Ok((ContentId(cid_bytes), chunk_index, shard_index))
-}
-
-/// Size of a shard push header (same as request but type=ShardPush, plus 4-byte payload length).
-pub const PUSH_HEADER_SIZE: usize = 46; // 4 + 1 + 32 + 4 + 1 + 4
-
-/// Encode a shard push message into wire format.
-///
-/// Wire format: `[magic:4][type:1(ShardPush=5)][content_id:32][chunk_index:4][shard_index:1][payload_len:4][payload]`
-pub fn encode_shard_push(
-    content_id: &ContentId,
-    chunk_index: u32,
-    shard_index: u8,
-    data: &[u8],
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(PUSH_HEADER_SIZE + data.len());
-    buf.extend_from_slice(&WIRE_MAGIC);
-    buf.push(WireMessageType::ShardPush as u8);
-    buf.extend_from_slice(&content_id.0);
-    buf.extend_from_slice(&chunk_index.to_be_bytes());
-    buf.push(shard_index);
-    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    buf.extend_from_slice(data);
-    buf
-}
-
-/// Decode a shard push header from wire format (first PUSH_HEADER_SIZE bytes).
-///
-/// Returns (content_id, chunk_index, shard_index, payload_len).
-pub fn decode_shard_push_header(buf: &[u8]) -> Result<(ContentId, u32, u8, u32)> {
-    if buf.len() < PUSH_HEADER_SIZE {
-        return Err(DataCraftError::TransferError("push header too short".into()));
-    }
-    if buf[0..4] != WIRE_MAGIC {
-        return Err(DataCraftError::TransferError("invalid magic".into()));
-    }
-    if buf[4] != WireMessageType::ShardPush as u8 {
-        return Err(DataCraftError::TransferError(format!(
-            "expected ShardPush type (5), got {}",
+            "expected PieceRequest, got {}",
             buf[4]
         )));
     }
     let mut cid_bytes = [0u8; 32];
     cid_bytes.copy_from_slice(&buf[5..37]);
-    let chunk_index = u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]);
-    let shard_index = buf[41];
-    let payload_len = u32::from_be_bytes([buf[42], buf[43], buf[44], buf[45]]);
-    Ok((ContentId(cid_bytes), chunk_index, shard_index, payload_len))
+    let segment_index = u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]);
+    let mut piece_id = [0u8; 32];
+    piece_id.copy_from_slice(&buf[41..73]);
+    Ok((ContentId(cid_bytes), segment_index, piece_id))
+}
+
+/// Encode a piece response with status, coefficient vector, and piece data.
+pub fn encode_piece_response(
+    status: WireStatus,
+    coefficients: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 4 + coefficients.len() + 4 + data.len());
+    buf.push(status as u8);
+    buf.extend_from_slice(&(coefficients.len() as u32).to_be_bytes());
+    buf.extend_from_slice(coefficients);
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Encode an error/not-found piece response (no data).
+pub fn encode_piece_response_error(status: WireStatus) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(status as u8);
+    buf.extend_from_slice(&0u32.to_be_bytes()); // coeff_len = 0
+    buf.extend_from_slice(&0u32.to_be_bytes()); // data_len = 0
+    buf
+}
+
+/// Encode a piece push message.
+///
+/// Wire format: `[magic:4][type:1(PiecePush)][content_id:32][segment_index:4][piece_id:32][coeff_len:4][coeff][data_len:4][data]`
+pub fn encode_piece_push(
+    content_id: &ContentId,
+    segment_index: u32,
+    piece_id: &[u8; 32],
+    coefficients: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let header_size = 4 + 1 + 32 + 4 + 32; // 73
+    let mut buf = Vec::with_capacity(header_size + 4 + coefficients.len() + 4 + data.len());
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::PiecePush as u8);
+    buf.extend_from_slice(&content_id.0);
+    buf.extend_from_slice(&segment_index.to_be_bytes());
+    buf.extend_from_slice(piece_id);
+    buf.extend_from_slice(&(coefficients.len() as u32).to_be_bytes());
+    buf.extend_from_slice(coefficients);
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Decode a piece push header (first 73 bytes) plus the variable-length payload.
+///
+/// Returns (content_id, segment_index, piece_id, coefficients, data).
+#[allow(clippy::type_complexity)]
+pub fn decode_piece_push(buf: &[u8]) -> Result<(ContentId, u32, [u8; 32], Vec<u8>, Vec<u8>)> {
+    if buf.len() < 73 + 8 {
+        return Err(DataCraftError::TransferError("push too short".into()));
+    }
+    if buf[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic".into()));
+    }
+    if buf[4] != WireMessageType::PiecePush as u8 {
+        return Err(DataCraftError::TransferError(format!(
+            "expected PiecePush, got {}",
+            buf[4]
+        )));
+    }
+    let mut cid_bytes = [0u8; 32];
+    cid_bytes.copy_from_slice(&buf[5..37]);
+    let segment_index = u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]);
+    let mut piece_id = [0u8; 32];
+    piece_id.copy_from_slice(&buf[41..73]);
+
+    let coeff_len = u32::from_be_bytes([buf[73], buf[74], buf[75], buf[76]]) as usize;
+    let coeff_end = 77 + coeff_len;
+    if buf.len() < coeff_end + 4 {
+        return Err(DataCraftError::TransferError("push coefficients truncated".into()));
+    }
+    let coefficients = buf[77..coeff_end].to_vec();
+
+    let data_len = u32::from_be_bytes([
+        buf[coeff_end],
+        buf[coeff_end + 1],
+        buf[coeff_end + 2],
+        buf[coeff_end + 3],
+    ]) as usize;
+    let data_start = coeff_end + 4;
+    if buf.len() < data_start + data_len {
+        return Err(DataCraftError::TransferError("push data truncated".into()));
+    }
+    let data = buf[data_start..data_start + data_len].to_vec();
+
+    Ok((ContentId(cid_bytes), segment_index, piece_id, coefficients, data))
 }
 
 /// Manifest push header size: magic(4) + type(1) + content_id(32) + payload_len(4) = 41
@@ -126,13 +178,18 @@ pub fn encode_manifest_push(content_id: &ContentId, manifest_json: &[u8]) -> Vec
 /// Returns (content_id, payload_len).
 pub fn decode_manifest_push_header(buf: &[u8]) -> Result<(ContentId, u32)> {
     if buf.len() < MANIFEST_PUSH_HEADER_SIZE {
-        return Err(DataCraftError::TransferError("manifest push header too short".into()));
+        return Err(DataCraftError::TransferError(
+            "manifest push header too short".into(),
+        ));
     }
     if buf[0..4] != WIRE_MAGIC {
         return Err(DataCraftError::TransferError("invalid magic".into()));
     }
     if buf[4] != WireMessageType::ManifestPush as u8 {
-        return Err(DataCraftError::TransferError(format!("expected ManifestPush type (6), got {}", buf[4])));
+        return Err(DataCraftError::TransferError(format!(
+            "expected ManifestPush type (6), got {}",
+            buf[4]
+        )));
     }
     let mut cid_bytes = [0u8; 32];
     cid_bytes.copy_from_slice(&buf[5..37]);
@@ -140,129 +197,44 @@ pub fn decode_manifest_push_header(buf: &[u8]) -> Result<(ContentId, u32)> {
     Ok((ContentId(cid_bytes), payload_len))
 }
 
-/// Encode a response with status and payload.
-pub fn encode_response(status: WireStatus, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(RESPONSE_HEADER_SIZE + payload.len());
-    buf.push(status as u8);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf
-}
-
-/// Encode a TransferReceipt into wire format.
-///
-/// Wire format: [magic:4][type:1(Receipt=4)][len:4 BE][bincode receipt]
-pub fn encode_receipt(receipt: &TransferReceipt) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(receipt).map_err(|e| {
-        DataCraftError::TransferError(format!("serialize receipt: {}", e))
-    })?;
-    let mut buf = Vec::with_capacity(4 + 1 + 4 + payload.len());
-    buf.extend_from_slice(&WIRE_MAGIC);
-    buf.push(WireMessageType::Receipt as u8);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&payload);
-    Ok(buf)
-}
-
-/// Decode a TransferReceipt from wire format.
-///
-/// Expects: [magic:4][type:1(Receipt=4)][len:4 BE][bincode receipt]
-pub fn decode_receipt(buf: &[u8]) -> Result<TransferReceipt> {
-    if buf.len() < 9 {
-        return Err(DataCraftError::TransferError("receipt frame too short".into()));
-    }
-    if buf[0..4] != WIRE_MAGIC {
-        return Err(DataCraftError::TransferError("invalid magic in receipt".into()));
-    }
-    if buf[4] != WireMessageType::Receipt as u8 {
-        return Err(DataCraftError::TransferError(format!(
-            "expected Receipt type, got {}",
-            buf[4]
-        )));
-    }
-    let payload_len = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
-    if buf.len() < 9 + payload_len {
-        return Err(DataCraftError::TransferError("receipt payload truncated".into()));
-    }
-    let receipt: TransferReceipt = bincode::deserialize(&buf[9..9 + payload_len]).map_err(|e| {
-        DataCraftError::TransferError(format!("deserialize receipt: {}", e))
-    })?;
-    Ok(receipt)
-}
-
-/// Read a TransferReceipt from an async stream.
-pub async fn read_receipt<S>(stream: &mut S) -> Result<TransferReceipt>
-where
-    S: AsyncReadExt + Unpin,
-{
-    // Read header: magic(4) + type(1) + len(4) = 9 bytes
-    let mut header = [0u8; 9];
-    stream.read_exact(&mut header).await.map_err(|e| {
-        DataCraftError::TransferError(format!("read receipt header: {}", e))
-    })?;
-    if header[0..4] != WIRE_MAGIC {
-        return Err(DataCraftError::TransferError("invalid magic in receipt".into()));
-    }
-    if header[4] != WireMessageType::Receipt as u8 {
-        return Err(DataCraftError::TransferError(format!(
-            "expected Receipt type, got {}",
-            header[4]
-        )));
-    }
-    let payload_len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
-    let mut payload = vec![0u8; payload_len];
-    stream.read_exact(&mut payload).await.map_err(|e| {
-        DataCraftError::TransferError(format!("read receipt payload: {}", e))
-    })?;
-    let receipt: TransferReceipt = bincode::deserialize(&payload).map_err(|e| {
-        DataCraftError::TransferError(format!("deserialize receipt: {}", e))
-    })?;
-    Ok(receipt)
-}
-
-/// Write a TransferReceipt to an async stream.
-pub async fn write_receipt<S>(stream: &mut S, receipt: &TransferReceipt) -> Result<()>
-where
-    S: AsyncWriteExt + Unpin,
-{
-    let encoded = encode_receipt(receipt)?;
-    stream.write_all(&encoded).await.map_err(|e| {
-        DataCraftError::TransferError(format!("write receipt: {}", e))
-    })?;
-    Ok(())
-}
-
-/// Handle an incoming shard request: read from local store and respond.
-pub async fn handle_shard_request<S>(
+/// Handle an incoming piece request: read from local store and respond.
+pub async fn handle_piece_request<S>(
     stream: &mut S,
     store: &FsStore,
     content_id: &ContentId,
-    chunk_index: u32,
-    shard_index: u8,
+    segment_index: u32,
+    piece_id: &[u8; 32],
 ) -> Result<()>
 where
     S: AsyncWriteExt + Unpin,
 {
-    match store.get_shard(content_id, chunk_index, shard_index) {
-        Ok(data) => {
+    let is_any = *piece_id == [0u8; 32];
+
+    let result = if is_any {
+        store.get_random_piece(content_id, segment_index)
+    } else {
+        store
+            .get_piece(content_id, segment_index, piece_id)
+            .map(|(data, coeff)| Some((*piece_id, data, coeff)))
+    };
+
+    match result {
+        Ok(Some((_pid, data, coefficients))) => {
             debug!(
-                "Serving shard {}/{}/{} ({} bytes)",
+                "Serving piece {}/{} ({} bytes data, {} bytes coeff)",
                 content_id,
-                chunk_index,
-                shard_index,
-                data.len()
+                segment_index,
+                data.len(),
+                coefficients.len()
             );
-            let response = encode_response(WireStatus::Ok, &data);
+            let response = encode_piece_response(WireStatus::Ok, &coefficients, &data);
             stream.write_all(&response).await.map_err(|e| {
                 DataCraftError::TransferError(format!("write response: {}", e))
             })?;
         }
-        Err(_) => {
-            warn!(
-                "Shard not found: {}/{}/{}",
-                content_id, chunk_index, shard_index
-            );
-            let response = encode_response(WireStatus::NotFound, b"");
+        Ok(None) | Err(_) => {
+            warn!("Piece not found: {}/{}", content_id, segment_index);
+            let response = encode_piece_response_error(WireStatus::NotFound);
             stream.write_all(&response).await.map_err(|e| {
                 DataCraftError::TransferError(format!("write not-found: {}", e))
             })?;
@@ -271,52 +243,63 @@ where
     Ok(())
 }
 
-/// Request a shard from a remote peer over an async stream.
-pub async fn request_shard<S>(
+/// Request a piece from a remote peer over an async stream.
+///
+/// Returns (coefficients, data) on success.
+pub async fn request_piece<S>(
     stream: &mut S,
     content_id: &ContentId,
-    chunk_index: u32,
-    shard_index: u8,
-) -> Result<Vec<u8>>
+    segment_index: u32,
+    piece_id: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>)>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Send request
-    let request = encode_shard_request(content_id, chunk_index, shard_index);
+    let request = encode_piece_request(content_id, segment_index, piece_id);
     stream.write_all(&request).await.map_err(|e| {
         DataCraftError::TransferError(format!("write request: {}", e))
     })?;
 
-    // Read response header
-    let mut header = [0u8; RESPONSE_HEADER_SIZE];
-    stream.read_exact(&mut header).await.map_err(|e| {
-        DataCraftError::TransferError(format!("read response header: {}", e))
+    // Read status
+    let mut status_byte = [0u8; 1];
+    stream.read_exact(&mut status_byte).await.map_err(|e| {
+        DataCraftError::TransferError(format!("read status: {}", e))
+    })?;
+    let status = WireStatus::from_u8(status_byte[0]).ok_or_else(|| {
+        DataCraftError::TransferError(format!("invalid status: {}", status_byte[0]))
     })?;
 
-    let status = WireStatus::from_u8(header[0]).ok_or_else(|| {
-        DataCraftError::TransferError(format!("invalid status: {}", header[0]))
+    // Read coeff_len
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.map_err(|e| {
+        DataCraftError::TransferError(format!("read coeff_len: {}", e))
     })?;
-    let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let coeff_len = u32::from_be_bytes(len_buf) as usize;
 
     match status {
         WireStatus::Ok => {
-            let mut payload = vec![0u8; payload_len];
-            stream.read_exact(&mut payload).await.map_err(|e| {
-                DataCraftError::TransferError(format!("read payload: {}", e))
+            let mut coefficients = vec![0u8; coeff_len];
+            stream.read_exact(&mut coefficients).await.map_err(|e| {
+                DataCraftError::TransferError(format!("read coefficients: {}", e))
             })?;
-            Ok(payload)
+
+            stream.read_exact(&mut len_buf).await.map_err(|e| {
+                DataCraftError::TransferError(format!("read data_len: {}", e))
+            })?;
+            let data_len = u32::from_be_bytes(len_buf) as usize;
+
+            let mut data = vec![0u8; data_len];
+            stream.read_exact(&mut data).await.map_err(|e| {
+                DataCraftError::TransferError(format!("read data: {}", e))
+            })?;
+
+            Ok((coefficients, data))
         }
         WireStatus::NotFound => Err(DataCraftError::ContentNotFound(format!(
-            "shard {}/{}/{}",
-            content_id, chunk_index, shard_index
+            "piece {}/{}",
+            content_id, segment_index
         ))),
-        WireStatus::Error => {
-            let mut msg = vec![0u8; payload_len];
-            stream.read_exact(&mut msg).await.ok();
-            Err(DataCraftError::TransferError(
-                String::from_utf8_lossy(&msg).to_string(),
-            ))
-        }
+        WireStatus::Error => Err(DataCraftError::TransferError("remote error".into())),
     }
 }
 
@@ -325,154 +308,177 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encode_decode_shard_request() {
+    fn test_encode_decode_piece_request() {
         let cid = ContentId::from_bytes(b"test");
-        let encoded = encode_shard_request(&cid, 5, 2);
-        assert_eq!(encoded.len(), REQUEST_HEADER_SIZE);
+        let piece_id = [0xABu8; 32];
+        let encoded = encode_piece_request(&cid, 5, &piece_id);
+        assert_eq!(encoded.len(), PIECE_REQUEST_SIZE);
         assert_eq!(&encoded[0..4], &WIRE_MAGIC);
 
-        let (decoded_cid, chunk, shard) = decode_shard_request(&encoded).unwrap();
+        let (decoded_cid, seg, decoded_pid) = decode_piece_request(&encoded).unwrap();
         assert_eq!(decoded_cid, cid);
-        assert_eq!(chunk, 5);
-        assert_eq!(shard, 2);
+        assert_eq!(seg, 5);
+        assert_eq!(decoded_pid, piece_id);
+    }
+
+    #[test]
+    fn test_encode_decode_piece_request_any() {
+        let cid = ContentId::from_bytes(b"any piece");
+        let zeroed = [0u8; 32];
+        let encoded = encode_piece_request(&cid, 0, &zeroed);
+        let (_, _, pid) = decode_piece_request(&encoded).unwrap();
+        assert_eq!(pid, zeroed);
     }
 
     #[test]
     fn test_decode_invalid_magic() {
-        let mut buf = vec![0u8; REQUEST_HEADER_SIZE];
+        let mut buf = vec![0u8; PIECE_REQUEST_SIZE];
         buf[0..4].copy_from_slice(b"XXXX");
-        assert!(decode_shard_request(&buf).is_err());
+        assert!(decode_piece_request(&buf).is_err());
     }
 
     #[test]
     fn test_decode_too_short() {
-        assert!(decode_shard_request(&[0u8; 10]).is_err());
+        assert!(decode_piece_request(&[0u8; 10]).is_err());
     }
 
     #[test]
-    fn test_encode_response() {
-        let response = encode_response(WireStatus::Ok, b"hello");
+    fn test_encode_piece_response() {
+        let coefficients = vec![1, 0, 0, 0, 1];
+        let data = b"piece data here";
+        let response = encode_piece_response(WireStatus::Ok, &coefficients, data);
         assert_eq!(response[0], WireStatus::Ok as u8);
-        let len = u32::from_be_bytes([response[1], response[2], response[3], response[4]]);
-        assert_eq!(len, 5);
-        assert_eq!(&response[5..], b"hello");
+        let coeff_len =
+            u32::from_be_bytes([response[1], response[2], response[3], response[4]]) as usize;
+        assert_eq!(coeff_len, 5);
+        assert_eq!(&response[5..10], &coefficients);
+        let data_len =
+            u32::from_be_bytes([response[10], response[11], response[12], response[13]]) as usize;
+        assert_eq!(data_len, 15);
+        assert_eq!(&response[14..], data);
     }
 
     #[test]
-    fn test_encode_response_empty() {
-        let response = encode_response(WireStatus::NotFound, b"");
+    fn test_encode_piece_response_error() {
+        let response = encode_piece_response_error(WireStatus::NotFound);
         assert_eq!(response[0], WireStatus::NotFound as u8);
-        let len = u32::from_be_bytes([response[1], response[2], response[3], response[4]]);
-        assert_eq!(len, 0);
+        let coeff_len =
+            u32::from_be_bytes([response[1], response[2], response[3], response[4]]);
+        assert_eq!(coeff_len, 0);
+        let data_len =
+            u32::from_be_bytes([response[5], response[6], response[7], response[8]]);
+        assert_eq!(data_len, 0);
     }
 
     #[test]
-    fn test_encode_decode_receipt() {
-        let receipt = TransferReceipt {
-            content_id: ContentId::from_bytes(b"receipt test"),
-            server_node: [1u8; 32],
-            requester: [2u8; 32],
-            shard_index: 3,
-            bytes_served: 16384,
-            timestamp: 1700000000,
-            signature: vec![0xAA, 0xBB, 0xCC],
-        };
+    fn test_encode_decode_piece_push() {
+        let cid = ContentId::from_bytes(b"push test");
+        let piece_id = [0x42u8; 32];
+        let coefficients = vec![1, 2, 3, 4, 5];
+        let data = b"pushed piece data";
 
-        let encoded = encode_receipt(&receipt).unwrap();
-        // Verify header
-        assert_eq!(&encoded[0..4], &WIRE_MAGIC);
-        assert_eq!(encoded[4], WireMessageType::Receipt as u8);
-
-        let decoded = decode_receipt(&encoded).unwrap();
-        assert_eq!(decoded.content_id, receipt.content_id);
-        assert_eq!(decoded.server_node, receipt.server_node);
-        assert_eq!(decoded.requester, receipt.requester);
-        assert_eq!(decoded.shard_index, 3);
-        assert_eq!(decoded.bytes_served, 16384);
-        assert_eq!(decoded.timestamp, 1700000000);
-        assert_eq!(decoded.signature, vec![0xAA, 0xBB, 0xCC]);
+        let encoded = encode_piece_push(&cid, 3, &piece_id, &coefficients, data);
+        let (dec_cid, seg, dec_pid, dec_coeff, dec_data) =
+            decode_piece_push(&encoded).unwrap();
+        assert_eq!(dec_cid, cid);
+        assert_eq!(seg, 3);
+        assert_eq!(dec_pid, piece_id);
+        assert_eq!(dec_coeff, coefficients);
+        assert_eq!(dec_data, data);
     }
 
     #[test]
-    fn test_decode_receipt_too_short() {
-        assert!(decode_receipt(&[0u8; 5]).is_err());
+    fn test_decode_piece_push_too_short() {
+        assert!(decode_piece_push(&[0u8; 10]).is_err());
     }
 
     #[test]
-    fn test_decode_receipt_bad_magic() {
-        let mut buf = vec![0u8; 20];
-        buf[0..4].copy_from_slice(b"XXXX");
-        assert!(decode_receipt(&buf).is_err());
-    }
-
-    #[test]
-    fn test_decode_receipt_wrong_type() {
-        let mut buf = vec![0u8; 20];
-        buf[0..4].copy_from_slice(&WIRE_MAGIC);
-        buf[4] = WireMessageType::ShardRequest as u8; // wrong type
-        assert!(decode_receipt(&buf).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_write_read_receipt_roundtrip() {
-        use tokio::io::duplex;
-
-        let receipt = TransferReceipt {
-            content_id: ContentId::from_bytes(b"stream receipt"),
-            server_node: [5u8; 32],
-            requester: [6u8; 32],
-            shard_index: 1,
-            bytes_served: 65536,
-            timestamp: 1700000001,
-            signature: vec![0xDE, 0xAD],
-        };
-
-        let (mut client, mut server) = duplex(4096);
-
-        let receipt_clone = receipt.clone();
-        let writer = tokio::spawn(async move {
-            write_receipt(&mut client, &receipt_clone).await.unwrap();
-        });
-
-        let reader = tokio::spawn(async move {
-            read_receipt(&mut server).await.unwrap()
-        });
-
-        writer.await.unwrap();
-        let read_back = reader.await.unwrap();
-        assert_eq!(read_back.content_id, receipt.content_id);
-        assert_eq!(read_back.bytes_served, 65536);
-        assert_eq!(read_back.signature, vec![0xDE, 0xAD]);
+    fn test_encode_decode_manifest_push() {
+        let cid = ContentId::from_bytes(b"manifest");
+        let json = b"{\"test\": true}";
+        let encoded = encode_manifest_push(&cid, json);
+        let (dec_cid, len) = decode_manifest_push_header(&encoded).unwrap();
+        assert_eq!(dec_cid, cid);
+        assert_eq!(len as usize, json.len());
+        assert_eq!(
+            &encoded[MANIFEST_PUSH_HEADER_SIZE..],
+            json
+        );
     }
 
     #[tokio::test]
     async fn test_request_response_roundtrip() {
+        use datacraft_store::piece_id_from_coefficients;
         use tokio::io::duplex;
 
-        let dir = std::env::temp_dir().join("datacraft-transfer-test");
+        let dir = std::env::temp_dir().join("datacraft-transfer-test-rlnc");
         std::fs::create_dir_all(&dir).ok();
         let store = FsStore::new(&dir).unwrap();
 
         let cid = ContentId::from_bytes(b"transfer test");
-        store.put_shard(&cid, 0, 0, b"shard data here").unwrap();
+        let coefficients = vec![1u8, 0, 0, 0];
+        let piece_id = piece_id_from_coefficients(&coefficients);
+        store
+            .store_piece(&cid, 0, &piece_id, b"piece data here", &coefficients)
+            .unwrap();
 
         let (mut client, mut server) = duplex(4096);
 
-        // Spawn server handler
         let server_store = FsStore::new(&dir).unwrap();
-        let cid_clone = cid;
         let server_handle = tokio::spawn(async move {
-            let mut header = [0u8; REQUEST_HEADER_SIZE];
+            let mut header = [0u8; PIECE_REQUEST_SIZE];
             server.read_exact(&mut header).await.unwrap();
-            let (req_cid, chunk, shard) = decode_shard_request(&header).unwrap();
-            handle_shard_request(&mut server, &server_store, &req_cid, chunk, shard)
+            let (req_cid, seg, req_pid) = decode_piece_request(&header).unwrap();
+            handle_piece_request(&mut server, &server_store, &req_cid, seg, &req_pid)
                 .await
                 .unwrap();
         });
 
-        // Client request
-        let data = request_shard(&mut client, &cid_clone, 0, 0).await.unwrap();
-        assert_eq!(data, b"shard data here");
+        let (coeff, data) = request_piece(&mut client, &cid, 0, &piece_id)
+            .await
+            .unwrap();
+        assert_eq!(coeff, coefficients);
+        assert_eq!(data, b"piece data here");
+
+        server_handle.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_request_any_piece() {
+        use datacraft_store::piece_id_from_coefficients;
+        use tokio::io::duplex;
+
+        let dir = std::env::temp_dir().join("datacraft-transfer-test-any");
+        std::fs::create_dir_all(&dir).ok();
+        let store = FsStore::new(&dir).unwrap();
+
+        let cid = ContentId::from_bytes(b"any piece test");
+        let coefficients = vec![0u8, 1, 0];
+        let piece_id = piece_id_from_coefficients(&coefficients);
+        store
+            .store_piece(&cid, 0, &piece_id, b"any piece data", &coefficients)
+            .unwrap();
+
+        let (mut client, mut server) = duplex(4096);
+        let server_store = FsStore::new(&dir).unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let mut header = [0u8; PIECE_REQUEST_SIZE];
+            server.read_exact(&mut header).await.unwrap();
+            let (req_cid, seg, req_pid) = decode_piece_request(&header).unwrap();
+            handle_piece_request(&mut server, &server_store, &req_cid, seg, &req_pid)
+                .await
+                .unwrap();
+        });
+
+        // Request with zeroed piece_id = "any piece"
+        let zeroed = [0u8; 32];
+        let (coeff, data) = request_piece(&mut client, &cid, 0, &zeroed)
+            .await
+            .unwrap();
+        assert_eq!(coeff, coefficients);
+        assert_eq!(data, b"any piece data");
 
         server_handle.await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
