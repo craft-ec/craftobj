@@ -77,6 +77,7 @@ pub enum DaemonEvent {
     // -- Eviction / Retirement --
     ContentEvicted { content_id: String, reason: String },
     ContentRetired { content_id: String, reason: String },
+    GcCompleted { deleted_count: u64, deleted_bytes: u64 },
 
     // -- Aggregation --
     AggregationComplete { receipt_count: usize, merkle_root: String },

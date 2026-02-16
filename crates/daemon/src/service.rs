@@ -473,7 +473,7 @@ pub async fn run_daemon_with_config(
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
             info!("Aggregation loop ended");
         }
-        _ = gc_loop(store.clone(), content_tracker.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes) => {
+        _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes) => {
             info!("GC loop ended");
         }
     }
@@ -585,10 +585,11 @@ async fn eviction_maintenance_loop(
 async fn gc_loop(
     store: Arc<Mutex<datacraft_store::FsStore>>,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    client: Arc<Mutex<datacraft_client::DataCraftClient>>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
     event_tx: EventSender,
     gc_interval_secs: u64,
-    max_storage_bytes: u64,
+    _max_storage_bytes: u64,
 ) {
     use std::time::Duration;
 
@@ -615,7 +616,11 @@ async fn gc_loop(
             }
         };
 
-        let pinned_cids: std::collections::HashSet<_> = s.list_pinned().into_iter().collect();
+        // Get pinned CIDs from the client's PinManager
+        let pinned_cids: std::collections::HashSet<_> = {
+            let c = client.lock().await;
+            all_cids.iter().filter(|cid| c.is_pinned(cid)).cloned().collect()
+        };
 
         // Also treat Publisher-role content as pinned (we published it)
         let tracker = content_tracker.lock().await;
@@ -632,32 +637,17 @@ async fn gc_loop(
         drop(tracker);
 
         let mut deleted_count = 0u64;
-        let mut deleted_bytes = 0u64;
 
         for cid in &all_cids {
             if pinned_cids.contains(cid) || publisher_cids.contains(cid) {
                 continue; // Keep pinned and published content
             }
 
-            // Unpinned, non-publisher content → delete
+            // Unpinned, non-publisher content -> delete
             if let Ok(()) = s.delete_content(cid) {
                 deleted_count += 1;
-                // Remove from content tracker
                 content_tracker.lock().await.remove(cid);
                 debug!("GC: deleted unpinned content {}", cid);
-            }
-        }
-
-        // If max_storage_bytes is set and we're still over, evict unpinned by LRU
-        // (the eviction_maintenance_loop handles funded vs free; GC is simpler)
-        if max_storage_bytes > 0 {
-            if let Ok(usage) = s.disk_usage() {
-                if usage > max_storage_bytes {
-                    debug!(
-                        "GC: storage {} > limit {}, would need LRU eviction (handled by eviction manager)",
-                        usage, max_storage_bytes
-                    );
-                }
             }
         }
 
@@ -670,13 +660,12 @@ async fn gc_loop(
             }
             let _ = event_tx.send(DaemonEvent::GcCompleted {
                 deleted_count,
-                deleted_bytes,
+                deleted_bytes: 0,
             });
         }
     }
 }
 
-/// Drive the swarm event loop.
 /// Type alias for shared removal cache.
 type SharedRemovalCache = Arc<Mutex<crate::removal_cache::RemovalCache>>;
 

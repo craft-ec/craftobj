@@ -52,6 +52,8 @@ pub struct DataCraftHandler {
     eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
     /// Storage Merkle tree for incremental updates on store operations.
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    /// Challenger manager for PDP — register CIDs after publish/store.
+    challenger: Option<Arc<Mutex<crate::challenger::ChallengerManager>>>,
     /// Start time for uptime calculation.
     start_time: Instant,
 }
@@ -81,12 +83,17 @@ impl DataCraftHandler {
             node_signing_key: None,
             eviction_manager: None,
             merkle_tree: None,
+            challenger: None,
             start_time: Instant::now(),
         }
     }
 
     pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
         self.merkle_tree = Some(tree);
+    }
+
+    pub fn set_challenger(&mut self, challenger: Arc<Mutex<crate::challenger::ChallengerManager>>) {
+        self.challenger = Some(challenger);
     }
 
     pub fn set_eviction_manager(&mut self, mgr: Arc<Mutex<crate::eviction::EvictionManager>>) {
@@ -141,6 +148,7 @@ impl DataCraftHandler {
             node_signing_key: None,
             eviction_manager: None,
             merkle_tree: None,
+            challenger: None,
             start_time: Instant::now(),
         }
     }
@@ -192,6 +200,12 @@ impl DataCraftHandler {
         if let Some(ref tracker) = self.content_tracker {
             let mut t = tracker.lock().await;
             t.track_published(result.content_id, &manifest, file_name, encrypted);
+        }
+
+        // Register CID with challenger for PDP tracking
+        if let Some(ref challenger) = self.challenger {
+            let mut mgr = challenger.lock().await;
+            mgr.register_cid(result.content_id, None);
         }
 
         // Announce to DHT after successful publish (Milestone 1)
@@ -625,8 +639,11 @@ impl DataCraftHandler {
         }))
     }
 
-    /// Fetch missing pieces from remote peers using P2P transfer.
-    /// Providers are ranked by peer score — best peers tried first.
+    /// Fetch missing pieces from remote peers using parallel P2P transfer.
+    ///
+    /// Design: opens concurrent piece requests (up to min(needed, providers, 20)),
+    /// checks linear independence of coefficient vectors before storing,
+    /// and discards dependent pieces.
     async fn fetch_missing_pieces_from_peers(
         &self,
         content_id: &datacraft_core::ContentId,
@@ -634,6 +651,11 @@ impl DataCraftHandler {
         providers: &[libp2p::PeerId],
         command_tx: &tokio::sync::mpsc::UnboundedSender<DataCraftCommand>,
     ) -> Result<(), String> {
+        use std::collections::HashMap;
+        use tokio::task::JoinSet;
+
+        const MAX_CONCURRENT: usize = 20;
+
         debug!("Fetching pieces for {} from {} providers", content_id, providers.len());
 
         let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
@@ -643,74 +665,182 @@ impl DataCraftHandler {
             providers.to_vec()
         };
 
-        // For each segment, check if we have enough pieces, if not request more
+        // For each segment, collect existing coefficient vectors and fetch missing pieces in parallel
         for seg_idx in 0..manifest.segment_count as u32 {
             let k = manifest.k_for_segment(seg_idx as usize);
-            let local_count = {
+
+            // Load existing pieces' coefficient vectors for independence checking
+            let (local_pieces, mut coeff_matrix) = {
                 let client = self.client.lock().await;
-                client.store().list_pieces(content_id, seg_idx).unwrap_or_default().len()
+                let piece_ids = client.store().list_pieces(content_id, seg_idx).unwrap_or_default();
+                let mut coeffs = Vec::with_capacity(piece_ids.len());
+                for pid in &piece_ids {
+                    if let Ok((_data, coeff)) = client.store().get_piece(content_id, seg_idx, pid) {
+                        coeffs.push(coeff);
+                    }
+                }
+                (piece_ids.len(), coeffs)
             };
 
-            if local_count >= k {
-                continue; // Already have enough for this segment
+            let mut current_rank = if coeff_matrix.is_empty() {
+                0
+            } else {
+                craftec_erasure::check_independence(&coeff_matrix)
+            };
+
+            if current_rank >= k {
+                continue; // Already have k independent pieces
             }
 
-            let needed = k - local_count;
-            debug!("Segment {} needs {} more pieces", seg_idx, needed);
+            let needed = k - current_rank;
+            debug!("Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
 
-            let mut fetched = 0;
-            for &provider in &ranked_providers {
-                if fetched >= needed {
-                    break;
-                }
+            // Spawn parallel piece requests using JoinSet
+            let concurrency = needed.min(ranked_providers.len()).min(MAX_CONCURRENT);
+            let mut join_set: JoinSet<(
+                libp2p::PeerId,
+                std::result::Result<(Vec<u8>, Vec<u8>), String>,
+                std::time::Duration,
+            )> = JoinSet::new();
 
-                let request_start = std::time::Instant::now();
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let command = DataCraftCommand::RequestPiece {
-                    peer_id: provider,
-                    content_id: *content_id,
-                    segment_index: seg_idx,
-                    piece_id: [0u8; 32], // "any piece"
-                    reply_tx,
+            let mut provider_iter = ranked_providers.iter().copied().cycle();
+            let mut requests_launched = 0usize;
+            let mut total_fetched = 0usize;
+            // Track per-provider consecutive failures to avoid hammering bad peers
+            let mut provider_failures: HashMap<libp2p::PeerId, u32> = HashMap::new();
+
+            // Launch initial batch
+            for _ in 0..concurrency {
+                let provider = provider_iter.next().unwrap();
+                let cmd_tx = command_tx.clone();
+                let cid = *content_id;
+                join_set.spawn(async move {
+                    let start = std::time::Instant::now();
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let command = DataCraftCommand::RequestPiece {
+                        peer_id: provider,
+                        content_id: cid,
+                        segment_index: seg_idx,
+                        piece_id: [0u8; 32], // "any piece"
+                        reply_tx,
+                    };
+                    if cmd_tx.send(command).is_err() {
+                        return (provider, Err("command channel closed".into()), start.elapsed());
+                    }
+                    match reply_rx.await {
+                        Ok(Ok((coeff, data))) => (provider, Ok((coeff, data)), start.elapsed()),
+                        Ok(Err(e)) => (provider, Err(e.to_string()), start.elapsed()),
+                        Err(e) => (provider, Err(e.to_string()), start.elapsed()),
+                    }
+                });
+                requests_launched += 1;
+            }
+
+            // Process results as they complete, spawn replacements
+            while let Some(result) = join_set.join_next().await {
+                let (provider, piece_result, latency) = match result {
+                    Ok(r) => r,
+                    Err(_) => continue, // task panicked
                 };
 
-                if command_tx.send(command).is_err() {
-                    continue;
-                }
+                match piece_result {
+                    Ok((coefficients, piece_data)) => {
+                        // Check linear independence before storing
+                        let mut test_matrix = coeff_matrix.clone();
+                        test_matrix.push(coefficients.clone());
+                        let new_rank = craftec_erasure::check_independence(&test_matrix);
 
-                match reply_rx.await {
-                    Ok(Ok((coefficients, piece_data))) => {
-                        let latency = request_start.elapsed();
-                        let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+                        if new_rank > current_rank {
+                            // Independent piece — store it
+                            let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
 
-                        if let Some(ref scorer) = self.peer_scorer {
-                            scorer.lock().await.record_success(&provider, latency);
-                        }
+                            if let Some(ref scorer) = self.peer_scorer {
+                                scorer.lock().await.record_success(&provider, latency);
+                            }
 
-                        let client = self.client.lock().await;
-                        if let Err(e) = client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients) {
-                            warn!("Failed to store piece: {}", e);
-                            continue;
+                            let stored = {
+                                let client = self.client.lock().await;
+                                client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients)
+                            };
+
+                            match stored {
+                                Ok(()) => {
+                                    if let Some(ref mt) = self.merkle_tree {
+                                        mt.lock().await.insert(content_id, seg_idx, &piece_id);
+                                    }
+                                    coeff_matrix.push(coefficients);
+                                    current_rank = new_rank;
+                                    total_fetched += 1;
+
+                                    if current_rank >= k {
+                                        debug!("Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
+                                        break; // segment done
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to store piece: {}", e);
+                                }
+                            }
+                        } else {
+                            // Dependent piece — discard, record success anyway (peer was fine)
+                            debug!("Discarded dependent piece for segment {} from {}", seg_idx, provider);
+                            if let Some(ref scorer) = self.peer_scorer {
+                                scorer.lock().await.record_success(&provider, latency);
+                            }
                         }
-                        // Update storage Merkle tree
-                        if let Some(ref mt) = self.merkle_tree {
-                            mt.lock().await.insert(content_id, seg_idx, &piece_id);
-                        }
-                        fetched += 1;
                     }
-                    Ok(Err(e)) => {
+                    Err(ref e) => {
                         debug!("Failed to get piece from {}: {}", provider, e);
+                        let failures = provider_failures.entry(provider).or_insert(0);
+                        *failures += 1;
                         if let Some(ref scorer) = self.peer_scorer {
                             scorer.lock().await.record_failure(&provider);
                         }
                     }
-                    Err(e) => {
-                        debug!("Channel error requesting piece: {}", e);
-                        if let Some(ref scorer) = self.peer_scorer {
-                            scorer.lock().await.record_timeout(&provider);
+                }
+
+                // Spawn a replacement request if we still need more pieces
+                if current_rank < k {
+                    // Pick next provider, skip those with too many failures
+                    let mut attempts = 0;
+                    while attempts < ranked_providers.len() {
+                        let next_provider = provider_iter.next().unwrap();
+                        let fail_count = provider_failures.get(&next_provider).copied().unwrap_or(0);
+                        if fail_count < 3 {
+                            let cmd_tx = command_tx.clone();
+                            let cid = *content_id;
+                            join_set.spawn(async move {
+                                let start = std::time::Instant::now();
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                let command = DataCraftCommand::RequestPiece {
+                                    peer_id: next_provider,
+                                    content_id: cid,
+                                    segment_index: seg_idx,
+                                    piece_id: [0u8; 32],
+                                    reply_tx,
+                                };
+                                if cmd_tx.send(command).is_err() {
+                                    return (next_provider, Err("command channel closed".into()), start.elapsed());
+                                }
+                                match reply_rx.await {
+                                    Ok(Ok((coeff, data))) => (next_provider, Ok((coeff, data)), start.elapsed()),
+                                    Ok(Err(e)) => (next_provider, Err(e.to_string()), start.elapsed()),
+                                    Err(e) => (next_provider, Err(e.to_string()), start.elapsed()),
+                                }
+                            });
+                            requests_launched += 1;
+                            break;
                         }
+                        attempts += 1;
                     }
                 }
+            }
+
+            if current_rank < k {
+                warn!(
+                    "Segment {} incomplete: got {}/{} independent pieces after {} requests",
+                    seg_idx, current_rank, k, requests_launched
+                );
             }
         }
 

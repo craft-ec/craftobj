@@ -284,6 +284,18 @@ impl FsStore {
         &self.data_dir
     }
 
+    /// List all pinned content IDs by reading from the pins file in the data directory.
+    pub fn list_pinned(&self) -> Vec<ContentId> {
+        let pins_path = self.data_dir.join("pins.json");
+        if !pins_path.exists() {
+            return Vec::new();
+        }
+        match PinManager::new(&self.data_dir) {
+            Ok(pm) => pm.list_pinned(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Calculate total disk usage of all stored pieces and manifests in bytes.
     pub fn disk_usage(&self) -> Result<u64> {
         let mut total = 0u64;

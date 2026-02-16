@@ -51,6 +51,9 @@ pub struct DaemonConfig {
     // ── Storage ─────────────────────────────────────────────
     /// Maximum storage in bytes (0 = unlimited).
     pub max_storage_bytes: u64,
+    /// Garbage collection sweep interval in seconds (default: 3600 = 1 hour).
+    /// Set to 0 to disable GC.
+    pub gc_interval_secs: u64,
 
     // ── Geographic ──────────────────────────────────────────
     /// Geographic region of this node (e.g. "us-east", "eu-west").
@@ -76,6 +79,7 @@ impl Default for DaemonConfig {
             challenger_interval_secs: None,
             aggregation_epoch_secs: None,
             max_storage_bytes: 0,
+            gc_interval_secs: 3600,
             region: None,
             extra: serde_json::Map::new(),
         }
