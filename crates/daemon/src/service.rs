@@ -195,6 +195,12 @@ pub async fn run_daemon_with_config(
     {
         error!("Failed to subscribe to storage receipt topic: {:?}", e);
     }
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .subscribe_topic(datacraft_core::REPAIR_TOPIC)
+    {
+        error!("Failed to subscribe to repair topic: {:?}", e);
+    }
 
     // Peer scorer — tracks capabilities and reliability
     let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
@@ -282,7 +288,7 @@ pub async fn run_daemon_with_config(
     info!("Capabilities: {:?}", own_capabilities);
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
-    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx, peer_scorer.clone(), receipt_store.clone(), channel_store);
+    let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone(), channel_store);
     handler.set_settlement_client(settlement_client);
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
@@ -347,6 +353,12 @@ pub async fn run_daemon_with_config(
         });
     }
 
+    // Repair coordinator for network-wide self-healing
+    let repair_command_tx = command_tx.clone();
+    let mut repair_coord = crate::repair::RepairCoordinator::new(local_peer_id, repair_command_tx);
+    repair_coord.set_peer_scorer(peer_scorer.clone());
+    let repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>> = Arc::new(Mutex::new(repair_coord));
+
     // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
@@ -357,7 +369,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -404,6 +416,8 @@ async fn drive_swarm(
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
     client: Arc<Mutex<datacraft_client::DataCraftClient>>,
     max_storage_bytes: u64,
+    repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>>,
+    store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -481,6 +495,7 @@ async fn drive_swarm(
                         }
                         handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
                         handle_gossipsub_storage_receipt(&event, &event_tx).await;
+                        handle_gossipsub_repair(&event, &repair_coordinator, &store_for_repair, &event_tx).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -693,6 +708,14 @@ async fn handle_command(
             }
         }
 
+        DataCraftCommand::BroadcastRepairMessage { repair_data } => {
+            debug!("Broadcasting repair message via gossipsub ({} bytes)", repair_data.len());
+            if let Err(e) = swarm.behaviour_mut()
+                .publish_to_topic(datacraft_core::REPAIR_TOPIC, repair_data) {
+                warn!("Failed to broadcast repair message via gossipsub: {:?}", e);
+            }
+        }
+
         DataCraftCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
             debug!("Handling push piece command: {}/{} to {}", content_id, segment_index, peer_id);
             
@@ -884,6 +907,66 @@ async fn handle_gossipsub_storage_receipt(
                 }
                 Err(e) => {
                     debug!("Failed to parse StorageReceipt from gossipsub: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Handle gossipsub repair messages (signals and announcements).
+async fn handle_gossipsub_repair(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+    repair_coordinator: &Arc<Mutex<crate::repair::RepairCoordinator>>,
+    store: &Arc<Mutex<datacraft_store::FsStore>>,
+    _event_tx: &EventSender,
+) {
+    use libp2p::gossipsub;
+
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        message, ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::REPAIR_TOPIC {
+            match bincode::deserialize::<datacraft_core::RepairMessage>(&message.data) {
+                Ok(datacraft_core::RepairMessage::Signal(signal)) => {
+                    debug!(
+                        "Received repair signal for {}/seg{}: {} pieces needed",
+                        signal.content_id, signal.segment_index, signal.pieces_needed
+                    );
+                    let store_guard = store.lock().await;
+                    let mut coord = repair_coordinator.lock().await;
+                    if let Some(delay) = coord.handle_repair_signal(&signal, &store_guard) {
+                        // Schedule delayed repair
+                        let rc = repair_coordinator.clone();
+                        let st = store.clone();
+                        let cid = signal.content_id;
+                        let seg = signal.segment_index;
+                        drop(store_guard);
+                        drop(coord);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let store_guard = st.lock().await;
+                            let manifest = match store_guard.get_manifest(&cid) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                            let mut coord = rc.lock().await;
+                            coord.execute_repair(&store_guard, &manifest, cid, seg);
+                        });
+                    }
+                }
+                Ok(datacraft_core::RepairMessage::Announcement(announcement)) => {
+                    debug!(
+                        "Received repair announcement for {}/seg{} from repairer",
+                        announcement.content_id, announcement.segment_index
+                    );
+                    let mut coord = repair_coordinator.lock().await;
+                    coord.handle_repair_announcement(&announcement);
+                }
+                Err(e) => {
+                    debug!("Failed to parse repair message from gossipsub: {}", e);
                 }
             }
         }

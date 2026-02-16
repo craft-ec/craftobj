@@ -78,6 +78,10 @@ pub enum DataCraftCommand {
     BroadcastStorageReceipt {
         receipt_data: Vec<u8>,
     },
+    /// Broadcast a repair message (signal or announcement) via gossipsub.
+    BroadcastRepairMessage {
+        repair_data: Vec<u8>,
+    },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
     /// Push a manifest to a remote storage peer.

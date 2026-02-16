@@ -246,9 +246,29 @@ impl ChallengerManager {
         let tier_info = self.provided_cids.get(&cid).and_then(|s| s.tier_info.clone());
         let health = health::assess_health(cid, manifest.k(), min_rank, round_result.results.len(), tier_info.as_ref());
 
-        // Heal if needed
+        // Heal if needed — challenger heals locally AND publishes repair signal
         let healing = if health.needs_healing && health.pieces_needed > 0 {
-            info!("Healing {} — generating {} new pieces", cid, health.pieces_needed);
+            info!("Healing {} — generating {} new pieces (local + broadcasting repair signal)", cid, health.pieces_needed);
+
+            // Publish repair signal for each under-replicated segment
+            for (&seg_idx, &seg_rank) in &rank_map {
+                let k_seg = manifest.k_for_segment(seg_idx as usize);
+                let required = tier_info.as_ref()
+                    .map(|t| (t.min_piece_ratio * k_seg as f64).ceil() as usize)
+                    .unwrap_or(0);
+                if seg_rank < required {
+                    let signal = crate::repair::create_repair_signal(
+                        cid, seg_idx, required - seg_rank, seg_rank, k_seg, &self.local_peer_id,
+                    );
+                    let msg = datacraft_core::RepairMessage::Signal(signal);
+                    if let Ok(data) = bincode::serialize(&msg) {
+                        let _ = self.command_tx.send(
+                            DataCraftCommand::BroadcastRepairMessage { repair_data: data }
+                        );
+                    }
+                }
+            }
+
             Some(health::heal_content(store, &manifest, health.pieces_needed))
         } else {
             None

@@ -338,6 +338,38 @@ pub const REMOVAL_TOPIC: &str = "datacraft/removal/1.0.0";
 /// Gossipsub topic for StorageReceipt broadcast (aggregator collection).
 pub const STORAGE_RECEIPT_TOPIC: &str = "datacraft/storage-receipts/1.0.0";
 
+/// Gossipsub topic for repair signals and announcements.
+pub const REPAIR_TOPIC: &str = "datacraft/repair/1.0.0";
+
+/// Repair signal: challenger detected under-replication for a segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairSignal {
+    pub content_id: ContentId,
+    pub segment_index: u32,
+    pub pieces_needed: usize,
+    pub current_rank: usize,
+    pub k: usize,
+    pub challenger: Vec<u8>,
+    pub timestamp: u64,
+}
+
+/// Repair announcement: a node completed repair and stored a new piece.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairAnnouncement {
+    pub content_id: ContentId,
+    pub segment_index: u32,
+    pub piece_id: [u8; 32],
+    pub repairer: Vec<u8>,
+    pub timestamp: u64,
+}
+
+/// Wrapper for repair gossipsub messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RepairMessage {
+    Signal(RepairSignal),
+    Announcement(RepairAnnouncement),
+}
+
 /// Capabilities a DataCraft node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataCraftCapability {
