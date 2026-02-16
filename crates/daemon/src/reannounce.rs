@@ -275,23 +275,28 @@ async fn distribute_content(
 
         let mut pushed_count = 0usize;
         let mut peer_idx = 0usize;
-        let max_per_peer: usize = 2;
+        // Each peer needs at least 2 pieces to be a valid RLNC provider
+        // (can create new linearly independent pieces via recombination).
+        let seed_per_peer: usize = 2;
         let mut pieces_per_peer: std::collections::HashMap<libp2p::PeerId, usize> =
             std::collections::HashMap::new();
 
         for (seg_idx, piece_id) in &all_pieces {
-            // Find next peer that hasn't hit the per-peer cap
+            // Find next peer that hasn't been fully seeded yet.
+            // Once all peers have 2 pieces (minimum for RLNC provider),
+            // overflow continues round-robin to distribute remaining pieces.
             let mut attempts = 0;
             let peer = loop {
                 let candidate = ranked_peers[peer_idx % ranked_peers.len()];
-                peer_idx += 1;
-                let count = pieces_per_peer.entry(candidate).or_insert(0);
-                if *count < max_per_peer {
+                let count = *pieces_per_peer.entry(candidate).or_insert(0);
+                if count < seed_per_peer {
                     break candidate;
                 }
+                peer_idx += 1;
                 attempts += 1;
                 if attempts >= ranked_peers.len() {
-                    break candidate; // all peers at cap, push anyway
+                    // All peers seeded — continue round-robin for remaining pieces
+                    break candidate;
                 }
             };
 
@@ -321,7 +326,12 @@ async fn distribute_content(
             match reply_rx.await {
                 Ok(Ok(())) => {
                     pushed_count += 1;
-                    *pieces_per_peer.entry(peer).or_insert(0) += 1;
+                    let count = pieces_per_peer.entry(peer).or_insert(0);
+                    *count += 1;
+                    // Move to next peer once this one is seeded
+                    if *count >= seed_per_peer {
+                        peer_idx += 1;
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!("Push piece to {} failed: {}", peer, e);
