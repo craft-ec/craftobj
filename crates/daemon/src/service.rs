@@ -337,8 +337,6 @@ pub async fn run_daemon_with_config(
     if let Some(key) = node_signing_key {
         handler.set_node_signing_key(key);
     }
-    let handler = Arc::new(handler);
-
     info!("Starting IPC server on {}", socket_path);
 
     // Create challenger manager
@@ -364,6 +362,10 @@ pub async fn run_daemon_with_config(
     challenger_mgr.set_merkle_tree(merkle_tree.clone());
 
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
+
+    // Wire challenger into handler for CID registration on publish/store
+    handler.set_challenger(challenger_mgr.clone());
+    let handler = Arc::new(handler);
 
     // Load or generate API key for WebSocket authentication
     let api_key = crate::api_key::load_or_generate(&data_dir)
@@ -443,7 +445,7 @@ pub async fn run_daemon_with_config(
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
             info!("Incoming streams handler ended");
         }
-        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events) => {
+        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
             info!("Protocol events handler ended");
         }
         _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes, daemon_config.region.clone(), merkle_tree.clone()) => {
@@ -470,6 +472,9 @@ pub async fn run_daemon_with_config(
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
             info!("Aggregation loop ended");
+        }
+        _ = gc_loop(store.clone(), content_tracker.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes) => {
+            info!("GC loop ended");
         }
     }
 
@@ -572,6 +577,101 @@ async fn eviction_maintenance_loop(
                 *merkle_tree.lock().await = new_tree;
                 debug!("Rebuilt storage Merkle tree after eviction");
             }
+        }
+    }
+}
+
+/// Periodic garbage collection: delete unpinned content, enforce storage limits.
+async fn gc_loop(
+    store: Arc<Mutex<datacraft_store::FsStore>>,
+    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
+    event_tx: EventSender,
+    gc_interval_secs: u64,
+    max_storage_bytes: u64,
+) {
+    use std::time::Duration;
+
+    if gc_interval_secs == 0 {
+        debug!("GC disabled (gc_interval_secs=0)");
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    // Initial delay to let the daemon stabilize
+    tokio::time::sleep(Duration::from_secs(120)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(gc_interval_secs));
+    loop {
+        interval.tick().await;
+        debug!("Starting GC sweep");
+
+        let s = store.lock().await;
+        let all_cids = match s.list_content() {
+            Ok(cids) => cids,
+            Err(e) => {
+                warn!("GC: failed to list content: {}", e);
+                continue;
+            }
+        };
+
+        let pinned_cids: std::collections::HashSet<_> = s.list_pinned().into_iter().collect();
+
+        // Also treat Publisher-role content as pinned (we published it)
+        let tracker = content_tracker.lock().await;
+        let publisher_cids: std::collections::HashSet<_> = all_cids
+            .iter()
+            .filter(|cid| {
+                tracker
+                    .get(cid)
+                    .map(|state| state.role == crate::content_tracker::ContentRole::Publisher)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        drop(tracker);
+
+        let mut deleted_count = 0u64;
+        let mut deleted_bytes = 0u64;
+
+        for cid in &all_cids {
+            if pinned_cids.contains(cid) || publisher_cids.contains(cid) {
+                continue; // Keep pinned and published content
+            }
+
+            // Unpinned, non-publisher content → delete
+            if let Ok(()) = s.delete_content(cid) {
+                deleted_count += 1;
+                // Remove from content tracker
+                content_tracker.lock().await.remove(cid);
+                debug!("GC: deleted unpinned content {}", cid);
+            }
+        }
+
+        // If max_storage_bytes is set and we're still over, evict unpinned by LRU
+        // (the eviction_maintenance_loop handles funded vs free; GC is simpler)
+        if max_storage_bytes > 0 {
+            if let Ok(usage) = s.disk_usage() {
+                if usage > max_storage_bytes {
+                    debug!(
+                        "GC: storage {} > limit {}, would need LRU eviction (handled by eviction manager)",
+                        usage, max_storage_bytes
+                    );
+                }
+            }
+        }
+
+        // Rebuild merkle tree if we deleted anything
+        if deleted_count > 0 {
+            info!("GC: deleted {} unpinned content items", deleted_count);
+            if let Ok(new_tree) = datacraft_store::merkle::StorageMerkleTree::build_from_store(&s) {
+                *merkle_tree.lock().await = new_tree;
+                debug!("GC: rebuilt storage Merkle tree");
+            }
+            let _ = event_tx.send(DaemonEvent::GcCompleted {
+                deleted_count,
+                deleted_bytes,
+            });
         }
     }
 }
@@ -682,17 +782,9 @@ async fn drive_swarm(
                             let mut scorer = peer_scorer.lock().await;
                             scorer.evict_stale(std::time::Duration::from_secs(900)); // 15min TTL (3x announce interval)
                         }
-                        // Trigger immediate distribution when a new storage peer appears
+                        // New storage peers get pieces via equalization (Function 2) naturally.
                         if new_storage_peer {
-                            info!("New storage peer detected — triggering immediate content distribution");
-                            let ct = content_tracker.clone();
-                            let ctx = command_tx.clone();
-                            let cl = client.clone();
-                            let etx = event_tx.clone();
-                            let ps = peer_scorer.clone();
-                            tokio::spawn(async move {
-                                crate::reannounce::trigger_immediate_reannounce(&ct, &ctx, &cl, &etx, &ps).await;
-                            });
+                            debug!("New storage peer detected — will receive pieces via equalization");
                         }
                         handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
                         handle_gossipsub_storage_receipt(&event, &event_tx, &receipt_store).await;
@@ -710,7 +802,7 @@ async fn drive_swarm(
                 if let Some(cmd) = command {
                     match cmd {
                         DataCraftCommand::TriggerDistribution => {
-                            info!("Received TriggerDistribution command — scheduling distribution in 5s");
+                            info!("Received TriggerDistribution command — running initial push");
                             let ct = content_tracker.clone();
                             let ctx = command_tx.clone();
                             let cl = client.clone();
@@ -719,7 +811,13 @@ async fn drive_swarm(
                             tokio::spawn(async move {
                                 // Short delay to let gossipsub capability announcements arrive first
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                crate::reannounce::trigger_immediate_reannounce(&ct, &ctx, &cl, &etx, &ps).await;
+                                let needs_push = {
+                                    let t = ct.lock().await;
+                                    t.needs_distribution()
+                                };
+                                for cid in needs_push {
+                                    crate::reannounce::run_initial_push(&cid, &ct, &ctx, &cl, &ps, &etx).await;
+                                }
                             });
                         }
                         other => {
@@ -1318,6 +1416,7 @@ async fn handle_protocol_events(
     daemon_event_tx: EventSender,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
 ) {
     info!("Starting protocol events handler");
     
@@ -1379,6 +1478,12 @@ async fn handle_protocol_events(
                 let mut t = content_tracker.lock().await;
                 t.track_stored(content_id, &manifest);
                 drop(t);
+
+                // Register CID with challenger for PDP tracking
+                {
+                    let mut mgr = challenger.lock().await;
+                    mgr.register_cid(content_id, None);
+                }
 
                 // Announce as provider in DHT so other nodes can discover us
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

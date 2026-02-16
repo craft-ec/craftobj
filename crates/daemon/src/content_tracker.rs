@@ -74,6 +74,9 @@ pub struct ContentState {
     pub size: u64,
     #[serde(default)]
     pub role: ContentRole,
+    /// Whether the initial 2-per-peer push has been completed.
+    #[serde(default)]
+    pub initial_push_done: bool,
 }
 
 /// Persistent content lifecycle tracker.
@@ -127,10 +130,19 @@ impl ContentTracker {
             name,
             size: manifest.total_size,
             role: ContentRole::Publisher,
+            initial_push_done: false,
         };
 
         self.states.insert(content_id, state);
         self.save();
+    }
+
+    /// Mark initial push as complete for a CID.
+    pub fn mark_initial_push_done(&mut self, content_id: &ContentId) {
+        if let Some(state) = self.states.get_mut(content_id) {
+            state.initial_push_done = true;
+            self.save();
+        }
     }
 
     /// Track content this node is storing on behalf of the network.
@@ -163,6 +175,7 @@ impl ContentTracker {
             name: String::new(),
             size: manifest.total_size,
             role: ContentRole::StorageProvider,
+            initial_push_done: true, // storage providers don't do initial push
         };
 
         self.states.insert(content_id, state);
@@ -260,10 +273,21 @@ impl ContentTracker {
             .collect()
     }
 
+    /// CIDs that need initial push (publisher, not yet pushed).
     pub fn needs_distribution(&self) -> Vec<ContentId> {
         self.states
             .values()
-            .filter(|s| s.local_pieces > 0)
+            .filter(|s| s.role == ContentRole::Publisher && !s.initial_push_done && s.local_pieces > 0)
+            .map(|s| s.content_id)
+            .collect()
+    }
+
+    /// CIDs where this node holds > 2 pieces and initial push is done.
+    /// Used for pressure equalization (Distribution Function 2).
+    pub fn needs_equalization(&self) -> Vec<ContentId> {
+        self.states
+            .values()
+            .filter(|s| s.initial_push_done && s.local_pieces > 2)
             .map(|s| s.content_id)
             .collect()
     }
@@ -304,6 +328,7 @@ impl ContentTracker {
                         name: cid.to_hex()[..12].to_string(),
                         size: manifest.total_size,
                         role: ContentRole::Publisher,
+                        initial_push_done: false,
                     };
                     self.states.insert(cid, state);
                     imported += 1;

@@ -1,7 +1,7 @@
 //! Content maintenance loop
 //!
-//! Periodically re-announces content to the DHT and distributes pieces
-//! to storage peers using round-robin push logic.
+//! Periodically re-announces content to the DHT and equalizes piece pressure.
+//! Initial push (Function 1) is triggered inline at publish time.
 
 use std::sync::Arc;
 
@@ -49,38 +49,34 @@ pub async fn run_maintenance_cycle(
         t.needs_announcement()
     };
 
-    let needs_dist_preview = {
+    let needs_equalize = {
         let t = tracker.lock().await;
-        t.needs_distribution()
+        t.needs_equalization()
     };
 
     let needs_announce_count = needs_announce.len();
 
     let _ = event_tx.send(DaemonEvent::MaintenanceCycleStarted {
-        content_count: needs_announce_count + needs_dist_preview.len(),
+        content_count: needs_announce_count + needs_equalize.len(),
         needs_announce: needs_announce_count,
-        needs_distribute: needs_dist_preview.len(),
+        needs_distribute: needs_equalize.len(),
     });
 
-    for content_id in needs_announce {
-        reannounce_content(&content_id, tracker, command_tx, client, event_tx).await;
+    for content_id in &needs_announce {
+        reannounce_content(content_id, tracker, command_tx, client, event_tx).await;
     }
 
-    distribute_content(tracker, command_tx, client, peer_scorer, event_tx).await;
+    // Equalization only (Function 2) — initial push is done at publish time
     equalize_pressure(tracker, command_tx, client, peer_scorer, event_tx).await;
 
-    let needs_dist = {
-        let t = tracker.lock().await;
-        t.needs_distribution()
-    };
-
-    for content_id in needs_dist {
-        check_providers(&content_id, tracker, command_tx).await;
+    // Check providers for announced content
+    for content_id in &needs_announce {
+        check_providers(content_id, tracker, command_tx).await;
     }
 
     let _ = event_tx.send(DaemonEvent::MaintenanceCycleCompleted {
         announced: needs_announce_count,
-        distributed: needs_dist_preview.len(),
+        distributed: needs_equalize.len(),
         next_run_secs: 0,
     });
 }
@@ -153,20 +149,10 @@ async fn check_providers(
             let count = providers.len();
             debug!("Content {} has {} providers", content_id, count);
             let mut t = tracker.lock().await;
-            // Track individual provider PeerIds for push target selection
             for peer in &providers {
                 t.add_provider(content_id, *peer);
             }
             t.update_provider_count(content_id, count);
-            if count > 0 {
-                if let Some(state) = t.get(content_id) {
-                    let remote_estimate = state.segment_count * state.k * count.min(3);
-                    let cid = *content_id;
-                    drop(t);
-                    let mut t = tracker.lock().await;
-                    t.update_piece_progress(&cid, remote_estimate);
-                }
-            }
         }
         Ok(Err(e)) => {
             debug!("Provider resolution failed for {}: {}", content_id, e);
@@ -175,8 +161,10 @@ async fn check_providers(
     }
 }
 
-/// Distribute pieces to storage peers. Round-robin push.
-async fn distribute_content(
+/// Initial push (Function 1): push exactly 2 pieces per storage peer, round-robin.
+/// Called inline at publish time. Fire and forget.
+pub async fn run_initial_push(
+    content_id: &ContentId,
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
     client: &Arc<Mutex<DataCraftClient>>,
@@ -193,18 +181,8 @@ async fn distribute_content(
     };
 
     if storage_peers.is_empty() {
-        let total_known = {
-            let scorer = peer_scorer.lock().await;
-            scorer.iter().count()
-        };
-        let reason = if total_known == 0 {
-            "No peers connected — waiting for network discovery".to_string()
-        } else {
-            format!("{} peers connected but none have Storage capability", total_known)
-        };
-        info!("Distribution: {} — skipping", reason);
-        let _ = event_tx.send(DaemonEvent::DistributionSkipped { reason, retry_secs: 600 });
-        return;
+        info!("Initial push for {}: no storage peers available, will retry next cycle", content_id);
+        return; // Don't mark as done — needs_distribution() will still return it
     }
 
     let ranked_peers = {
@@ -212,188 +190,144 @@ async fn distribute_content(
         scorer.rank_peers(&storage_peers)
     };
 
-    let needs_dist = {
-        let t = tracker.lock().await;
-        t.needs_distribution()
+    let manifest = {
+        let c = client.lock().await;
+        match c.store().get_manifest(content_id) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Cannot push {}: {}", content_id, e);
+                return;
+            }
+        }
     };
 
-    if needs_dist.is_empty() {
-        return;
+    // Push manifest to all peers first
+    let manifest_json = match serde_json::to_vec(&manifest) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Cannot serialize manifest for {}: {}", content_id, e);
+            return;
+        }
+    };
+
+    {
+        let mut manifest_futs = Vec::new();
+        for &peer in &ranked_peers {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = DataCraftCommand::PushManifest {
+                peer_id: peer,
+                content_id: *content_id,
+                manifest_json: manifest_json.clone(),
+                reply_tx,
+            };
+            if command_tx.send(cmd).is_ok() {
+                manifest_futs.push(async move { (peer, reply_rx.await) });
+            }
+        }
+        for (peer, result) in futures::future::join_all(manifest_futs).await {
+            match result {
+                Ok(Ok(())) => debug!("Pushed manifest for {} to {}", content_id, peer),
+                Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
+                Err(_) => {}
+            }
+        }
     }
 
-    info!(
-        "Distributing {} content items to {} storage peers",
-        needs_dist.len(),
-        ranked_peers.len()
-    );
-
-    for content_id in needs_dist {
-        let manifest = {
+    // Collect all local pieces
+    let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
+    for seg_idx in 0..manifest.segment_count as u32 {
+        let piece_ids = {
             let c = client.lock().await;
-            match c.store().get_manifest(&content_id) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Cannot distribute {}: {}", content_id, e);
-                    continue;
-                }
+            c.store().list_pieces(content_id, seg_idx).unwrap_or_default()
+        };
+        for pid in piece_ids {
+            all_pieces.push((seg_idx, pid));
+        }
+    }
+
+    // Assign exactly 2 pieces per peer, round-robin. Stop when we run out of peers.
+    let pieces_per_peer: usize = 2;
+    let max_pieces = pieces_per_peer * ranked_peers.len();
+    let mut assignments: Vec<(libp2p::PeerId, u32, [u8; 32])> = Vec::new();
+
+    for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
+        if i >= max_pieces {
+            break; // Only push 2 per peer, remaining pieces spread via equalization
+        }
+        let peer = ranked_peers[i / pieces_per_peer];
+        assignments.push((peer, *seg_idx, *piece_id));
+    }
+
+    // Push assigned pieces with bounded concurrency
+    let max_concurrent: usize = 30;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let pushed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut push_futs = Vec::new();
+    let cid = *content_id;
+    for (peer, seg_idx, piece_id) in assignments {
+        let (piece_data, coefficients) = {
+            let c = client.lock().await;
+            match c.store().get_piece(&cid, seg_idx, &piece_id) {
+                Ok(d) => d,
+                Err(_) => continue,
             }
         };
 
-        // Push manifest first
-        let manifest_json = match serde_json::to_vec(&manifest) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!("Cannot serialize manifest for {}: {}", content_id, e);
-                continue;
-            }
-        };
-        // Push manifests to all peers in parallel.
-        {
-            let mut manifest_futs = Vec::new();
-            for &peer in &ranked_peers {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let cmd = DataCraftCommand::PushManifest {
-                    peer_id: peer,
-                    content_id,
-                    manifest_json: manifest_json.clone(),
-                    reply_tx,
-                };
-                if command_tx.send(cmd).is_ok() {
-                    manifest_futs.push(async move { (peer, reply_rx.await) });
-                }
-            }
-            for (peer, result) in futures::future::join_all(manifest_futs).await {
-                match result {
-                    Ok(Ok(())) => info!("Pushed manifest for {} to {}", content_id, peer),
-                    Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
-                    Err(_) => {}
-                }
-            }
-        }
+        let sem = semaphore.clone();
+        let cmd_tx = command_tx.clone();
+        let pushed = pushed_count.clone();
 
-        // Collect all pieces, then assign targets.
-        // Each peer needs at least 2 pieces to be a valid RLNC provider
-        // (can create new linearly independent pieces via recombination).
-        // Push 2 consecutive pieces per peer before rotating. Overflow
-        // continues round-robin for initial upload.
-        let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
-        for seg_idx in 0..manifest.segment_count as u32 {
-            let piece_ids = {
-                let c = client.lock().await;
-                c.store().list_pieces(&content_id, seg_idx).unwrap_or_default()
+        push_futs.push(async move {
+            let _permit = sem.acquire().await;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = DataCraftCommand::PushPiece {
+                peer_id: peer,
+                content_id: cid,
+                segment_index: seg_idx,
+                piece_id,
+                coefficients,
+                piece_data,
+                reply_tx,
             };
-            for pid in piece_ids {
-                all_pieces.push((seg_idx, pid));
+            if cmd_tx.send(cmd).is_err() {
+                return;
             }
-        }
-
-        // Assign pieces to peers (2 consecutive per peer, then rotate).
-        let seed_per_peer: usize = 2;
-        let mut peer_idx = 0usize;
-        let mut pieces_per_peer: std::collections::HashMap<libp2p::PeerId, usize> =
-            std::collections::HashMap::new();
-        let mut assignments: Vec<(libp2p::PeerId, u32, [u8; 32])> = Vec::new();
-
-        for (seg_idx, piece_id) in &all_pieces {
-            let mut attempts = 0;
-            let peer = loop {
-                let candidate = ranked_peers[peer_idx % ranked_peers.len()];
-                let count = *pieces_per_peer.entry(candidate).or_insert(0);
-                if count < seed_per_peer {
-                    break candidate;
+            match reply_rx.await {
+                Ok(Ok(())) => {
+                    pushed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                peer_idx += 1;
-                attempts += 1;
-                if attempts >= ranked_peers.len() {
-                    // All peers seeded — continue round-robin for remaining pieces
-                    break candidate;
+                Ok(Err(e)) => {
+                    warn!("Push piece to {} failed: {}", peer, e);
                 }
-            };
-            let count = pieces_per_peer.entry(peer).or_insert(0);
-            *count += 1;
-            if *count >= seed_per_peer {
-                peer_idx += 1;
+                Err(_) => {}
             }
-            assignments.push((peer, *seg_idx, *piece_id));
-        }
+        });
+    }
+    futures::future::join_all(push_futs).await;
+    let total_pushed = pushed_count.load(std::sync::atomic::Ordering::Relaxed);
 
-        // Push all assigned pieces in parallel with bounded concurrency.
-        let max_concurrent: usize = 30;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let pushed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    info!("Initial push for {}: pushed {} pieces to {} peers", content_id, total_pushed, ranked_peers.len());
 
-        let mut push_futs = Vec::new();
-        for (peer, seg_idx, piece_id) in assignments {
-            let (piece_data, coefficients) = {
-                let c = client.lock().await;
-                match c.store().get_piece(&content_id, seg_idx, &piece_id) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                }
-            };
+    if total_pushed > 0 {
+        let _ = event_tx.send(DaemonEvent::ContentDistributed {
+            content_id: content_id.to_hex(),
+            pieces_pushed: total_pushed,
+            total_pieces: total_pushed,
+            target_peers: ranked_peers.len(),
+        });
+    }
 
-            let sem = semaphore.clone();
-            let cmd_tx = command_tx.clone();
-            let pushed = pushed_count.clone();
-
-            push_futs.push(async move {
-                let _permit = sem.acquire().await;
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let cmd = DataCraftCommand::PushPiece {
-                    peer_id: peer,
-                    content_id,
-                    segment_index: seg_idx,
-                    piece_id,
-                    coefficients,
-                    piece_data,
-                    reply_tx,
-                };
-                if cmd_tx.send(cmd).is_err() {
-                    return;
-                }
-                match reply_rx.await {
-                    Ok(Ok(())) => {
-                        pushed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Push piece to {} failed: {}", peer, e);
-                    }
-                    Err(_) => {}
-                }
-            });
-        }
-        futures::future::join_all(push_futs).await;
-        let pushed_count = pushed_count.load(std::sync::atomic::Ordering::Relaxed);
-
-        if pushed_count > 0 {
-            info!("Distributed {} pieces for {}", pushed_count, content_id);
-            let _ = event_tx.send(DaemonEvent::ContentDistributed {
-                content_id: content_id.to_hex(),
-                pieces_pushed: pushed_count,
-                total_pieces: pushed_count, // approximation
-                target_peers: ranked_peers.len(),
-            });
-            let mut t = tracker.lock().await;
-            t.update_piece_progress(&content_id, pushed_count);
-            if let Some((state, summary)) = t.status_summary(&content_id) {
-                let _ = event_tx.send(DaemonEvent::ContentStatus {
-                    content_id: content_id.to_hex(),
-                    name: state.name,
-                    size: state.size,
-                    stage: state.stage.to_string(),
-                    local_pieces: state.local_pieces,
-                    remote_pieces: state.remote_pieces,
-                    total_pieces: state.segment_count * state.k,
-                    provider_count: state.provider_count,
-                    summary,
-                });
-            }
-        }
+    // Mark initial push as done regardless of push count (fire and forget)
+    {
+        let mut t = tracker.lock().await;
+        t.mark_initial_push_done(content_id);
+        t.update_piece_progress(content_id, total_pushed);
     }
 }
 
-/// Pressure equalization: if a node holds >2 pieces for any CID, push 1 excess
-/// piece per CID per cycle to a random storage peer.
+/// Pressure equalization (Function 2): for CIDs where local_pieces > 2,
+/// push 1 piece to a storage peer that doesn't already have this CID.
 async fn equalize_pressure(
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
@@ -401,8 +335,6 @@ async fn equalize_pressure(
     peer_scorer: &Arc<Mutex<PeerScorer>>,
     event_tx: &EventSender,
 ) {
-    let excess_threshold: usize = 2;
-
     let storage_peers: Vec<libp2p::PeerId> = {
         let scorer = peer_scorer.lock().await;
         scorer
@@ -416,13 +348,33 @@ async fn equalize_pressure(
         return;
     }
 
-    let all_cids = {
+    let needs_equalize = {
         let t = tracker.lock().await;
-        t.needs_distribution()
+        t.needs_equalization()
     };
 
-    for content_id in all_cids {
-        // Count total local pieces
+    for content_id in needs_equalize {
+        // Find peers that do NOT already have this CID
+        let existing_providers: std::collections::HashSet<libp2p::PeerId> = {
+            let t = tracker.lock().await;
+            t.get_providers(&content_id).into_iter().collect()
+        };
+
+        let candidates: Vec<libp2p::PeerId> = storage_peers
+            .iter()
+            .filter(|p| !existing_providers.contains(p))
+            .copied()
+            .collect();
+
+        if candidates.is_empty() {
+            debug!("Equalization for {}: all storage peers are already providers", content_id);
+            continue;
+        }
+
+        // Pick one candidate (deterministic from CID for distribution)
+        let peer_idx = (content_id.0[0] as usize) % candidates.len();
+        let peer = candidates[peer_idx];
+
         let manifest = {
             let c = client.lock().await;
             match c.store().get_manifest(&content_id) {
@@ -431,21 +383,7 @@ async fn equalize_pressure(
             }
         };
 
-        let mut total_local = 0usize;
-        for seg in 0..manifest.segment_count as u32 {
-            let c = client.lock().await;
-            total_local += c.store().list_pieces(&content_id, seg).unwrap_or_default().len();
-        }
-
-        if total_local <= excess_threshold {
-            continue;
-        }
-
-        // Pick a random peer and push 1 piece
-        let peer_idx = (content_id.0[0] as usize) % storage_peers.len();
-        let peer = storage_peers[peer_idx];
-
-        // Find the first piece to push
+        // Find first available piece to push
         'outer: for seg in 0..manifest.segment_count as u32 {
             let pieces = {
                 let c = client.lock().await;
@@ -487,11 +425,11 @@ async fn equalize_pressure(
 
                 if command_tx.send(cmd).is_ok() {
                     if let Ok(Ok(())) = reply_rx.await {
-                        debug!("Pressure equalization: pushed 1 piece for {} to {}", content_id, peer);
+                        debug!("Equalization: pushed 1 piece for {} to {}", content_id, peer);
                         let _ = event_tx.send(DaemonEvent::ContentDistributed {
                             content_id: content_id.to_hex(),
                             pieces_pushed: 1,
-                            total_pieces: total_local,
+                            total_pieces: 1,
                             target_peers: 1,
                         });
                     }
@@ -500,15 +438,4 @@ async fn equalize_pressure(
             }
         }
     }
-}
-
-pub async fn trigger_immediate_reannounce(
-    tracker: &Arc<Mutex<ContentTracker>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
-    client: &Arc<Mutex<DataCraftClient>>,
-    event_tx: &EventSender,
-    peer_scorer: &Arc<Mutex<PeerScorer>>,
-) {
-    info!("Triggering immediate re-announcement and distribution");
-    run_maintenance_cycle(tracker, command_tx, client, event_tx, peer_scorer).await;
 }
