@@ -645,6 +645,33 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_receipt_contribution_receipt_trait() {
+        use craftec_core::ContributionReceipt;
+
+        let receipt = StorageReceipt {
+            content_id: ContentId([0u8; 32]),
+            storage_node: [10u8; 32],
+            challenger: [20u8; 32],
+            segment_index: 0,
+            piece_id: [5u8; 32],
+            timestamp: 42000,
+            nonce: [3u8; 32],
+            proof_hash: [4u8; 32],
+            signature: vec![0xAA; 64],
+        };
+
+        assert_eq!(ContributionReceipt::weight(&receipt), 1);
+        assert_eq!(receipt.operator(), [10u8; 32]);
+        assert_eq!(receipt.signer(), [20u8; 32]);
+        assert_eq!(ContributionReceipt::timestamp(&receipt), 42000);
+        assert_eq!(receipt.signature(), &[0xAA; 64]);
+        // signable_data should be deterministic and 204 bytes
+        let data = ContributionReceipt::signable_data(&receipt);
+        assert_eq!(data.len(), 204);
+        assert_eq!(data, ContributionReceipt::signable_data(&receipt));
+    }
+
+    #[test]
     fn test_storage_receipt_serde() {
         let receipt = StorageReceipt {
             content_id: ContentId([0u8; 32]),
