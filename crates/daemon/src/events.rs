@@ -73,6 +73,10 @@ pub enum DaemonEvent {
     // -- PDP --
     ChallengerRoundCompleted { rounds: u32 },
     PieceRequested { content_id: String, peer_id: String, segment: u32 },
+
+    // -- Eviction / Retirement --
+    ContentEvicted { content_id: String, reason: String },
+    ContentRetired { content_id: String, reason: String },
 }
 
 pub type EventSender = broadcast::Sender<DaemonEvent>;

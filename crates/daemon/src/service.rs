@@ -329,6 +329,13 @@ pub async fn run_daemon_with_config(
     challenger_mgr.set_peer_scorer(peer_scorer.clone());
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
+    // Eviction manager
+    let eviction_config = crate::eviction::EvictionConfig {
+        max_storage_bytes: daemon_config.max_storage_bytes,
+        enable_eviction: true,
+    };
+    let eviction_manager = Arc::new(Mutex::new(crate::eviction::EvictionManager::new(&eviction_config)));
+
     // Load or generate API key for WebSocket authentication
     let api_key = crate::api_key::load_or_generate(&data_dir)
         .map_err(|e| format!("Failed to load/generate API key: {}", e))?;
@@ -413,6 +420,9 @@ pub async fn run_daemon_with_config(
         _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id) => {
             info!("Scaling maintenance loop ended");
         }
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone()) => {
+            info!("Eviction maintenance loop ended");
+        }
     }
 
     Ok(())
@@ -445,6 +455,44 @@ async fn scaling_maintenance_loop(
             }
         }
         tracker.cleanup();
+    }
+}
+
+/// Periodically check storage pressure and evict free content.
+async fn eviction_maintenance_loop(
+    eviction_manager: Arc<Mutex<crate::eviction::EvictionManager>>,
+    store: Arc<Mutex<datacraft_store::FsStore>>,
+    event_tx: EventSender,
+) {
+    use std::time::Duration;
+    // Initial delay
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    loop {
+        interval.tick().await;
+        let store_guard = store.lock().await;
+        let mut mgr = eviction_manager.lock().await;
+
+        // Run eviction (no retirement data available yet — pass empty maps)
+        let result = mgr.run_maintenance(
+            &store_guard,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        for (cid, reason) in &result.evicted {
+            let _ = event_tx.send(DaemonEvent::ContentEvicted {
+                content_id: cid.to_hex(),
+                reason: reason.to_string(),
+            });
+        }
+        for (cid, reason) in &result.retired {
+            let _ = event_tx.send(DaemonEvent::ContentRetired {
+                content_id: cid.to_hex(),
+                reason: reason.to_string(),
+            });
+        }
     }
 }
 
