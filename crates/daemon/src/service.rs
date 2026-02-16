@@ -258,6 +258,13 @@ pub async fn run_daemon_with_config(
     protocol.set_eviction_manager(eviction_manager.clone());
     protocol.set_merkle_tree(merkle_tree.clone());
 
+    // Create stream pool for persistent outbound streams
+    let stream_pool = {
+        let control = swarm.behaviour().stream_control();
+        Arc::new(Mutex::new(crate::stream_manager::StreamPool::new(control)))
+    };
+    protocol.set_stream_pool(stream_pool.clone());
+
     let protocol = Arc::new(protocol);
 
     // Payment channel store
@@ -430,7 +437,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), stream_pool.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -594,9 +601,14 @@ async fn drive_swarm(
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
+    stream_pool: Arc<Mutex<crate::stream_manager::StreamPool>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
+
+    // Timer for polling the stream pool
+    let mut pool_poll_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    pool_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -610,6 +622,12 @@ async fn drive_swarm(
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         let total = swarm.connected_peers().count();
                         info!("Connected to {} ({} peers total)", peer_id, total);
+                        // Clear stream pool cooldown and pre-open stream
+                        {
+                            let mut pool = stream_pool.lock().await;
+                            pool.on_peer_connected(&peer_id);
+                            pool.ensure_opening(peer_id);
+                        }
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
                             peer_id: peer_id.to_string(),
                             address: endpoint.get_remote_address().to_string(),
@@ -646,6 +664,8 @@ async fn drive_swarm(
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         let remaining = swarm.connected_peers().count();
                         info!("Disconnected from {} ({} peers remaining)", peer_id, remaining);
+                        // Clean up stream pool for disconnected peer
+                        stream_pool.lock().await.on_peer_disconnected(&peer_id);
                         let _ = event_tx.send(DaemonEvent::PeerDisconnected {
                             peer_id: peer_id.to_string(),
                             remaining_peers: remaining,
@@ -707,6 +727,11 @@ async fn drive_swarm(
                         }
                     }
                 }
+            }
+            // Poll stream pool for completed background opens
+            _ = pool_poll_interval.tick() => {
+                let mut pool = stream_pool.lock().await;
+                pool.poll();
             }
         }
     }

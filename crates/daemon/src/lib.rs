@@ -28,5 +28,6 @@ pub mod scaling;
 pub mod removal_cache;
 pub mod service;
 pub mod settlement;
+pub mod stream_manager;
 pub mod settlement_cycle;
 pub mod ws_server;
