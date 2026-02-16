@@ -13,53 +13,96 @@ Read the parent [CLAUDE.md](../CLAUDE.md) first for ecosystem conventions.
 
 ```
 crates/
-├── core/       ContentId, ChunkManifest, StorageReceipt, wire protocol, constants
+├── core/       ContentId, ContentManifest, StorageReceipt, wire protocol, constants
 ├── store/      Content-addressed filesystem storage, PinManager, GC
 ├── routing/    DHT content provider records, CID resolution
-├── transfer/   Piece exchange protocol, shard request/response codec
+├── transfer/   Piece exchange protocol, piece request/response codec
 ├── client/     High-level orchestration: publish, fetch, pin, unpin
 ├── daemon/     Background service: swarm, protocol, IPC handler, commands
 └── uniffi/     Mobile bindings (future)
 ```
 
+**⚠️ Naming updates needed**: `ChunkManifest` → `ContentManifest` throughout all crates. `shard_index` → removed (pieces identified by coefficient vectors). `data_shards`/`parity_shards` → `piece_size`/`segment_size`/`initial_parity`.
+
 ## Current State
 
 - **P2P pipeline working**: Publish → DHT announce → DHT resolve → libp2p-stream transfer → fetch complete
 - **166 tests passing**, build + clippy clean
-- **Peer scoring active**: `PeerScorer` in daemon tracks per-peer reliability (success/failure/timeout with exponential decay), latency EMA, and capabilities from gossipsub. Replaces old static `PeerCapabilities` map. `rank_peers()` for routing, `evict_stale()` for TTL cleanup. Capability announcements still broadcast every 5 min via gossipsub.
-- **TransferReceipts generated on shard transfers**: Requester signs receipt with ed25519 key after receiving shard data, sends back to server. Server verifies signature and stores in PersistentReceiptStore (append-only binary file with in-memory indices, dedup, CID/node/time queries)
-- **Signing module active**: `crates/core/src/signing.rs` provides `sign_transfer_receipt`, `verify_transfer_receipt`, `peer_id_to_ed25519_pubkey`
-- **Payment channel persistence**: `ChannelStore` (daemon) manages open channels on disk (one JSON per channel in `~/.datacraft/channels/`). Full voucher validation (sig verify, nonce, cumulative amounts). IPC handlers (`channel.open`, `channel.voucher`, `channel.close`, `channel.list`) wired to ChannelStore.
-- **Protocol egress pricing**: Fixed rate `PROTOCOL_EGRESS_PRICE_PER_BYTE` (1 USDC lamport/byte) in `economics.rs`. `EgressPricing` struct with `cost()` and `covers()` helpers. Nodes compete on performance, not price.
-- **Content encryption**: ChaCha20-Poly1305 per-content key, nonce prepended. Publish with `encrypted=true` → `(CID, content_key)`. Reconstruct with key → plaintext, without → ciphertext.
-- **Access control (access.rs)**: `AccessEntry`/`AccessList` types. ECDH(ephemeral, recipient_x25519) + ChaCha20 key wrapping. Signed by creator. Bincode serialization for DHT.
-- **Proxy Re-Encryption (pre.rs)**: Client-side PRE using x25519 ECDH. `encrypt_content_key` (to creator), `generate_re_key` (creator→recipient), `re_encrypt_with_content_key`, `decrypt_re_encrypted`. Ed25519→x25519 via SHA-512 clamping (secret) + Edwards→Montgomery (public).
-- **Client PRE API**: `publish_with_pre()`, `grant_access()` (returns ReKeyEntry + ReEncryptedKey for DHT), `reconstruct_with_pre()` (recipient decrypts via PRE).
-- **DHT access metadata**: AccessList and ReKeyEntry stored/retrieved via DHT (`/datacraft/access/<cid>`, `/datacraft/rekey/<cid>/<did>`). ContentRouter methods: `put_access_list`, `get_access_list`, `put_re_key`, `get_re_key`, `remove_re_key`. Bincode serialization. Tombstone pattern for revocation.
-- **Access IPC handlers**: `access.grant` (generates ReKeyEntry + ReEncryptedKey, stores in DHT), `access.revoke` (tombstones re-key), `access.revoke_rotate` (revoke + rotate content key + re-encrypt content + re-grant remaining users), `access.list` (fetches AccessList from DHT, returns authorized DIDs). Full async DHT round-trip via protocol event flow.
-- **Content revocation with key rotation**: `revoke_and_rotate()` in client generates new content key, re-encrypts content (new CID), re-grants remaining users via PRE. `access.revoke_rotate` IPC handler orchestrates full flow: tombstone old re-key → rotate → re-grant → store in DHT → announce new CID.
-- **StorageReceipt generation wired into PDP challenger**: ChallengerManager signs receipts with ed25519 after successful PDP challenges, persists to PersistentReceiptStore. `receipt.storage.list` IPC handler with pagination/filters. Challenger runs periodically in daemon event loop.
-- **Settlement module wired**: `SolanaClient` in `crates/daemon/src/settlement.rs` wraps `craftec-settlement` instruction builders. Methods: `create_creator_pool`, `fund_pool`, `claim_pdp`, `open_payment_channel`, `close_payment_channel`, `force_close_channel`. IPC handlers: `settlement.create_pool`, `settlement.fund_pool`, `settlement.claim`, `settlement.open_channel`, `settlement.close_channel`. Currently dry-run mode (LoggingTransport) — swap to real `solana-client` RPC when program is deployed. Initialized in `DataCraftService` with ed25519 signing key from libp2p keypair.
-- **Real Solana RPC transport**: `RpcTransport` in `settlement.rs` wraps `solana_client::nonblocking::rpc_client::RpcClient`. Builds `Transaction` from `PreparedTransaction`, signs with Solana `Keypair` (derived from node's ed25519 key), submits via `send_and_confirm_transaction`. Handles fresh blockhash, compute budget (200k CU), retry on timeout (3x). Config-driven: set `DATACRAFT_SOLANA_RPC_URL` env → real RPC, otherwise `LoggingTransport` (dry-run). USDC mint auto-detected (devnet/mainnet) or override via `DATACRAFT_USDC_MINT`. Settlement program: `8FgnYTEdbvSkbGQ1gC9Laihv6amobQ4r4kSECPQpY68L`.
-- **Content removal daemon fully wired**: `data.remove` IPC handler (signs RemovalNotice, stores in DHT, unpins local shards), `RemovalCache` (in-memory HashSet for fast checks), gossipsub removal propagation (broadcast + receive on REMOVAL_TOPIC), pre-serve check in protocol (rejects shard requests for removed CIDs). Full flow: creator calls `data.remove` → daemon signs notice → DHT put + gossipsub broadcast → peers populate RemovalCache → shard serve blocked.
-- **Not yet implemented**: challenger→claim_pdp integration in challenger loop, payment channel close→settlement integration
+- **⚠️ Erasure coding is Reed-Solomon — needs refactoring to RLNC**: All existing erasure code uses `reed-solomon-erasure` crate with `data_shards`/`parity_shards`/`shard_index` model. The design has moved to RLNC (Random Linear Network Coding) with segments (10MB), pieces (100KB), coefficient vectors, and no shard indices. See "RS → RLNC Refactoring" section below.
+- **Peer scoring active**: `PeerScorer` in daemon tracks per-peer reliability, latency EMA, and capabilities from gossipsub.
+- **StorageReceipts generated on PDP challenges**: ChallengerManager signs receipts after successful PDP challenges, persists to PersistentReceiptStore.
+- **Signing module active**: `crates/core/src/signing.rs` provides receipt signing/verification.
+- **Content encryption**: ChaCha20-Poly1305 per-content key. Publish with `encrypted=true` → `(CID, content_key)`.
+- **Access control + PRE**: ECDH key wrapping, Proxy Re-Encryption for trustless access delegation via DHT.
+- **Content removal daemon fully wired**: RemovalNotice, gossipsub propagation, pre-serve check.
+- **Settlement module (dry-run)**: `SolanaClient` wraps `craftec-settlement` instruction builders. Real RPC transport available.
 
-## Key Design Decisions (from recent discussions)
+### What's been removed from the design (code still exists, needs cleanup)
 
-- **Capabilities, not roles**: Nodes declare capabilities (Storage, Relay, Client, Aggregator). Each announced via per-craft gossip topics.
-- **Separate DHTs**: DataCraft runs its own Kademlia instance, separate from TunnelCraft. Cross-craft peer discovery via shared gossipsub (cross-pollination).
-- **Node model**: Single node, two cost dimensions (storage = per-byte-per-time, transfer = per-byte-per-event).
-- **Erasure distribution, NOT replication**: No duplicates. Each storage node holds a unique parity shard. Dynamic shard count grows/shrinks with provider set.
-- **Immutable ChunkManifest**: Contains k, chunk_size, erasure_config, content_hash. Does NOT track shard count or locations.
-- **Creator Pool model**: One pool per creator, funds all their CIDs. USDC balance. StorageReceipt (PDP) is the ONLY settlement mechanism for storage distribution. No transfer/egress settlement pool.
-- **Payment channels for premium egress**: Users open payment channels directly with storage nodes. Cumulative vouchers (latest supersedes all previous, like Filecoin). Protocol fee on redemption.
-- **TransferReceipt is analytics-only**: Still generated for bandwidth monitoring and node reputation via `craftec-identity`, but NOT used for settlement.
-- **Free egress has no reward**: Best effort, volunteer. No receipt, no settlement.
-- **Protocol fee**: Flat fee in basis points (default 5%) on all on-chain settlements (PDP claims + payment channel redemptions).
-- **PDP peer rotation**: Challenger nominated from providers, sorted by online time. Challenger fetches k-1 shards, verifies all providers, assesses health, heals if needed (generates new parity). Self-healing loop.
-- **Tier-guaranteed shard ratios**: Lite=2x, Standard=3x, Pro=5x, Enterprise=10x. Tier is minimum not cap.
-- **Dual revenue**: Funded CID + paying user = storage node earns from creator pool (PDP) + payment channel (premium egress). Two separate services, two separate payers.
-- **Free tier still issues StorageReceipts** for reputation tracking — no settlement, but receipts feed into craftec-identity.
+- **TransferReceipt for settlement** — removed. No transfer/egress receipts for payment. StorageReceipt (PDP) is the sole settlement mechanism.
+- **Payment channels** — removed. No user↔storage-node payment channels. Subscriptions replace per-byte egress pricing.
+- **Per-byte egress pricing** — removed. `PROTOCOL_EGRESS_PRICE_PER_BYTE` in economics.rs is obsolete.
+- **ChunkManifest with RS parameters** — replaced by ContentManifest with RLNC parameters.
+
+## Key Design Decisions (from current design)
+
+- **RLNC, NOT Reed-Solomon**: Random Linear Network Coding over GF(2^8). Pieces identified by coefficient vectors, not shard indices. Any node with 2+ pieces can create new unique pieces via linear combination. No 256-shard limit.
+- **Segments + Pieces**: Content split into 10MB segments, each segment into 100KB pieces. k=100 per full segment (k = ceil(segment_bytes/piece_size) for partial segments). Initial parity: 1.2x (20 extra coded pieces).
+- **ContentManifest is simple**: `content_hash`, `segment_count`, `erasure_config` (segment_size, piece_size, initial_parity). No shard count, no piece locations, no Merkle roots.
+- **"Give me any piece for segment Y"**: Client requests any piece, provider returns random piece + coefficient vector. Client checks linear independence. Cheaper to discard dependent piece (~1/256 probability) than coordinate upfront.
+- **Client-side delivery intelligence**: Storage nodes are dumb piece servers. All fetch strategy (connection pooling, provider selection, piece validation) lives in the client.
+- **PDP uses coefficient vector cross-checking**: Challenger holds pieces, uses GF(2^8) linear algebra to verify prover's data. No Merkle roots needed. Coefficient vector IS piece identity.
+- **Four-function distribution**: Push (initial upload), Distribution (ongoing equalization), Repair (reactive after PDP), Scaling (demand-driven, bounded by tier max).
+- **Dual-pool economics**: Global Pool (protocol fees → all nodes by total PDP passes) + Creator Pool (creator allocation → nodes storing their content by PDP passes).
+- **Subscriptions, not payment channels**: Creator subscription + platform subscription → revenue to creators. Protocol fee → Global Pool.
+- **Priority serving**: Creator subscriber > Platform subscriber > Free user. On-chain subscription proofs, cached by storage nodes.
+- **No separate egress revenue**: PDP covers everything. Holding data IS the service.
+- **Capabilities, not roles**: Nodes declare capabilities (Storage, Relay, Client, Aggregator).
+- **Separate DHTs**: DataCraft runs its own Kademlia instance.
+- **Bounded redundancy**: Base (pool-funded) → demand-driven scaling → max (hard ceiling). Tiers: Free(1.5x/3x), Lite(2x/4x), Standard(3x/6x), Pro(5x/10x), Enterprise(10x/20x).
+
+## RS → RLNC Refactoring
+
+The existing codebase is built on Reed-Solomon erasure coding. The design has moved to RLNC. Here's what needs to change:
+
+### craftec-core (shared crate)
+- **`crates/erasure/src/lib.rs`**: Core RS implementation using `reed-solomon-erasure` crate. `ErasureCoder` wraps `ReedSolomon` with `data_shards`/`parity_shards`. Must be replaced with RLNC encoder/decoder over GF(2^8).
+- **`crates/erasure/src/chunker.rs`**: Chunking logic. Needs update for segment/piece model.
+- **`crates/erasure/Cargo.toml`**: Depends on `reed-solomon-erasure`. Replace with RLNC library or custom implementation.
+- **`ErasureConfig`**: Currently has `data_shards`/`parity_shards`. Replace with `piece_size`/`segment_size`/`initial_parity`.
+
+### datacraft/crates/core/
+- **`src/lib.rs`**: Defines `ChunkManifest` (rename to `ContentManifest`), uses `ErasureConfig` from craftec-erasure. Update struct fields.
+- **`src/signing.rs`**: Tests reference `shard_index` in StorageReceipt. Update to use `piece_id` (SHA-256 of coefficient vector).
+- **`src/economics.rs`**: References `shard_index` in test receipts, has `PROTOCOL_EGRESS_PRICE_PER_BYTE` (remove).
+
+### datacraft/crates/store/
+- **`src/lib.rs`**: Stores shards at `chunks/<cid>/<chunk_index>/<shard_index>`. Change to segment/piece model with coefficient vector identification.
+
+### datacraft/crates/transfer/
+- **`src/lib.rs`**: Wire protocol uses `[content_id:32][chunk_index:4][shard_index:1]`. Replace with segment-based "any piece" request model.
+
+### datacraft/crates/routing/
+- **`src/lib.rs`**: References `ChunkManifest`. Rename to `ContentManifest`.
+
+### datacraft/crates/client/
+- **`src/lib.rs`**: Publish flow uses RS encode. Update to RLNC segment/piece model.
+- **`src/extension.rs`**: Fetch reconstruction uses `data_shards` and RS decode. Replace with RLNC Gaussian elimination.
+- **`tests/e2e.rs`, `tests/e2e_two_node.rs`**: Reference RS concepts. Update tests.
+
+### datacraft/crates/daemon/ (many files)
+- **`src/commands.rs`**: `DataCraftCommand` variants use `ChunkManifest`, `shard_index`. Update.
+- **`src/service.rs`**: References `ChunkManifest`, `shard_index` in command handling. Update.
+- **`src/protocol.rs`**: Uses `ChunkManifest`, `shard_index`, `TransferReceipt`. Update wire protocol.
+- **`src/handler.rs`**: Publish handler uses `data_shards`/`parity_shards`. Update to RLNC.
+- **`src/content_tracker.rs`**: Uses `ChunkManifest`, `data_shards + parity_shards` for total shard count. Update.
+- **`src/health.rs`**: Health assessment uses `shard_index`, `ChunkManifest`. Replace with rank-based health from coefficient vectors.
+- **`src/pdp.rs`**: PDP challenge uses `shard_index`. Replace with coefficient vector cross-checking.
+- **`src/challenger.rs`**: Queries `max_shard_index`, challenges by shard index. Replace with coefficient vector model.
+- **`src/eviction.rs`**: References `ChunkManifest`, `default_erasure_config()`. Update.
+- **`src/reannounce.rs`**: Uses `data_shards + parity_shards` for shard iteration. Update.
+- **`src/receipt_store.rs`**: Dedup hash includes `shard_index`. Replace with `piece_id`.
+- **`src/settlement.rs`**: Test receipts use `shard_index`. Update.
 
 ## Reference Implementation
 
