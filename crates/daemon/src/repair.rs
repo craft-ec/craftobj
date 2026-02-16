@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use crate::commands::DataCraftCommand;
 use crate::health;
 use crate::peer_scorer::PeerScorer;
+use crate::push_target;
 
 /// Base delay for repair scheduling (highest-scored node gets ~0, lowest gets this).
 const BASE_REPAIR_DELAY: Duration = Duration::from_secs(10);
@@ -156,6 +157,7 @@ impl RepairCoordinator {
         manifest: &ContentManifest,
         content_id: ContentId,
         segment_index: u32,
+        known_providers: &[PeerId],
     ) -> Option<[u8; 32]> {
         let key = (content_id, segment_index);
 
@@ -209,6 +211,33 @@ impl RepairCoordinator {
 
         // Also handle our own announcement
         self.handle_repair_announcement(&announcement);
+
+        // Push piece to best available peer (prefer non-providers)
+        if let Some(target_peer) = push_target::select_push_target(
+            &self.local_peer_id,
+            known_providers,
+            &self.peer_scorer,
+        ) {
+            // Read piece data back from store for pushing
+            if let Ok((piece_data, coefficients)) = store.get_piece(&content_id, segment_index, &piece_id) {
+                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                if self.command_tx.send(DataCraftCommand::PushPiece {
+                    peer_id: target_peer,
+                    content_id,
+                    segment_index,
+                    piece_id,
+                    coefficients,
+                    piece_data,
+                    reply_tx,
+                }).is_err() {
+                    warn!("Failed to send PushPiece command for repair {}/seg{}", content_id, segment_index);
+                } else {
+                    info!("Repair: pushing piece to {} for {}/seg{}", target_peer, content_id, segment_index);
+                }
+            }
+        } else {
+            debug!("No push target available for repair {}/seg{}, keeping locally", content_id, segment_index);
+        }
 
         Some(piece_id)
     }

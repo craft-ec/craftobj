@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::DataCraftCommand;
 use crate::peer_scorer::PeerScorer;
+use crate::push_target;
 
 /// Minimum fetches in the demand window to consider content "hot".
 const DEMAND_THRESHOLD: u32 = 10;
@@ -179,6 +180,7 @@ impl ScalingCoordinator {
         &self,
         store: &FsStore,
         content_id: ContentId,
+        known_providers: &[PeerId],
     ) {
         // Collect existing pieces from segment 0 for recombination
         let piece_ids = match store.list_pieces(&content_id, 0) {
@@ -217,9 +219,12 @@ impl ScalingCoordinator {
 
         info!("Scaling: created new piece for {}, selecting push target", content_id);
 
-        // Select highest-rated non-provider node to push to.
-        // Use peer scorer if available, else we can't push (no known peers).
-        let target = self.select_push_target();
+        // Select push target: prefer non-providers, fall back to providers.
+        let target = push_target::select_push_target(
+            &self.local_peer_id,
+            known_providers,
+            &self.peer_scorer,
+        );
         let target_peer = match target {
             Some(p) => p,
             None => {
@@ -245,26 +250,6 @@ impl ScalingCoordinator {
         } else {
             info!("Scaling: pushing piece to {} for {}", target_peer, content_id);
         }
-    }
-
-    /// Select the highest-rated non-provider node for push.
-    /// Returns None if no peer scorer or no peers available.
-    fn select_push_target(&self) -> Option<PeerId> {
-        let scorer = self.peer_scorer.as_ref()?;
-
-        // We need to block briefly to access the scorer.
-        // In real async code this would be awaited; here we try_lock.
-        let scorer_guard = scorer.try_lock().ok()?;
-
-        // Get all known peers, ranked by score (highest first)
-        let all_peers: Vec<PeerId> = scorer_guard.iter().map(|(p, _)| *p).collect();
-        if all_peers.is_empty() {
-            return None;
-        }
-
-        let ranked = scorer_guard.rank_peers(&all_peers);
-        // Pick the highest-ranked peer that isn't us
-        ranked.into_iter().find(|p| *p != self.local_peer_id)
     }
 
     /// Compute random delay for scaling coordination (same as repair).

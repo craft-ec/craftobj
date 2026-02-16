@@ -1061,7 +1061,7 @@ async fn handle_gossipsub_repair(
                                 Err(_) => return,
                             };
                             let mut coord = rc.lock().await;
-                            coord.execute_repair(&store_guard, &manifest, cid, seg);
+                            coord.execute_repair(&store_guard, &manifest, cid, seg, &[]);
                         });
                     }
                 }
@@ -1116,7 +1116,7 @@ async fn handle_gossipsub_scaling(
                             tokio::time::sleep(delay).await;
                             let store_guard = store_clone.lock().await;
                             let coord = coord_clone.lock().await;
-                            coord.execute_scaling(&store_guard, cid);
+                            coord.execute_scaling(&store_guard, cid, &[]);
                         });
                     }
                 }
