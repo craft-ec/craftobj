@@ -183,6 +183,10 @@ pub struct ConnectionPool {
     active_providers: Vec<ProviderId>,
     /// Backup providers not yet in use.
     backup_providers: VecDeque<ProviderId>,
+    /// Known regions per provider (from capability announcements).
+    provider_regions: HashMap<ProviderId, String>,
+    /// Our own region for geographic preference.
+    local_region: Option<String>,
 }
 
 impl ConnectionPool {
@@ -192,6 +196,27 @@ impl ConnectionPool {
         providers: Vec<ProviderId>,
         config: FetchConfig,
     ) -> Self {
+        Self::with_geo_preference(requester, providers, config, HashMap::new(), None)
+    }
+
+    /// Create a new connection pool with geographic preference.
+    /// Providers with matching regions are preferred (sorted to front).
+    pub fn with_geo_preference(
+        requester: Arc<dyn PieceRequester>,
+        mut providers: Vec<ProviderId>,
+        config: FetchConfig,
+        provider_regions: HashMap<ProviderId, String>,
+        local_region: Option<String>,
+    ) -> Self {
+        // Sort providers: matching region first, then others
+        if let Some(ref my_region) = local_region {
+            providers.sort_by(|a, b| {
+                let a_match = provider_regions.get(a).map(|r| r == my_region).unwrap_or(false);
+                let b_match = provider_regions.get(b).map(|r| r == my_region).unwrap_or(false);
+                b_match.cmp(&a_match) // true (matching) sorts first
+            });
+        }
+
         let max = config.max_connections.min(providers.len());
         let (active, backup): (Vec<_>, Vec<_>) = providers
             .into_iter()
@@ -212,6 +237,8 @@ impl ConnectionPool {
             provider_stats,
             active_providers,
             backup_providers,
+            provider_regions,
+            local_region,
         }
     }
 

@@ -404,6 +404,14 @@ pub async fn run_daemon_with_config(
     scaling_coord.set_merkle_tree(merkle_tree.clone());
     let scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>> = Arc::new(Mutex::new(scaling_coord));
 
+    // Derive ed25519 signing key for capability announcement signing
+    let swarm_signing_key = keypair.clone().try_into_ed25519().ok().map(|ed25519_kp| {
+        let secret_bytes = ed25519_kp.secret();
+        ed25519_dalek::SigningKey::from_bytes(
+            secret_bytes.as_ref().try_into().expect("ed25519 secret is 32 bytes"),
+        )
+    });
+
     // Aggregator config — configurable epoch, default 10 min
     let aggregator_config = crate::aggregator::AggregatorConfig {
         epoch_duration: std::time::Duration::from_secs(
@@ -422,7 +430,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -438,7 +446,7 @@ pub async fn run_daemon_with_config(
             info!("Challenger loop ended");
         }
         _ = crate::reannounce::content_maintenance_loop(
-            content_tracker,
+            content_tracker.clone(),
             command_tx_for_maintenance.clone(),
             client.clone(),
             daemon_config.reannounce_interval_secs,
@@ -447,7 +455,7 @@ pub async fn run_daemon_with_config(
         ) => {
             info!("Content maintenance loop ended");
         }
-        _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone()) => {
+        _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone(), content_tracker.clone()) => {
             info!("Scaling maintenance loop ended");
         }
         _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone()) => {
@@ -467,6 +475,7 @@ async fn scaling_maintenance_loop(
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     local_peer_id: libp2p::PeerId,
     peer_scorer: Arc<Mutex<crate::peer_scorer::PeerScorer>>,
+    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
     use std::time::Duration;
     // Initial delay
@@ -478,13 +487,11 @@ async fn scaling_maintenance_loop(
         let mut tracker = demand_tracker.lock().await;
         let hot_cids = tracker.check_demand();
         for (cid, demand_level) in hot_cids {
-            // Check if there are non-provider storage peers who could accept new pieces.
-            // We pass an empty provider list since content_tracker doesn't track per-CID
-            // provider PeerIds yet — has_non_provider_targets checks if ANY storage peers
-            // exist beyond the (empty) provider set, which is a safe over-approximation.
+            // Get known providers for this CID to exclude from push targets
+            let known_providers = content_tracker.lock().await.get_providers(&cid);
             let has_targets = crate::push_target::has_non_provider_targets(
                 &local_peer_id,
-                &[], // TODO: pass actual provider PeerIds when content_tracker tracks them
+                &known_providers,
                 &Some(peer_scorer.clone()),
             );
             if tracker.should_broadcast_demand(&cid, has_targets) {
@@ -584,6 +591,9 @@ async fn drive_swarm(
     scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
+    region: Option<String>,
+    signing_key: Option<ed25519_dalek::SigningKey>,
+    receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -665,7 +675,7 @@ async fn drive_swarm(
                             });
                         }
                         handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
-                        handle_gossipsub_storage_receipt(&event, &event_tx).await;
+                        handle_gossipsub_storage_receipt(&event, &event_tx, &receipt_store).await;
                         handle_gossipsub_repair(&event, &repair_coordinator, &store_for_repair, &event_tx).await;
                         handle_gossipsub_scaling(&event, &scaling_coordinator, &store_for_repair, max_storage_bytes).await;
                         // Pass events to our protocol handler
@@ -693,7 +703,7 @@ async fn drive_swarm(
                             });
                         }
                         other => {
-                            handle_command(swarm, &protocol, other, pending_requests.clone(), &event_tx).await;
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &event_tx, &region, &signing_key).await;
                         }
                     }
                 }
@@ -709,6 +719,8 @@ async fn handle_command(
     command: DataCraftCommand,
     pending_requests: PendingRequests,
     event_tx: &EventSender,
+    region: &Option<String>,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
 ) {
     match command {
         DataCraftCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
@@ -773,16 +785,23 @@ async fn handle_command(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let announcement = CapabilityAnnouncement {
+            let mut announcement = CapabilityAnnouncement {
                 peer_id: local_peer_id.to_bytes(),
                 capabilities,
                 timestamp,
-                signature: vec![], // TODO: sign with node keypair
+                signature: vec![],
                 storage_committed_bytes,
                 storage_used_bytes,
                 storage_root,
-                region: None, // TODO: pass region from config
+                region: region.clone(),
             };
+            // Sign the announcement if we have a signing key
+            if let Some(key) = signing_key {
+                use ed25519_dalek::Signer;
+                let data = announcement.signable_data();
+                let sig: ed25519_dalek::Signature = key.sign(&data);
+                announcement.signature = sig.to_bytes().to_vec();
+            }
             match serde_json::to_vec(&announcement) {
                 Ok(data) => {
                     if let Err(e) = swarm
@@ -1012,6 +1031,7 @@ async fn handle_gossipsub_capability(
                                 ann.timestamp,
                                 ann.storage_committed_bytes,
                                 ann.storage_used_bytes,
+                                ann.region,
                             );
                         }
                         return is_new && has_storage;
@@ -1072,6 +1092,7 @@ async fn handle_gossipsub_removal(
 async fn handle_gossipsub_storage_receipt(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     event_tx: &EventSender,
+    receipt_store: &Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -1093,7 +1114,11 @@ async fn handle_gossipsub_storage_receipt(
                         content_id: receipt.content_id.to_hex(),
                         storage_node: hex::encode(receipt.storage_node),
                     });
-                    // TODO: forward to aggregator service channel when running as aggregator node
+                    // Forward to receipt store for aggregator collection
+                    let mut store = receipt_store.lock().await;
+                    if let Err(e) = store.add_storage(receipt) {
+                        debug!("Failed to store gossipsub receipt: {}", e);
+                    }
                 }
                 Err(e) => {
                     debug!("Failed to parse StorageReceipt from gossipsub: {}", e);
@@ -1279,6 +1304,14 @@ async fn handle_protocol_events(
                     content_id: content_id.to_hex(),
                     count: providers.len(),
                 });
+
+                // Track providers in content tracker for push target selection
+                {
+                    let mut tracker = content_tracker.lock().await;
+                    for &peer in &providers {
+                        tracker.add_provider(&content_id, peer);
+                    }
+                }
                 
                 // Find and respond to the waiting request
                 let mut pending = pending_requests.lock().await;

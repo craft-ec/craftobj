@@ -3,11 +3,12 @@
 //! Tracks the lifecycle stage of content: stored → announced → distributing → distributed.
 //! Uses piece counts per segment instead of shard counts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use datacraft_core::{ContentManifest, ContentId};
 use datacraft_store::FsStore;
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -80,6 +81,9 @@ pub struct ContentTracker {
     states: HashMap<ContentId, ContentState>,
     path: PathBuf,
     reannounce_threshold_secs: u64,
+    /// In-memory provider tracking per CID (from DHT discovery / gossipsub).
+    /// Not persisted — rebuilt at runtime from network events.
+    providers: HashMap<ContentId, HashSet<PeerId>>,
 }
 
 impl ContentTracker {
@@ -91,7 +95,7 @@ impl ContentTracker {
         let path = data_dir.join("content_tracker.json");
         let states = Self::load_from(&path).unwrap_or_default();
         debug!("ContentTracker loaded {} entries from {:?}", states.len(), path);
-        Self { states, path, reannounce_threshold_secs }
+        Self { states, path, reannounce_threshold_secs, providers: HashMap::new() }
     }
 
     /// Track newly published content.
@@ -200,6 +204,18 @@ impl ContentTracker {
             state.last_checked = Some(now_secs());
             self.save();
         }
+    }
+
+    /// Record a provider PeerId for a CID (from DHT discovery or gossipsub).
+    pub fn add_provider(&mut self, content_id: &ContentId, peer: PeerId) {
+        self.providers.entry(*content_id).or_default().insert(peer);
+    }
+
+    /// Get known provider PeerIds for a CID.
+    pub fn get_providers(&self, content_id: &ContentId) -> Vec<PeerId> {
+        self.providers.get(content_id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     pub fn mark_degraded(&mut self, content_id: &ContentId) {

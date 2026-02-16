@@ -58,6 +58,8 @@ pub struct PeerScore {
     pub storage_committed_bytes: u64,
     /// Storage currently used by this peer (from capability announcement).
     pub storage_used_bytes: u64,
+    /// Geographic region from capability announcement (e.g. "us-east", "eu-west").
+    pub region: Option<String>,
 }
 
 impl PeerScore {
@@ -72,6 +74,7 @@ impl PeerScore {
             avg_latency_ms: 0.0,
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
+            region: None,
         }
     }
 
@@ -171,7 +174,7 @@ impl PeerScorer {
         capabilities: Vec<DataCraftCapability>,
         _timestamp: u64,
     ) {
-        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0);
+        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None);
     }
 
     /// Update capabilities and storage info from a gossipsub announcement.
@@ -182,6 +185,7 @@ impl PeerScorer {
         _timestamp: u64,
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
+        region: Option<String>,
     ) {
         let now = Instant::now();
         let entry = self.scores.entry(*peer).or_insert_with(|| {
@@ -193,6 +197,12 @@ impl PeerScorer {
         entry.last_announcement = now;
         entry.storage_committed_bytes = storage_committed_bytes;
         entry.storage_used_bytes = storage_used_bytes;
+        entry.region = region;
+    }
+
+    /// Get the region for a peer, if known.
+    pub fn get_region(&self, peer: &PeerId) -> Option<&str> {
+        self.scores.get(peer).and_then(|s| s.region.as_deref())
     }
 
     /// Get network-wide storage summary from all known peers.
@@ -406,6 +416,7 @@ mod tests {
                 avg_latency_ms: 0.0,
                 storage_committed_bytes: 0,
                 storage_used_bytes: 0,
+                region: None,
             },
         );
 
