@@ -1370,31 +1370,34 @@ impl DataCraftHandler {
     // -----------------------------------------------------------------------
 
     /// Shared helper: compute health info for a single CID.
+    /// Returns (min_rank, health_ratio, disk_usage).
+    /// Health ratio = min per-segment ratio (pieces/k_for_segment), so the last
+    /// segment (which has fewer source pieces) doesn't drag down the score.
     async fn compute_cid_health(&self, cid: &datacraft_core::ContentId) -> Result<(usize, f64, u64), String> {
         let client = self.client.lock().await;
         let store = client.store();
 
+        let manifest = store.get_manifest(cid).ok();
         let segments = store.list_segments(cid).unwrap_or_default();
         let mut min_rank: Option<usize> = None;
+        let mut min_ratio: Option<f64> = None;
         for &seg in &segments {
-            // Rank = local piece count. This is a local approximation — true network rank
-            // requires PDP coefficient vector collection from remote providers.
             let pieces = store.list_pieces(cid, seg).unwrap_or_default();
             let rank = pieces.len();
             min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+            // Per-segment k for correct last-segment health
+            let seg_k = manifest.as_ref()
+                .map(|m| m.k_for_segment(seg as usize))
+                .unwrap_or(0);
+            if seg_k > 0 {
+                let ratio = rank as f64 / seg_k as f64;
+                min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+            }
         }
         let min_rank = min_rank.unwrap_or(0);
+        let health_ratio = min_ratio.unwrap_or(0.0);
         let disk_usage = store.cid_disk_usage(cid);
-        drop(client);
 
-        let k = if let Some(ref tracker) = self.content_tracker {
-            let t = tracker.lock().await;
-            t.get(cid).map(|s| s.k).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let health_ratio = if k > 0 { min_rank as f64 / k as f64 } else { 0.0 };
         Ok((min_rank, health_ratio, disk_usage))
     }
 
@@ -1410,13 +1413,17 @@ impl DataCraftHandler {
         let segments_list = store.list_segments(&cid).unwrap_or_default();
         let mut segments_json = Vec::new();
         let mut min_rank: Option<usize> = None;
+        let mut min_ratio: Option<f64> = None;
 
         for &seg in &segments_list {
-            // Rank = local piece count (local approximation — true network rank requires
-            // PDP coefficient vector collection from all providers).
             let pieces = store.list_pieces(&cid, seg).unwrap_or_default();
             let rank = pieces.len();
             min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+            let seg_k = manifest.k_for_segment(seg as usize);
+            if seg_k > 0 {
+                let ratio = rank as f64 / seg_k as f64;
+                min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+            }
             segments_json.push(serde_json::json!({
                 "index": seg,
                 "local_pieces": rank,
@@ -1448,7 +1455,7 @@ impl DataCraftHandler {
             (String::new(), 0, String::new(), String::new(), 0)
         };
 
-        let health_ratio = if k > 0 { min_rank_val as f64 / k as f64 } else { 0.0 };
+        let health_ratio = min_ratio.unwrap_or(0.0);
 
         // Build provider list with peer scorer info
         let mut providers_json = Vec::new();
@@ -1499,17 +1506,27 @@ impl DataCraftHandler {
         let items = client.list().map_err(|e| e.to_string())?;
 
         // Compute health inline while we hold the client lock.
-        let mut cid_health: Vec<(datacraft_core::ContentId, usize, u64)> = Vec::new();
+        // Uses per-segment k from manifest so last segment doesn't drag down health.
+        let mut cid_health: Vec<(datacraft_core::ContentId, usize, f64, u64)> = Vec::new();
         for item in &items {
+            let manifest = client.store().get_manifest(&item.content_id).ok();
             let segments = client.store().list_segments(&item.content_id).unwrap_or_default();
             let mut min_rank: Option<usize> = None;
+            let mut min_ratio: Option<f64> = None;
             for &seg in &segments {
                 let pieces = client.store().list_pieces(&item.content_id, seg).unwrap_or_default();
                 let rank = pieces.len();
                 min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+                let seg_k = manifest.as_ref()
+                    .map(|m| m.k_for_segment(seg as usize))
+                    .unwrap_or(0);
+                if seg_k > 0 {
+                    let ratio = rank as f64 / seg_k as f64;
+                    min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+                }
             }
             let disk_usage = client.store().cid_disk_usage(&item.content_id);
-            cid_health.push((item.content_id, min_rank.unwrap_or(0), disk_usage));
+            cid_health.push((item.content_id, min_rank.unwrap_or(0), min_ratio.unwrap_or(0.0), disk_usage));
         }
         drop(client);
 
@@ -1523,12 +1540,7 @@ impl DataCraftHandler {
 
         let mut result = Vec::new();
         for (i, item) in items.iter().enumerate() {
-            let (_, min_rank, disk_usage) = &cid_health[i];
-            let k = tracker_data.as_ref()
-                .and_then(|td| td[i].as_ref())
-                .map(|s| s.k)
-                .unwrap_or(0);
-            let health_ratio = if k > 0 { *min_rank as f64 / k as f64 } else { 0.0 };
+            let (_, min_rank, health_ratio, disk_usage) = &cid_health[i];
 
             let mut obj = serde_json::json!({
                 "content_id": item.content_id.to_hex(),
@@ -1593,22 +1605,30 @@ impl DataCraftHandler {
             let client = self.client.lock().await;
             total_content = states.len();
             for state in &states {
+                let manifest = client.store().get_manifest(&state.content_id).ok();
                 let segments = client.store().list_segments(&state.content_id).unwrap_or_default();
-                let mut min_rank: Option<usize> = None;
+                let mut min_ratio: Option<f64> = None;
+                let mut all_reconstructable = true;
                 for &seg in &segments {
                     let pieces = client.store().list_pieces(&state.content_id, seg).unwrap_or_default();
                     let rank = pieces.len();
-                    min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+                    let seg_k = manifest.as_ref()
+                        .map(|m| m.k_for_segment(seg as usize))
+                        .unwrap_or(state.k);
+                    if seg_k > 0 {
+                        let ratio = rank as f64 / seg_k as f64;
+                        min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+                        if rank < seg_k { all_reconstructable = false; }
+                    }
                 }
-                let min_rank_val = min_rank.unwrap_or(0);
                 let disk_usage = client.store().cid_disk_usage(&state.content_id);
                 total_stored_bytes += disk_usage;
-                let health_ratio = if state.k > 0 { min_rank_val as f64 / state.k as f64 } else { 0.0 };
+                let health_ratio = min_ratio.unwrap_or(0.0);
                 health_sum += health_ratio;
-                if state.k > 0 && min_rank_val < state.k {
-                    degraded += 1;
-                } else {
+                if all_reconstructable {
                     healthy += 1;
+                } else {
+                    degraded += 1;
                 }
             }
         }
