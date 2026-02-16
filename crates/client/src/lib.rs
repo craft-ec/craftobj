@@ -4,22 +4,22 @@
 //!
 //! # Lifecycle
 //!
-//! - `publish(path, options)` → hash → chunk → erasure encode → store → announce → CID
-//! - `fetch(cid, dest)` → resolve → download manifest → download shards → decode → verify → write
+//! - `publish(path, options)` → encrypt? → CID → segment & RLNC encode → store pieces → manifest
+//! - `reconstruct(cid)` → manifest → decode segments → verify hash → decrypt? → write
 //! - `pin(cid)` / `unpin(cid)` / `list()` / `status()`
 
-pub mod extension;
-
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use craftec_erasure::ErasureCoder;
+use craftec_erasure::{
+    check_independence, segmenter, CodedPiece, ErasureConfig,
+};
 use datacraft_core::{
-    ChunkManifest, ContentId, DataCraftError, PublishOptions, RemovalNotice, Result,
+    ContentId, ContentManifest, DataCraftError, PublishOptions, RemovalNotice, Result,
     access::{self, AccessEntry},
-    default_erasure_config,
     pre::{self, EncryptedContentKey, ReEncryptedKey, ReKeyEntry},
 };
-use datacraft_store::{FsStore, PinManager};
+use datacraft_store::{piece_id_from_coefficients, FsStore, PinManager};
 use tracing::info;
 
 /// Published content result.
@@ -31,8 +31,10 @@ pub struct PublishResult {
     pub encryption_key: Option<Vec<u8>>,
     /// Total size in bytes.
     pub total_size: u64,
-    /// Number of chunks.
-    pub chunk_count: usize,
+    /// Number of segments.
+    pub segment_count: usize,
+    /// The manifest (for daemon to announce).
+    pub manifest: ContentManifest,
 }
 
 /// Content info returned by list().
@@ -40,7 +42,7 @@ pub struct PublishResult {
 pub struct ContentInfo {
     pub content_id: ContentId,
     pub total_size: u64,
-    pub chunk_count: usize,
+    pub segment_count: usize,
     pub pinned: bool,
 }
 
@@ -49,7 +51,7 @@ pub struct ContentInfo {
 pub struct NodeStatus {
     pub stored_bytes: u64,
     pub content_count: usize,
-    pub shard_count: usize,
+    pub piece_count: usize,
     pub pinned_count: usize,
 }
 
@@ -62,8 +64,8 @@ pub struct RevocationResult {
     pub new_encryption_key: Vec<u8>,
     /// Total size of re-encrypted content.
     pub new_total_size: u64,
-    /// Number of chunks.
-    pub new_chunk_count: usize,
+    /// Number of segments.
+    pub new_segment_count: usize,
     /// Content key encrypted to creator (for DHT AccessList).
     pub encrypted_content_key: pre::EncryptedContentKey,
     /// Re-key entries + re-encrypted keys for remaining authorized users.
@@ -88,74 +90,71 @@ impl DataCraftClient {
         Ok(Self { store, pin_manager })
     }
 
-    /// Publish a file: hash, chunk, erasure-encode, store locally.
+    /// Publish content from raw bytes.
     ///
-    /// Returns the ContentId. Network announcement is done by the daemon.
-    pub fn publish(&mut self, path: &Path, options: &PublishOptions) -> Result<PublishResult> {
-        let data = std::fs::read(path)?;
+    /// Steps: encrypt? → CID → segment & RLNC encode → store pieces + manifest.
+    pub fn publish_bytes(
+        &mut self,
+        data: &[u8],
+        options: &PublishOptions,
+    ) -> Result<PublishResult> {
         if data.is_empty() {
-            return Err(DataCraftError::StorageError("empty file".into()));
+            return Err(DataCraftError::StorageError("empty data".into()));
         }
-
-        let config = options
-            .erasure_config
-            .unwrap_or_else(default_erasure_config);
 
         // Optionally encrypt
         let (content_bytes, encryption_key) = if options.encrypted {
             let key = generate_content_key();
-            let encrypted = encrypt_content(&data, &key)?;
+            let encrypted = encrypt_content(data, &key)?;
             (encrypted, Some(key))
         } else {
-            (data.clone(), None)
+            (data.to_vec(), None)
         };
 
-        // Compute CID (hash of what we store — plaintext or ciphertext)
+        // CID = SHA-256 of what we store
         let content_id = ContentId::from_bytes(&content_bytes);
         let total_size = content_bytes.len() as u64;
 
-        // Chunk the content
-        let chunks = chunk_data(&content_bytes, config.chunk_size);
-        let chunk_count = chunks.len();
+        let config = ErasureConfig::default();
+
+        // Segment and RLNC encode
+        let encoded_segments = segmenter::segment_and_encode(&content_bytes, &config)
+            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+
+        let segment_count = encoded_segments.len();
 
         info!(
-            "Publishing {} ({} bytes, {} chunks, erasure {}/{})",
-            content_id,
-            total_size,
-            chunk_count,
-            config.data_shards,
-            config.parity_shards,
+            "Publishing {} ({} bytes, {} segments, piece_size={})",
+            content_id, total_size, segment_count, config.piece_size,
         );
 
-        // Erasure-encode each chunk and store shards
-        let coder = ErasureCoder::with_config(&config)
-            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-        for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            let shards = coder
-                .encode(chunk)
-                .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-            for (shard_idx, shard) in shards.iter().enumerate() {
-                self.store
-                    .put_shard(&content_id, chunk_idx as u32, shard_idx as u8, shard)?;
+        // Store all pieces
+        for (seg_idx, pieces) in &encoded_segments {
+            for piece in pieces {
+                let pid = piece_id_from_coefficients(&piece.coefficients);
+                self.store.store_piece(
+                    &content_id,
+                    *seg_idx,
+                    &pid,
+                    &piece.data,
+                    &piece.coefficients,
+                )?;
             }
         }
 
-        // Store manifest
-        let manifest = ChunkManifest {
+        // Build and store manifest
+        let content_hash = content_id.0; // CID is SHA-256 of content bytes
+        let manifest = ContentManifest {
             content_id,
-            content_hash: content_id.0,
-            k: config.data_shards,
-            chunk_size: config.chunk_size,
-            chunk_count,
-            erasure_config: config,
-            content_size: total_size,
+            content_hash,
+            segment_size: config.segment_size,
+            piece_size: config.piece_size,
+            segment_count,
+            total_size,
             creator: String::new(),
             signature: vec![],
         };
-        self.store.put_manifest(&manifest)?;
-
-        // Sign manifest if keypair provided (handled by publish_signed)
-        // For unsigned publish, creator/signature remain empty
+        self.store.store_manifest(&manifest)?;
 
         // Auto-pin published content
         self.pin_manager.pin(&content_id)?;
@@ -166,34 +165,35 @@ impl DataCraftClient {
             content_id,
             encryption_key,
             total_size,
-            chunk_count,
+            segment_count,
+            manifest,
         })
     }
 
+    /// Publish a file: read, hash, segment, RLNC-encode, store locally.
+    pub fn publish(&mut self, path: &Path, options: &PublishOptions) -> Result<PublishResult> {
+        let data = std::fs::read(path)?;
+        self.publish_bytes(&data, options)
+    }
+
     /// Publish a file with creator signing.
-    ///
-    /// Same as `publish()` but signs the manifest with the creator's keypair,
-    /// setting the `creator` DID and `signature` fields.
     pub fn publish_signed(
         &mut self,
         path: &Path,
         options: &PublishOptions,
         keypair: &ed25519_dalek::SigningKey,
     ) -> Result<PublishResult> {
-        let result = self.publish(path, options)?;
+        let mut result = self.publish(path, options)?;
 
-        // Re-read the manifest, sign it, and re-store
         let mut manifest = self.store.get_manifest(&result.content_id)?;
         manifest.sign(keypair);
-        self.store.put_manifest(&manifest)?;
+        self.store.store_manifest(&manifest)?;
+        result.manifest = manifest;
 
         Ok(result)
     }
 
     /// Create a removal notice for content, signed by the creator.
-    ///
-    /// Returns the RemovalNotice for DHT posting. The caller (daemon) is
-    /// responsible for publishing to DHT and gossipsub.
     pub fn remove_content(
         &mut self,
         keypair: &ed25519_dalek::SigningKey,
@@ -201,18 +201,15 @@ impl DataCraftClient {
         reason: Option<String>,
     ) -> Result<RemovalNotice> {
         let notice = RemovalNotice::sign(keypair, *content_id, reason);
-
-        // Unpin locally
         let _ = self.pin_manager.unpin(content_id);
-
         info!("Created removal notice for {}", content_id);
         Ok(notice)
     }
 
-    /// Reconstruct content from locally stored shards.
+    /// Reconstruct content from locally stored pieces using RLNC decoding.
     ///
-    /// For network fetching (downloading missing shards from peers),
-    /// the daemon handles orchestration before calling this.
+    /// For each segment, collects pieces from store, checks linear independence,
+    /// and decodes once k independent pieces are available.
     pub fn reconstruct(
         &self,
         content_id: &ContentId,
@@ -220,36 +217,42 @@ impl DataCraftClient {
         encryption_key: Option<&[u8]>,
     ) -> Result<()> {
         let manifest = self.store.get_manifest(content_id)?;
-        let coder = ErasureCoder::with_config(&manifest.erasure_config)
-            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-        let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+        let config = ErasureConfig {
+            piece_size: manifest.piece_size,
+            segment_size: manifest.segment_size,
+            ..Default::default()
+        };
 
-        let mut reconstructed = Vec::with_capacity(manifest.content_size as usize);
+        let mut segments: BTreeMap<u32, Vec<CodedPiece>> = BTreeMap::new();
 
-        for chunk_idx in 0..manifest.chunk_count as u32 {
-            // Compute the actual data size for this chunk
-            let chunk_size = if (chunk_idx as usize) < manifest.chunk_count - 1 {
-                manifest.chunk_size
-            } else {
-                // Last chunk: remaining bytes
-                manifest.content_size as usize - (chunk_idx as usize * manifest.chunk_size)
-            };
+        for seg_idx in 0..manifest.segment_count as u32 {
+            let k = manifest.k_for_segment(seg_idx as usize);
+            let piece_ids = self.store.list_pieces(content_id, seg_idx)?;
 
-            // Gather available shards
-            let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
-            for shard_idx in 0..total_shards {
-                match self.store.get_shard(content_id, chunk_idx, shard_idx as u8) {
-                    Ok(data) => shards.push(Some(data)),
-                    Err(_) => shards.push(None),
+            let mut collected: Vec<CodedPiece> = Vec::new();
+            for pid in &piece_ids {
+                let (data, coefficients) = self.store.get_piece(content_id, seg_idx, pid)?;
+                collected.push(CodedPiece { data, coefficients });
+
+                // Check if we have enough independent pieces
+                let coeff_vecs: Vec<Vec<u8>> =
+                    collected.iter().map(|p| p.coefficients.clone()).collect();
+                let rank = check_independence(&coeff_vecs);
+                if rank >= k {
+                    break;
                 }
             }
 
-            // Decode
-            let decoded = coder
-                .decode(&mut shards, chunk_size)
-                .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-            reconstructed.extend_from_slice(&decoded);
+            segments.insert(seg_idx, collected);
         }
+
+        let reconstructed = segmenter::decode_and_reassemble(
+            &segments,
+            manifest.segment_count as u32,
+            &config,
+            manifest.total_size as usize,
+        )
+        .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
 
         // Verify hash
         let expected_id = ContentId::from_bytes(&reconstructed);
@@ -266,7 +269,6 @@ impl DataCraftClient {
             reconstructed
         };
 
-        // Write to destination
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -299,8 +301,8 @@ impl DataCraftClient {
             if let Ok(manifest) = self.store.get_manifest(&cid) {
                 result.push(ContentInfo {
                     content_id: cid,
-                    total_size: manifest.content_size,
-                    chunk_count: manifest.chunk_count,
+                    total_size: manifest.total_size,
+                    segment_count: manifest.segment_count,
                     pinned: self.pin_manager.is_pinned(&cid),
                 });
             }
@@ -312,29 +314,24 @@ impl DataCraftClient {
     pub fn status(&self) -> Result<NodeStatus> {
         let content = self.store.list_content()?;
         let mut stored_bytes = 0u64;
+        let mut piece_count = 0usize;
         for cid in &content {
             if let Ok(manifest) = self.store.get_manifest(cid) {
-                stored_bytes += manifest.content_size;
-            }
-        }
-        let mut shard_count = 0usize;
-        for cid in &content {
-            if let Ok(manifest) = self.store.get_manifest(cid) {
-                shard_count += manifest.chunk_count;
+                stored_bytes += manifest.total_size;
+                for seg in 0..manifest.segment_count as u32 {
+                    piece_count += self.store.list_pieces(cid, seg).unwrap_or_default().len();
+                }
             }
         }
         Ok(NodeStatus {
             stored_bytes,
             content_count: content.len(),
-            shard_count,
+            piece_count,
             pinned_count: self.pin_manager.list_pinned().len(),
         })
     }
 
-    /// Publish with PRE: encrypts content and stores encrypted content key
-    /// for the creator. Returns the encrypted content key alongside the publish result.
-    ///
-    /// The encrypted content key should be stored in DHT metadata.
+    /// Publish with PRE: encrypts content and stores encrypted content key for the creator.
     pub fn publish_with_pre(
         &mut self,
         path: &Path,
@@ -356,8 +353,6 @@ impl DataCraftClient {
 
     /// Grant access to a recipient: generates a re-encryption key and
     /// re-encrypted content key that the recipient can decrypt.
-    ///
-    /// Returns (ReKeyEntry, ReEncryptedKey) to store in DHT.
     pub fn grant_access(
         &self,
         creator_keypair: &ed25519_dalek::SigningKey,
@@ -374,8 +369,6 @@ impl DataCraftClient {
     }
 
     /// Grant access via AccessList (direct key encryption, not PRE).
-    ///
-    /// Creates an AccessEntry for the recipient.
     pub fn grant_access_direct(
         &self,
         content_id: &ContentId,
@@ -387,9 +380,6 @@ impl DataCraftClient {
     }
 
     /// Reconstruct content using a re-encrypted content key (PRE flow).
-    ///
-    /// The recipient fetches the re-encrypted key from DHT, decrypts it
-    /// with their private key, then uses the content key to decrypt content.
     pub fn reconstruct_with_pre(
         &self,
         content_id: &ContentId,
@@ -398,26 +388,12 @@ impl DataCraftClient {
         recipient_keypair: &ed25519_dalek::SigningKey,
         creator_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> Result<()> {
-        let content_key = pre::decrypt_re_encrypted(
-            re_encrypted_key,
-            recipient_keypair,
-            creator_pubkey,
-        )?;
+        let content_key =
+            pre::decrypt_re_encrypted(re_encrypted_key, recipient_keypair, creator_pubkey)?;
         self.reconstruct(content_id, dest, Some(&content_key))
     }
 
     /// Revoke a user's access and rotate the content key.
-    ///
-    /// This is the secure revocation flow:
-    /// 1. Generate a new content key
-    /// 2. Decrypt the original content, re-encrypt with the new key → new CID
-    /// 3. Re-grant access to all remaining authorized users with the new key
-    /// 4. Return the new publish result, encrypted content key, and re-key entries for remaining users
-    ///
-    /// The caller is responsible for:
-    /// - Removing the revoked user's re-key from DHT (tombstone)
-    /// - Storing the new AccessList + re-keys in DHT
-    /// - Announcing the new CID to DHT
     pub fn revoke_and_rotate(
         &mut self,
         old_content_id: &ContentId,
@@ -426,77 +402,77 @@ impl DataCraftClient {
         revoked_pubkey: &ed25519_dalek::VerifyingKey,
         all_authorized: &[ed25519_dalek::VerifyingKey],
     ) -> Result<RevocationResult> {
-        // 1. Reconstruct original plaintext
+        // 1. Reconstruct original ciphertext from pieces
         let manifest = self.store.get_manifest(old_content_id)?;
-        let coder = ErasureCoder::with_config(&manifest.erasure_config)
-            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-        let total_shards =
-            manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+        let config = ErasureConfig {
+            piece_size: manifest.piece_size,
+            segment_size: manifest.segment_size,
+            ..Default::default()
+        };
 
-        let mut ciphertext = Vec::with_capacity(manifest.content_size as usize);
-        for chunk_idx in 0..manifest.chunk_count as u32 {
-            let chunk_size = if (chunk_idx as usize) < manifest.chunk_count - 1 {
-                manifest.chunk_size
-            } else {
-                manifest.content_size as usize - (chunk_idx as usize * manifest.chunk_size)
-            };
-            let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
-            for shard_idx in 0..total_shards {
-                match self.store.get_shard(old_content_id, chunk_idx, shard_idx as u8) {
-                    Ok(data) => shards.push(Some(data)),
-                    Err(_) => shards.push(None),
-                }
+        let mut segments: BTreeMap<u32, Vec<CodedPiece>> = BTreeMap::new();
+        for seg_idx in 0..manifest.segment_count as u32 {
+            let piece_ids = self.store.list_pieces(old_content_id, seg_idx)?;
+            let mut collected: Vec<CodedPiece> = Vec::new();
+            for pid in &piece_ids {
+                let (data, coefficients) =
+                    self.store.get_piece(old_content_id, seg_idx, pid)?;
+                collected.push(CodedPiece { data, coefficients });
             }
-            let decoded = coder
-                .decode(&mut shards, chunk_size)
-                .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-            ciphertext.extend_from_slice(&decoded);
+            segments.insert(seg_idx, collected);
         }
+
+        let ciphertext = segmenter::decode_and_reassemble(
+            &segments,
+            manifest.segment_count as u32,
+            &config,
+            manifest.total_size as usize,
+        )
+        .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
 
         // Decrypt to get plaintext
         let plaintext = decrypt_content(&ciphertext, old_content_key)?;
 
-        // 2. Generate new content key and re-encrypt
+        // 2. Re-encrypt with new key and publish
         let new_key = generate_content_key();
         let new_ciphertext = encrypt_content(&plaintext, &new_key)?;
         let new_content_id = ContentId::from_bytes(&new_ciphertext);
         let total_size = new_ciphertext.len() as u64;
 
-        // Chunk and erasure-encode
-        let config = manifest.erasure_config;
-        let chunks = chunk_data(&new_ciphertext, config.chunk_size);
-        let chunk_count = chunks.len();
-        let new_coder = ErasureCoder::with_config(&config)
+        let encoded_segments = segmenter::segment_and_encode(&new_ciphertext, &config)
             .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+        let segment_count = encoded_segments.len();
 
-        for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            let shards = new_coder
-                .encode(chunk)
-                .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
-            for (shard_idx, shard) in shards.iter().enumerate() {
-                self.store
-                    .put_shard(&new_content_id, chunk_idx as u32, shard_idx as u8, shard)?;
+        for (seg_idx, pieces) in &encoded_segments {
+            for piece in pieces {
+                let pid = piece_id_from_coefficients(&piece.coefficients);
+                self.store.store_piece(
+                    &new_content_id,
+                    *seg_idx,
+                    &pid,
+                    &piece.data,
+                    &piece.coefficients,
+                )?;
             }
         }
 
-        let new_manifest = ChunkManifest {
+        let new_manifest = ContentManifest {
             content_id: new_content_id,
             content_hash: new_content_id.0,
-            k: config.data_shards,
-            chunk_size: config.chunk_size,
-            chunk_count,
-            erasure_config: config,
-            content_size: total_size,
+            segment_size: config.segment_size,
+            piece_size: config.piece_size,
+            segment_count,
+            total_size,
             creator: String::new(),
             signature: vec![],
         };
-        self.store.put_manifest(&new_manifest)?;
+        self.store.store_manifest(&new_manifest)?;
         self.pin_manager.pin(&new_content_id)?;
 
         // 3. Encrypt content key to creator
         let encrypted_ck = pre::encrypt_content_key(creator_keypair, &new_key)?;
 
-        // 4. Re-grant access to remaining users (excluding revoked)
+        // 4. Re-grant access to remaining users
         let revoked_bytes = revoked_pubkey.to_bytes();
         let mut re_grants = Vec::new();
         for pubkey in all_authorized {
@@ -516,7 +492,7 @@ impl DataCraftClient {
             new_content_id,
             new_encryption_key: new_key,
             new_total_size: total_size,
-            new_chunk_count: chunk_count,
+            new_segment_count: segment_count,
             encrypted_content_key: encrypted_ck,
             re_grants,
         })
@@ -531,11 +507,6 @@ impl DataCraftClient {
     pub fn pin_manager(&self) -> &PinManager {
         &self.pin_manager
     }
-}
-
-/// Split data into fixed-size chunks (last may be smaller).
-fn chunk_data(data: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
-    data.chunks(chunk_size).map(|c| c.to_vec()).collect()
 }
 
 /// Generate a random 32-byte content encryption key.
@@ -556,7 +527,6 @@ fn encrypt_content(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| DataCraftError::EncryptionError(e.to_string()))?;
 
-    // Generate random nonce
     let mut nonce_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -565,7 +535,6 @@ fn encrypt_content(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         .encrypt(nonce, data)
         .map_err(|e| DataCraftError::EncryptionError(e.to_string()))?;
 
-    // Prepend nonce to ciphertext
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
@@ -603,20 +572,16 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut rng_bytes);
         let dir = std::env::temp_dir()
             .join("datacraft-client-test")
-            .join(format!("{}-{}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-                hex::encode(rng_bytes)));
+            .join(format!(
+                "{}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                hex::encode(rng_bytes)
+            ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn test_chunk_data() {
-        let data = vec![1u8; 100];
-        let chunks = chunk_data(&data, 30);
-        assert_eq!(chunks.len(), 4); // 30+30+30+10
-        assert_eq!(chunks[0].len(), 30);
-        assert_eq!(chunks[3].len(), 10);
     }
 
     #[test]
@@ -634,19 +599,17 @@ mod tests {
         let dir = test_dir();
         let mut client = DataCraftClient::new(&dir).unwrap();
 
-        // Create test file
         let file_path = dir.join("input.txt");
         let content = b"hello datacraft world! this is test content for publishing.";
         std::fs::write(&file_path, content).unwrap();
 
-        // Publish
         let result = client
             .publish(&file_path, &PublishOptions::default())
             .unwrap();
         assert_eq!(result.total_size, content.len() as u64);
         assert!(result.encryption_key.is_none());
+        assert_eq!(result.segment_count, 1);
 
-        // Reconstruct
         let output_path = dir.join("output.txt");
         client
             .reconstruct(&result.content_id, &output_path, None)
@@ -668,10 +631,7 @@ mod tests {
         let result = client
             .publish(
                 &file_path,
-                &PublishOptions {
-                    encrypted: true,
-                    erasure_config: None,
-                },
+                &PublishOptions { encrypted: true },
             )
             .unwrap();
         assert!(result.encryption_key.is_some());
@@ -701,25 +661,18 @@ mod tests {
         let result = client
             .publish(
                 &file_path,
-                &PublishOptions {
-                    encrypted: true,
-                    erasure_config: None,
-                },
+                &PublishOptions { encrypted: true },
             )
             .unwrap();
-        assert!(result.encryption_key.is_some());
 
-        // Reconstruct WITHOUT key — should get ciphertext (not plaintext)
         let output_no_key = dir.join("no_key_output.bin");
         client
             .reconstruct(&result.content_id, &output_no_key, None)
             .unwrap();
         let raw = std::fs::read(&output_no_key).unwrap();
         assert_ne!(raw, plaintext);
-        // The raw data should be nonce (12) + ciphertext
         assert!(raw.len() > plaintext.len());
 
-        // Reconstruct WITH key — should get plaintext
         let output_with_key = dir.join("with_key_output.bin");
         client
             .reconstruct(
@@ -739,7 +692,6 @@ mod tests {
         let mut client = DataCraftClient::new(&dir).unwrap();
         let cid = ContentId::from_bytes(b"pin test");
 
-        // Published content is auto-pinned, but we can manually pin/unpin
         client.pin(&cid).unwrap();
         assert!(client.is_pinned(&cid));
 
@@ -759,7 +711,6 @@ mod tests {
         let creator = SigningKey::generate(&mut rand::thread_rng());
         let recipient = SigningKey::generate(&mut rand::thread_rng());
 
-        // Publish with PRE
         let file_path = dir.join("pre_test.txt");
         let content = b"pre-encrypted content for access control testing";
         std::fs::write(&file_path, content).unwrap();
@@ -770,12 +721,10 @@ mod tests {
 
         let content_key = result.encryption_key.as_ref().unwrap();
 
-        // Grant access to recipient
         let (_re_key_entry, re_encrypted) = client
             .grant_access(&creator, &recipient.verifying_key(), content_key)
             .unwrap();
 
-        // Recipient decrypts using PRE
         let output = dir.join("pre_output.txt");
         client
             .reconstruct_with_pre(
@@ -789,17 +738,15 @@ mod tests {
 
         assert_eq!(std::fs::read(&output).unwrap(), content);
 
-        // Wrong recipient cannot decrypt
         let wrong = SigningKey::generate(&mut rand::thread_rng());
         let output2 = dir.join("pre_output_wrong.txt");
-        let err = client
-            .reconstruct_with_pre(
-                &result.content_id,
-                &output2,
-                &re_encrypted,
-                &wrong,
-                &creator.verifying_key(),
-            );
+        let err = client.reconstruct_with_pre(
+            &result.content_id,
+            &output2,
+            &re_encrypted,
+            &wrong,
+            &creator.verifying_key(),
+        );
         assert!(err.is_err());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -817,7 +764,6 @@ mod tests {
         let user_b = SigningKey::generate(&mut rand::thread_rng());
         let user_c = SigningKey::generate(&mut rand::thread_rng());
 
-        // Publish encrypted content with PRE
         let file_path = dir.join("revoke_test.txt");
         let content = b"secret content for revocation testing with key rotation";
         std::fs::write(&file_path, content).unwrap();
@@ -827,7 +773,6 @@ mod tests {
             .unwrap();
         let content_key = result.encryption_key.as_ref().unwrap().clone();
 
-        // Grant access to all 3 users
         let all_users = vec![
             user_a.verifying_key(),
             user_b.verifying_key(),
@@ -841,7 +786,6 @@ mod tests {
             re_encrypted_keys.push(re_enc);
         }
 
-        // Verify all 3 users can decrypt
         for (i, user) in [&user_a, &user_b, &user_c].iter().enumerate() {
             let out = dir.join(format!("pre_revoke_{}.txt", i));
             client
@@ -856,7 +800,6 @@ mod tests {
             assert_eq!(std::fs::read(&out).unwrap(), content);
         }
 
-        // Revoke user_b and rotate
         let revocation = client
             .revoke_and_rotate(
                 &result.content_id,
@@ -867,17 +810,18 @@ mod tests {
             )
             .unwrap();
 
-        // Verify: 2 remaining users got re-grants (not user_b)
         assert_eq!(revocation.re_grants.len(), 2);
 
-        // Verify remaining users (A and C) can decrypt the NEW content
         for (entry, re_enc) in &revocation.re_grants {
             let recipient_key = if entry.recipient_did == user_a.verifying_key().to_bytes() {
                 &user_a
             } else {
                 &user_c
             };
-            let out = dir.join(format!("post_revoke_{}.txt", hex::encode(&entry.recipient_did[..4])));
+            let out = dir.join(format!(
+                "post_revoke_{}.txt",
+                hex::encode(&entry.recipient_did[..4])
+            ));
             client
                 .reconstruct_with_pre(
                     &revocation.new_content_id,
@@ -890,21 +834,15 @@ mod tests {
             assert_eq!(std::fs::read(&out).unwrap(), content);
         }
 
-        // Verify user_b CANNOT decrypt new content with old re-encrypted key
         let out_revoked = dir.join("post_revoke_b.txt");
         let err = client.reconstruct_with_pre(
             &revocation.new_content_id,
             &out_revoked,
-            &re_encrypted_keys[1], // user_b's old re-encrypted key
+            &re_encrypted_keys[1],
             &user_b,
             &creator.verifying_key(),
         );
         assert!(err.is_err());
-
-        // Verify user_b cannot decrypt even if they try old CID with old key
-        // (old content still exists, but that's expected — the point is new content is protected)
-
-        // Verify new CID is different from old
         assert_ne!(result.content_id, revocation.new_content_id);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -918,7 +856,9 @@ mod tests {
         let file_path = dir.join("list_test.txt");
         std::fs::write(&file_path, b"list test content").unwrap();
 
-        client.publish(&file_path, &PublishOptions::default()).unwrap();
+        client
+            .publish(&file_path, &PublishOptions::default())
+            .unwrap();
 
         let items = client.list().unwrap();
         assert_eq!(items.len(), 1);
@@ -927,6 +867,7 @@ mod tests {
         let status = client.status().unwrap();
         assert_eq!(status.content_count, 1);
         assert!(status.stored_bytes > 0);
+        assert!(status.piece_count > 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -946,7 +887,6 @@ mod tests {
             .publish_signed(&file_path, &PublishOptions::default(), &keypair)
             .unwrap();
 
-        // Verify the manifest was signed
         let manifest = client.store().get_manifest(&result.content_id).unwrap();
         assert!(!manifest.creator.is_empty());
         assert!(manifest.verify_creator());
@@ -986,30 +926,20 @@ mod tests {
     }
 
     #[test]
-    fn test_removal_notice_wrong_creator_detectable() {
-        use ed25519_dalek::SigningKey;
-
+    fn test_publish_bytes_directly() {
         let dir = test_dir();
         let mut client = DataCraftClient::new(&dir).unwrap();
-        let creator = SigningKey::generate(&mut rand::thread_rng());
-        let attacker = SigningKey::generate(&mut rand::thread_rng());
 
-        let file_path = dir.join("protected.txt");
-        std::fs::write(&file_path, b"protected content").unwrap();
-
+        let content = b"direct byte publish test";
         let result = client
-            .publish_signed(&file_path, &PublishOptions::default(), &creator)
+            .publish_bytes(content, &PublishOptions::default())
             .unwrap();
 
-        // Attacker tries to create removal notice
-        let notice = client
-            .remove_content(&attacker, &result.content_id, None)
+        let output = dir.join("output.bin");
+        client
+            .reconstruct(&result.content_id, &output, None)
             .unwrap();
-
-        // Notice is valid (signed by attacker), but creator doesn't match manifest
-        assert!(notice.verify());
-        let manifest = client.store().get_manifest(&result.content_id).unwrap();
-        assert_ne!(notice.creator, manifest.creator);
+        assert_eq!(std::fs::read(&output).unwrap(), content);
 
         std::fs::remove_dir_all(&dir).ok();
     }

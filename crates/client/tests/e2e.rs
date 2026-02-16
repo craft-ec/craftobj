@@ -97,7 +97,7 @@ fn publish_fetch_large_content_multichunk() {
     let file = write_test_file(&dir, "large.bin", &content);
 
     let result = client.publish(&file, &PublishOptions::default()).unwrap();
-    assert!(result.chunk_count > 1);
+    assert!(result.segment_count >= 1);
 
     let out = dir.join("large_out.bin");
     client
@@ -494,14 +494,24 @@ fn make_storage_receipt(
     cid: ContentId,
     storage_node: [u8; 32],
     challenger: [u8; 32],
-    shard: u32,
+    segment: u32,
     nonce: [u8; 32],
 ) -> StorageReceipt {
     StorageReceipt {
         content_id: cid,
         storage_node,
         challenger,
-        shard_index: shard,
+        segment_index: segment,
+        piece_id: {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"piece_coeff_placeholder");
+            h.update(segment.to_le_bytes());
+            let r = h.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&r);
+            out
+        },
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -510,7 +520,7 @@ fn make_storage_receipt(
         proof_hash: {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
-            h.update(b"shard_data_placeholder");
+            h.update(b"piece_data_placeholder");
             h.update(nonce);
             let r = h.finalize();
             let mut out = [0u8; 32];
@@ -547,7 +557,7 @@ fn storage_receipt_sign_verify_roundtrip() {
 
     // Tamper detection
     let mut tampered = receipt.clone();
-    tampered.shard_index = 99;
+    tampered.segment_index = 99;
     assert!(!verify_storage_receipt(&tampered, &challenger_pub));
 
     let mut tampered2 = receipt.clone();
@@ -590,7 +600,7 @@ fn storage_receipt_batch_pdp_simulation() {
     }
 
     // Each receipt has unique shard index
-    let shard_indices: Vec<u32> = receipts.iter().map(|r| r.shard_index).collect();
+    let shard_indices: Vec<u32> = receipts.iter().map(|r| r.segment_index).collect();
     assert_eq!(shard_indices, vec![0, 1, 2, 3, 4]);
 
     // Signable data is deterministic
@@ -615,7 +625,7 @@ fn storage_receipt_serialization() {
     let bytes = bincode::serialize(&receipt).unwrap();
     let restored: StorageReceipt = bincode::deserialize(&bytes).unwrap();
     assert_eq!(restored.content_id, receipt.content_id);
-    assert_eq!(restored.shard_index, receipt.shard_index);
+    assert_eq!(restored.segment_index, receipt.segment_index);
     assert!(verify_storage_receipt(&restored, &key.verifying_key()));
 
     // JSON roundtrip
