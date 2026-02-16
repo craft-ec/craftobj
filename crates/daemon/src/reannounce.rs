@@ -243,16 +243,23 @@ async fn distribute_content(
                 continue;
             }
         };
-        for &peer in &ranked_peers {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let cmd = DataCraftCommand::PushManifest {
-                peer_id: peer,
-                content_id,
-                manifest_json: manifest_json.clone(),
-                reply_tx,
-            };
-            if command_tx.send(cmd).is_ok() {
-                match reply_rx.await {
+        // Push manifests to all peers in parallel.
+        {
+            let mut manifest_futs = Vec::new();
+            for &peer in &ranked_peers {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let cmd = DataCraftCommand::PushManifest {
+                    peer_id: peer,
+                    content_id,
+                    manifest_json: manifest_json.clone(),
+                    reply_tx,
+                };
+                if command_tx.send(cmd).is_ok() {
+                    manifest_futs.push(async move { (peer, reply_rx.await) });
+                }
+            }
+            for (peer, result) in futures::future::join_all(manifest_futs).await {
+                match result {
                     Ok(Ok(())) => info!("Pushed manifest for {} to {}", content_id, peer),
                     Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
                     Err(_) => {}
@@ -260,8 +267,11 @@ async fn distribute_content(
             }
         }
 
-        // Push pieces round-robin, max 2 pieces per peer per CID.
-        // Collect all pieces first, then distribute.
+        // Collect all pieces, then assign targets.
+        // Each peer needs at least 2 pieces to be a valid RLNC provider
+        // (can create new linearly independent pieces via recombination).
+        // Push 2 consecutive pieces per peer before rotating. Overflow
+        // continues round-robin for initial upload.
         let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
         for seg_idx in 0..manifest.segment_count as u32 {
             let piece_ids = {
@@ -273,18 +283,14 @@ async fn distribute_content(
             }
         }
 
-        let mut pushed_count = 0usize;
-        let mut peer_idx = 0usize;
-        // Each peer needs at least 2 pieces to be a valid RLNC provider
-        // (can create new linearly independent pieces via recombination).
+        // Assign pieces to peers (2 consecutive per peer, then rotate).
         let seed_per_peer: usize = 2;
+        let mut peer_idx = 0usize;
         let mut pieces_per_peer: std::collections::HashMap<libp2p::PeerId, usize> =
             std::collections::HashMap::new();
+        let mut assignments: Vec<(libp2p::PeerId, u32, [u8; 32])> = Vec::new();
 
         for (seg_idx, piece_id) in &all_pieces {
-            // Find next peer that hasn't been fully seeded yet.
-            // Once all peers have 2 pieces (minimum for RLNC provider),
-            // overflow continues round-robin to distribute remaining pieces.
             let mut attempts = 0;
             let peer = loop {
                 let candidate = ranked_peers[peer_idx % ranked_peers.len()];
@@ -299,46 +305,61 @@ async fn distribute_content(
                     break candidate;
                 }
             };
+            let count = pieces_per_peer.entry(peer).or_insert(0);
+            *count += 1;
+            if *count >= seed_per_peer {
+                peer_idx += 1;
+            }
+            assignments.push((peer, *seg_idx, *piece_id));
+        }
 
+        // Push all assigned pieces in parallel with bounded concurrency.
+        let max_concurrent: usize = 30;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let pushed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut push_futs = Vec::new();
+        for (peer, seg_idx, piece_id) in assignments {
             let (piece_data, coefficients) = {
                 let c = client.lock().await;
-                match c.store().get_piece(&content_id, *seg_idx, piece_id) {
+                match c.store().get_piece(&content_id, seg_idx, &piece_id) {
                     Ok(d) => d,
                     Err(_) => continue,
                 }
             };
 
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let cmd = DataCraftCommand::PushPiece {
-                peer_id: peer,
-                content_id,
-                segment_index: *seg_idx,
-                piece_id: *piece_id,
-                coefficients,
-                piece_data,
-                reply_tx,
-            };
+            let sem = semaphore.clone();
+            let cmd_tx = command_tx.clone();
+            let pushed = pushed_count.clone();
 
-            if command_tx.send(cmd).is_err() {
-                continue;
-            }
-
-            match reply_rx.await {
-                Ok(Ok(())) => {
-                    pushed_count += 1;
-                    let count = pieces_per_peer.entry(peer).or_insert(0);
-                    *count += 1;
-                    // Move to next peer once this one is seeded
-                    if *count >= seed_per_peer {
-                        peer_idx += 1;
+            push_futs.push(async move {
+                let _permit = sem.acquire().await;
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let cmd = DataCraftCommand::PushPiece {
+                    peer_id: peer,
+                    content_id,
+                    segment_index: seg_idx,
+                    piece_id,
+                    coefficients,
+                    piece_data,
+                    reply_tx,
+                };
+                if cmd_tx.send(cmd).is_err() {
+                    return;
+                }
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        pushed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    Ok(Err(e)) => {
+                        warn!("Push piece to {} failed: {}", peer, e);
+                    }
+                    Err(_) => {}
                 }
-                Ok(Err(e)) => {
-                    warn!("Push piece to {} failed: {}", peer, e);
-                }
-                Err(_) => {}
-            }
+            });
         }
+        futures::future::join_all(push_futs).await;
+        let pushed_count = pushed_count.load(std::sync::atomic::Ordering::Relaxed);
 
         if pushed_count > 0 {
             info!("Distributed {} pieces for {}", pushed_count, content_id);
