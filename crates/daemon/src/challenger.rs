@@ -194,7 +194,7 @@ impl ChallengerManager {
                     Ok((coefficients, data)) => {
                         let latency = challenge_start.elapsed();
                         let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
-                        let byte_positions: Vec<u32> = (0..16.min(data.len() as u32)).collect();
+                        let byte_positions = crate::pdp::derive_byte_positions(&nonce, &piece_id, data.len() as u32, 16);
                         let proof_hash = compute_proof_hash(&data, &byte_positions, &coefficients, &nonce);
 
                         if let Some(ref scorer) = self.peer_scorer {

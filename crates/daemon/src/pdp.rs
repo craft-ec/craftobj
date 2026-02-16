@@ -40,6 +40,31 @@ pub struct PdpResponse {
     pub coefficients: Vec<u8>,
 }
 
+/// Derive deterministic byte positions from nonce + piece_id.
+///
+/// Both challenger and prover can independently compute the same positions,
+/// ensuring positions are spread across the full piece rather than just the first N bytes.
+pub fn derive_byte_positions(nonce: &[u8; 32], piece_id: &[u8; 32], piece_len: u32, count: usize) -> Vec<u32> {
+    if piece_len == 0 {
+        return vec![];
+    }
+    let mut pos_seed = Sha256::new();
+    pos_seed.update(nonce);
+    pos_seed.update(piece_id);
+    let seed = pos_seed.finalize();
+
+    (0..count)
+        .map(|i| {
+            let b0 = seed[(i * 2) % 32];
+            let b1 = seed[(i * 2 + 1) % 32];
+            let b2 = seed[(i * 2 + 2) % 32];
+            let b3 = seed[(i * 2 + 3) % 32];
+            let offset = u32::from_be_bytes([b0, b1, b2, b3]);
+            offset % piece_len
+        })
+        .collect()
+}
+
 /// Compute the expected proof hash: SHA-256(sampled_bytes || coefficients || nonce).
 pub fn compute_proof_hash(piece_data: &[u8], byte_positions: &[u32], coefficients: &[u8], nonce: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -399,6 +424,50 @@ mod tests {
         assert_eq!(receipt.signature.len(), 64);
         assert!(verify_storage_receipt(&receipt, &pubkey));
         assert_eq!(receipt.piece_id, piece_id);
+    }
+
+    #[test]
+    fn test_derive_byte_positions_deterministic() {
+        let nonce = [1u8; 32];
+        let piece_id = [2u8; 32];
+        let p1 = derive_byte_positions(&nonce, &piece_id, 1000, 16);
+        let p2 = derive_byte_positions(&nonce, &piece_id, 1000, 16);
+        assert_eq!(p1, p2);
+        assert_eq!(p1.len(), 16);
+        for &pos in &p1 {
+            assert!(pos < 1000);
+        }
+    }
+
+    #[test]
+    fn test_derive_byte_positions_different_nonces() {
+        let piece_id = [2u8; 32];
+        let p1 = derive_byte_positions(&[1u8; 32], &piece_id, 10000, 16);
+        let p2 = derive_byte_positions(&[2u8; 32], &piece_id, 10000, 16);
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn test_derive_byte_positions_different_piece_ids() {
+        let nonce = [1u8; 32];
+        let p1 = derive_byte_positions(&nonce, &[1u8; 32], 10000, 16);
+        let p2 = derive_byte_positions(&nonce, &[2u8; 32], 10000, 16);
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn test_derive_byte_positions_spread() {
+        // With a large piece, positions should not all be in the first 16 bytes
+        let nonce = [42u8; 32];
+        let piece_id = [7u8; 32];
+        let positions = derive_byte_positions(&nonce, &piece_id, 1_000_000, 16);
+        let max_pos = *positions.iter().max().unwrap();
+        assert!(max_pos > 16, "positions should spread across the piece, max was {}", max_pos);
+    }
+
+    #[test]
+    fn test_derive_byte_positions_zero_len() {
+        assert!(derive_byte_positions(&[0u8; 32], &[0u8; 32], 0, 16).is_empty());
     }
 
     #[test]
