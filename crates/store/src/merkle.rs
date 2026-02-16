@@ -72,7 +72,7 @@ impl StorageMerkleTree {
     /// Build from an existing store by scanning all pieces.
     pub fn build_from_store(store: &FsStore) -> Result<Self> {
         let mut leaves = Vec::new();
-        let content_ids = store.list_content()?;
+        let content_ids = store.list_content_with_pieces()?;
         for cid in &content_ids {
             let segments = store.list_segments(cid)?;
             for seg in segments {
@@ -122,6 +122,19 @@ impl StorageMerkleTree {
             return;
         }
         self.leaves.insert(pos, leaf);
+        self.cached_root = Self::compute_root_from_leaves(&self.leaves);
+    }
+
+    /// Insert multiple pieces at once (more efficient than repeated single inserts).
+    pub fn insert_batch(&mut self, pieces: &[(&ContentId, u32, &[u8; 32])]) {
+        for &(content_id, segment_index, piece_id) in pieces {
+            let leaf = compute_leaf(content_id, segment_index, piece_id);
+            let pos = self.leaves.binary_search(&leaf).unwrap_or_else(|p| p);
+            if pos < self.leaves.len() && self.leaves[pos] == leaf {
+                continue;
+            }
+            self.leaves.insert(pos, leaf);
+        }
         self.cached_root = Self::compute_root_from_leaves(&self.leaves);
     }
 
@@ -422,16 +435,21 @@ mod tests {
 
     #[test]
     fn test_large_tree_performance() {
-        // ~10,000 pieces should be fast
+        // ~10,000 pieces should be fast using batch insert
         let mut tree = StorageMerkleTree::new();
+        let mut pieces: Vec<(ContentId, u32, [u8; 32])> = Vec::with_capacity(10_000);
         for i in 0u32..10_000 {
             let mut c = [0u8; 32];
             c[..4].copy_from_slice(&i.to_be_bytes());
-            let content = ContentId(c);
             let mut p = [0u8; 32];
             p[..4].copy_from_slice(&i.to_le_bytes());
-            tree.insert(&content, 0, &p);
+            pieces.push((ContentId(c), 0, p));
         }
+        let refs: Vec<(&ContentId, u32, &[u8; 32])> = pieces
+            .iter()
+            .map(|(c, s, p)| (c, *s, p))
+            .collect();
+        tree.insert_batch(&refs);
         assert_eq!(tree.len(), 10_000);
 
         // Verify a random proof

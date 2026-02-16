@@ -221,6 +221,29 @@ impl FsStore {
         Ok(result)
     }
 
+    /// List all content IDs that have pieces stored (scans piece directory).
+    pub fn list_content_with_pieces(&self) -> Result<Vec<ContentId>> {
+        let pieces_dir = self.data_dir.join("pieces");
+        let mut result = Vec::new();
+        if !pieces_dir.exists() {
+            return Ok(result);
+        }
+        if let Ok(entries) = std::fs::read_dir(&pieces_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        if let Some(hex_str) = entry.file_name().to_str() {
+                            if let Ok(cid) = ContentId::from_hex(hex_str) {
+                                result.push(cid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// List all content IDs that have manifests stored.
     pub fn list_content(&self) -> Result<Vec<ContentId>> {
         let manifest_dir = self.data_dir.join("manifests");

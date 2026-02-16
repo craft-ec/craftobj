@@ -144,6 +144,18 @@ pub async fn run_daemon_with_config(
     
     let store = Arc::new(Mutex::new(datacraft_store::FsStore::new(&data_dir)?));
 
+    // Build storage Merkle tree from existing pieces
+    let merkle_tree = {
+        let tmp_store = datacraft_store::FsStore::new(&data_dir)?;
+        let tree = datacraft_store::merkle::StorageMerkleTree::build_from_store(&tmp_store)
+            .unwrap_or_else(|e| {
+                warn!("Failed to build storage Merkle tree: {}, starting empty", e);
+                datacraft_store::merkle::StorageMerkleTree::new()
+            });
+        info!("Storage Merkle tree built: {} leaves, root={}", tree.len(), hex::encode(&tree.root()[..8]));
+        Arc::new(Mutex::new(tree))
+    };
+
     // Build swarm
     let (mut swarm, local_peer_id) = build_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
@@ -407,7 +419,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -416,7 +428,7 @@ pub async fn run_daemon_with_config(
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events) => {
             info!("Protocol events handler ended");
         }
-        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes) => {
+        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes, daemon_config.region.clone(), merkle_tree.clone()) => {
             info!("Capability announcement loop ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
@@ -559,6 +571,7 @@ async fn drive_swarm(
     store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
     scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
+    merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -582,10 +595,12 @@ async fn drive_swarm(
                         });
                         // Announce capabilities: immediately + delayed retry after gossipsub mesh forms
                         let used = client.lock().await.store().disk_usage().unwrap_or(0);
+                        let sr = merkle_tree.lock().await.root();
                         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
                             capabilities: own_capabilities.clone(),
                             storage_committed_bytes: max_storage_bytes,
                             storage_used_bytes: used,
+                            storage_root: sr,
                         });
                         // Gossipsub mesh formation takes ~1-3s after connection.
                         // Retry to ensure the new peer receives our announcement.
@@ -593,13 +608,16 @@ async fn drive_swarm(
                         let delayed_tx = command_tx.clone();
                         let delayed_client = client.clone();
                         let delayed_max = max_storage_bytes;
+                        let delayed_merkle = merkle_tree.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             let used = delayed_client.lock().await.store().disk_usage().unwrap_or(0);
+                            let sr = delayed_merkle.lock().await.root();
                             let _ = delayed_tx.send(DataCraftCommand::PublishCapabilities {
                                 capabilities: delayed_caps,
                                 storage_committed_bytes: delayed_max,
                                 storage_used_bytes: used,
+                                storage_root: sr,
                             });
                         });
                     }
@@ -736,7 +754,7 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::PublishCapabilities { capabilities, storage_committed_bytes, storage_used_bytes } => {
+        DataCraftCommand::PublishCapabilities { capabilities, storage_committed_bytes, storage_used_bytes, storage_root } => {
             let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
             let local_peer_id = *swarm.local_peer_id();
             let timestamp = std::time::SystemTime::now()
@@ -750,6 +768,8 @@ async fn handle_command(
                 signature: vec![], // TODO: sign with node keypair
                 storage_committed_bytes,
                 storage_used_bytes,
+                storage_root,
+                region: None, // TODO: pass region from config
             };
             match serde_json::to_vec(&announcement) {
                 Ok(data) => {
@@ -1186,6 +1206,8 @@ async fn announce_capabilities_periodically(
     interval_secs: u64,
     client: Arc<Mutex<datacraft_client::DataCraftClient>>,
     max_storage_bytes: u64,
+    region: Option<String>,
+    merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
 ) {
     use std::time::Duration;
 
@@ -1196,11 +1218,13 @@ async fn announce_capabilities_periodically(
     loop {
         interval.tick().await;
         let used = client.lock().await.store().disk_usage().unwrap_or(0);
-        debug!("Publishing capability announcement (storage: {}/{} bytes)", used, max_storage_bytes);
+        let storage_root = merkle_tree.lock().await.root();
+        debug!("Publishing capability announcement (storage: {}/{} bytes, merkle root: {})", used, max_storage_bytes, hex::encode(&storage_root[..8]));
         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
             capabilities: capabilities.clone(),
             storage_committed_bytes: max_storage_bytes,
             storage_used_bytes: used,
+            storage_root,
         });
     }
 }

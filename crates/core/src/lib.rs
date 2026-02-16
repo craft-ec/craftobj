@@ -456,6 +456,9 @@ pub struct CapabilityAnnouncement {
     /// Auto-detected or manually configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// Root hash of the node's storage Merkle tree (all held pieces).
+    #[serde(default)]
+    pub storage_root: [u8; 32],
 }
 
 impl CapabilityAnnouncement {
@@ -472,6 +475,7 @@ impl CapabilityAnnouncement {
         if let Some(ref region) = self.region {
             data.extend_from_slice(region.as_bytes());
         }
+        data.extend_from_slice(&self.storage_root);
         data
     }
 }
@@ -742,6 +746,7 @@ mod tests {
             storage_committed_bytes: 10_000_000_000,
             storage_used_bytes: 5_000_000_000,
             region: Some("us-east".to_string()),
+            storage_root: [0u8; 32],
         };
         let json = serde_json::to_string(&ann).unwrap();
         let parsed: CapabilityAnnouncement = serde_json::from_str(&json).unwrap();
@@ -760,9 +765,10 @@ mod tests {
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
             region: None,
+            storage_root: [0u8; 32],
         };
         let data = ann.signable_data();
-        assert_eq!(data.len(), 28);
+        assert_eq!(data.len(), 60); // 2 (peer_id) + 2 (caps) + 8 (ts) + 8 + 8 + 32 (storage_root)
         assert_eq!(data, ann.signable_data());
     }
 
