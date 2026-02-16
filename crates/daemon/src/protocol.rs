@@ -70,6 +70,8 @@ pub struct DataCraftProtocol {
     removal_cache: Option<Arc<Mutex<crate::removal_cache::RemovalCache>>>,
     /// Demand tracker for scaling — records fetches when serving pieces.
     demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
+    /// Eviction manager — records access for LRU tracking.
+    eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
 }
 
 /// Tracks what we're waiting for from a DHT query.
@@ -93,6 +95,7 @@ impl DataCraftProtocol {
             persistent_receipt_store: None,
             removal_cache: None,
             demand_tracker: None,
+            eviction_manager: None,
         }
     }
 
@@ -108,6 +111,10 @@ impl DataCraftProtocol {
 
     pub fn set_demand_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandTracker>>) {
         self.demand_tracker = Some(tracker);
+    }
+
+    pub fn set_eviction_manager(&mut self, mgr: Arc<Mutex<crate::eviction::EvictionManager>>) {
+        self.eviction_manager = Some(mgr);
     }
 
     /// Register this protocol with the shared libp2p swarm.
@@ -592,6 +599,11 @@ impl DataCraftProtocol {
                 if let Some(ref dt) = self.demand_tracker {
                     let mut tracker = dt.lock().await;
                     tracker.record_fetch(content_id);
+                }
+                // Record access for eviction LRU tracking
+                if let Some(ref em) = self.eviction_manager {
+                    let mut mgr = em.lock().await;
+                    mgr.record_access(&content_id);
                 }
             }
             _ => {

@@ -237,6 +237,14 @@ pub async fn run_daemon_with_config(
     let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::new()));
     protocol.set_demand_tracker(demand_tracker.clone());
 
+    // Eviction manager (created early to wire into protocol before Arc wrapping)
+    let eviction_config = crate::eviction::EvictionConfig {
+        max_storage_bytes: daemon_config.max_storage_bytes,
+        enable_eviction: true,
+    };
+    let eviction_manager = Arc::new(Mutex::new(crate::eviction::EvictionManager::new(&eviction_config)));
+    protocol.set_eviction_manager(eviction_manager.clone());
+
     let protocol = Arc::new(protocol);
 
     // Payment channel store
@@ -303,6 +311,7 @@ pub async fn run_daemon_with_config(
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
     handler.set_daemon_config(daemon_config_shared, data_dir.clone());
+    handler.set_eviction_manager(eviction_manager.clone());
     handler.set_event_sender(event_tx.clone());
     if let Some(key) = node_signing_key {
         handler.set_node_signing_key(key);
@@ -327,14 +336,12 @@ pub async fn run_daemon_with_config(
     }
     challenger_mgr.set_persistent_store(receipt_store.clone());
     challenger_mgr.set_peer_scorer(peer_scorer.clone());
-    let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
-    // Eviction manager
-    let eviction_config = crate::eviction::EvictionConfig {
-        max_storage_bytes: daemon_config.max_storage_bytes,
-        enable_eviction: true,
-    };
-    let eviction_manager = Arc::new(Mutex::new(crate::eviction::EvictionManager::new(&eviction_config)));
+    // Shared PDP rank data between challenger and eviction loops
+    let pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>> = Arc::new(Mutex::new(HashMap::new()));
+    challenger_mgr.set_pdp_ranks(pdp_ranks.clone());
+
+    let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
     // Load or generate API key for WebSocket authentication
     let api_key = crate::api_key::load_or_generate(&data_dir)
@@ -382,6 +389,14 @@ pub async fn run_daemon_with_config(
         crate::scaling::ScalingCoordinator::new(local_peer_id, scaling_command_tx),
     ));
 
+    // Aggregator config — configurable epoch, default 10 min
+    let aggregator_config = crate::aggregator::AggregatorConfig {
+        epoch_duration: std::time::Duration::from_secs(
+            daemon_config.aggregation_epoch_secs.unwrap_or(600),
+        ),
+        pool_id: [0u8; 32], // TODO: load from config/on-chain
+    };
+
     // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
@@ -420,8 +435,11 @@ pub async fn run_daemon_with_config(
         _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone()) => {
             info!("Scaling maintenance loop ended");
         }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone()) => {
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone()) => {
             info!("Eviction maintenance loop ended");
+        }
+        _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
+            info!("Aggregation loop ended");
         }
     }
 
@@ -445,15 +463,16 @@ async fn scaling_maintenance_loop(
         let mut tracker = demand_tracker.lock().await;
         let hot_cids = tracker.check_demand();
         for (cid, demand_level) in hot_cids {
-            // TODO: pass actual non_providers_exist check from content_tracker/DHT
-            if tracker.should_broadcast_demand(&cid, true) {
-                // Don't broadcast if all known peers are already providers —
-                // scaling can't place pieces if there's nobody new.
-                let has_targets = crate::push_target::has_non_provider_targets(
-                    &local_peer_id,
-                    &[], // TODO: pass actual provider PeerIds when content_tracker tracks them
-                    &Some(peer_scorer.clone()),
-                );
+            // Check if there are non-provider storage peers who could accept new pieces.
+            // We pass an empty provider list since content_tracker doesn't track per-CID
+            // provider PeerIds yet — has_non_provider_targets checks if ANY storage peers
+            // exist beyond the (empty) provider set, which is a safe over-approximation.
+            let has_targets = crate::push_target::has_non_provider_targets(
+                &local_peer_id,
+                &[], // TODO: pass actual provider PeerIds when content_tracker tracks them
+                &Some(peer_scorer.clone()),
+            );
+            if tracker.should_broadcast_demand(&cid, has_targets) {
                 if !has_targets {
                     debug!("Skipping scaling notice for {}: no non-provider targets", cid);
                     continue;
@@ -476,6 +495,7 @@ async fn eviction_maintenance_loop(
     eviction_manager: Arc<Mutex<crate::eviction::EvictionManager>>,
     store: Arc<Mutex<datacraft_store::FsStore>>,
     event_tx: EventSender,
+    pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>>,
 ) {
     use std::time::Duration;
     // Initial delay
@@ -487,11 +507,20 @@ async fn eviction_maintenance_loop(
         let store_guard = store.lock().await;
         let mut mgr = eviction_manager.lock().await;
 
-        // Run eviction (no retirement data available yet — pass empty maps)
+        // Build retirement data from latest PDP rank snapshots
+        let ranks_snapshot = pdp_ranks.lock().await;
+        let mut k_by_cid = HashMap::new();
+        let mut segment_ranks_by_cid = HashMap::new();
+        for (cid, (k, seg_ranks)) in ranks_snapshot.iter() {
+            k_by_cid.insert(*cid, *k);
+            segment_ranks_by_cid.insert(*cid, seg_ranks.clone());
+        }
+        drop(ranks_snapshot);
+
         let result = mgr.run_maintenance(
             &store_guard,
-            &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
+            &k_by_cid,
+            &segment_ranks_by_cid,
         );
 
         for (cid, reason) in &result.evicted {

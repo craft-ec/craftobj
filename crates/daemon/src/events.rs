@@ -77,6 +77,9 @@ pub enum DaemonEvent {
     // -- Eviction / Retirement --
     ContentEvicted { content_id: String, reason: String },
     ContentRetired { content_id: String, reason: String },
+
+    // -- Aggregation --
+    AggregationComplete { receipt_count: usize, merkle_root: String },
 }
 
 pub type EventSender = broadcast::Sender<DaemonEvent>;

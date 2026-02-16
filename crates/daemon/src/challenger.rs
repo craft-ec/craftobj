@@ -47,7 +47,12 @@ pub struct ChallengerManager {
     signing_key: Option<SigningKey>,
     persistent_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
+    /// Shared PDP rank data for eviction retirement checks.
+    pdp_ranks: Option<Arc<Mutex<PdpRankData>>>,
 }
+
+/// Shared PDP rank data: maps CID → (k, segment_index → rank).
+pub type PdpRankData = HashMap<ContentId, (usize, HashMap<u32, usize>)>;
 
 impl ChallengerManager {
     pub fn new(
@@ -65,7 +70,12 @@ impl ChallengerManager {
             signing_key: None,
             persistent_store: None,
             peer_scorer: None,
+            pdp_ranks: None,
         }
+    }
+
+    pub fn set_pdp_ranks(&mut self, ranks: Arc<Mutex<PdpRankData>>) {
+        self.pdp_ranks = Some(ranks);
     }
 
     pub fn set_peer_scorer(&mut self, scorer: Arc<Mutex<PeerScorer>>) {
@@ -243,8 +253,15 @@ impl ChallengerManager {
         let rank_map = health::compute_network_rank(&round_result.results);
         let min_rank = health::min_rank_across_segments(&rank_map);
 
+        let k = manifest.k();
         let tier_info = self.provided_cids.get(&cid).and_then(|s| s.tier_info.clone());
-        let health = health::assess_health(cid, manifest.k(), min_rank, round_result.results.len(), tier_info.as_ref());
+        let health = health::assess_health(cid, k, min_rank, round_result.results.len(), tier_info.as_ref());
+
+        // Update shared PDP rank data for eviction retirement checks
+        if let Some(ref pdp_ranks) = self.pdp_ranks {
+            let mut ranks = pdp_ranks.lock().await;
+            ranks.insert(cid, (k, rank_map.clone()));
+        }
 
         // Heal if needed — challenger heals locally AND publishes repair signal
         let healing = if health.needs_healing && health.pieces_needed > 0 {

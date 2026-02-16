@@ -272,6 +272,32 @@ pub struct StorageReceipt {
     pub signature: Vec<u8>,
 }
 
+impl craftec_core::ContributionReceipt for StorageReceipt {
+    fn weight(&self) -> u64 {
+        1
+    }
+
+    fn signable_data(&self) -> Vec<u8> {
+        StorageReceipt::signable_data(self)
+    }
+
+    fn operator(&self) -> [u8; 32] {
+        self.storage_node
+    }
+
+    fn signer(&self) -> [u8; 32] {
+        self.challenger
+    }
+
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+}
+
 impl StorageReceipt {
     /// Weight for settlement: 1 per successful PDP proof.
     pub fn weight(&self) -> u64 {

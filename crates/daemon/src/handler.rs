@@ -47,6 +47,8 @@ pub struct DataCraftHandler {
     event_sender: Option<EventSender>,
     /// Node signing key for manifest signing on publish.
     node_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// Eviction manager for recording access on fetch.
+    eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
 }
 
 impl DataCraftHandler {
@@ -72,7 +74,12 @@ impl DataCraftHandler {
             data_dir: None,
             event_sender: None,
             node_signing_key: None,
+            eviction_manager: None,
         }
+    }
+
+    pub fn set_eviction_manager(&mut self, mgr: Arc<Mutex<crate::eviction::EvictionManager>>) {
+        self.eviction_manager = Some(mgr);
     }
 
     pub fn set_node_signing_key(&mut self, key: ed25519_dalek::SigningKey) {
@@ -121,6 +128,7 @@ impl DataCraftHandler {
             data_dir: None,
             event_sender: None,
             node_signing_key: None,
+            eviction_manager: None,
         }
     }
 
@@ -349,6 +357,12 @@ impl DataCraftHandler {
         })
         .await
         .map_err(|e| format!("reconstruct task panicked: {}", e))??;
+
+        // Record access for eviction LRU tracking
+        if let Some(ref em) = self.eviction_manager {
+            let mut mgr = em.lock().await;
+            mgr.record_access(&cid);
+        }
 
         Ok(serde_json::json!({
             "path": output.to_string_lossy(),

@@ -44,6 +44,9 @@ pub struct DaemonConfig {
     pub reannounce_threshold_secs: u64,
     /// Challenger check interval in seconds (default: 300)
     pub challenger_interval_secs: Option<u64>,
+    /// Aggregation epoch interval in seconds (default: 600 = 10 minutes).
+    /// Set to None to use the default.
+    pub aggregation_epoch_secs: Option<u64>,
 
     // ── Storage ─────────────────────────────────────────────
     /// Maximum storage in bytes (0 = unlimited).
@@ -66,6 +69,7 @@ impl Default for DaemonConfig {
             reannounce_interval_secs: 600,
             reannounce_threshold_secs: 1200,
             challenger_interval_secs: None,
+            aggregation_epoch_secs: None,
             max_storage_bytes: 0,
             extra: serde_json::Map::new(),
         }

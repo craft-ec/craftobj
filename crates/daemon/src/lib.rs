@@ -5,6 +5,7 @@
 //! - IPC server for desktop/CLI clients
 //! - Content routing and transfer
 
+pub mod aggregator;
 pub mod api_key;
 pub mod challenger;
 pub mod channel_store;
@@ -27,4 +28,5 @@ pub mod scaling;
 pub mod removal_cache;
 pub mod service;
 pub mod settlement;
+pub mod settlement_cycle;
 pub mod ws_server;

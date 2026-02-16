@@ -706,6 +706,66 @@ impl SolanaClient {
         self.submit(tx).await
     }
 
+    /// Submit a distribution proof (batch proof from the prover) to the settlement program.
+    ///
+    /// Takes the prover's `BatchProof` and posts it as a `PostDistribution` instruction.
+    /// The proof contains the Merkle root over (operator, weight) entries and the ZK proof.
+    pub async fn submit_distribution_proof(
+        &self,
+        pool_id: &[u8; 32],
+        batch_proof: &craftec_prover::BatchProof,
+    ) -> Result<TransactionResult, SettlementError> {
+        // Parse the public inputs to extract root and total_weight
+        if batch_proof.public_inputs.len() != 76 {
+            return Err(SettlementError::InvalidParam(
+                "batch proof public_inputs must be 76 bytes".into(),
+            ));
+        }
+        let output = craftec_prover_guest_types::DistributionOutput::from_bytes(
+            batch_proof.public_inputs.as_slice().try_into().unwrap(),
+        );
+
+        let ix_data = instruction::post_distribution(
+            *pool_id,
+            output.root,
+            output.total_weight,
+            batch_proof.proof_bytes.clone(),
+            batch_proof.public_inputs.clone(),
+        );
+
+        let pool_pda = pda::creator_pool_pda(&self.program_id, pool_id);
+
+        let tx = PreparedTransaction {
+            instruction_data: ix_data,
+            accounts: vec![
+                TransactionAccount {
+                    pubkey: self.local_pubkey,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                TransactionAccount {
+                    pubkey: pool_pda,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            description: format!(
+                "PostDistribution pool={} root={} total_weight={} entries={}",
+                hex::encode(&pool_id[..8]),
+                hex::encode(&output.root[..8]),
+                output.total_weight,
+                output.entry_count,
+            ),
+        };
+
+        debug!(
+            "Preparing PostDistribution for pool={} entries={}",
+            hex::encode(&pool_id[..8]),
+            output.entry_count,
+        );
+        self.submit(tx).await
+    }
+
     /// Force-close a payment channel (unilateral close by sender after timeout).
     pub async fn force_close_channel(
         &self,

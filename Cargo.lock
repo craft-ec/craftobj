@@ -1028,6 +1028,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-prover"
+version = "0.1.0"
+dependencies = [
+ "craftec-core",
+ "craftec-prover-guest-types",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "craftec-prover-guest-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "craftec-settings"
 version = "0.1.0"
 dependencies = [
@@ -1301,11 +1319,14 @@ dependencies = [
  "async-trait",
  "bincode",
  "craftec-app",
+ "craftec-core",
  "craftec-erasure",
  "craftec-ipc",
  "craftec-keystore",
  "craftec-logging",
  "craftec-network",
+ "craftec-prover",
+ "craftec-prover-guest-types",
  "craftec-settlement",
  "datacraft-client",
  "datacraft-core",
