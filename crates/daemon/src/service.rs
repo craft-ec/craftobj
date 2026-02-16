@@ -777,8 +777,8 @@ async fn drive_swarm(
                         }
                         handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
                         handle_gossipsub_storage_receipt(&event, &event_tx, &receipt_store).await;
-                        handle_gossipsub_repair(&event, &repair_coordinator, &store_for_repair, &event_tx).await;
-                        handle_gossipsub_scaling(&event, &scaling_coordinator, &store_for_repair, max_storage_bytes).await;
+                        handle_gossipsub_repair(&event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
+                        handle_gossipsub_scaling(&event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -1246,6 +1246,7 @@ async fn handle_gossipsub_repair(
     repair_coordinator: &Arc<Mutex<crate::repair::RepairCoordinator>>,
     store: &Arc<Mutex<datacraft_store::FsStore>>,
     _event_tx: &EventSender,
+    content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
     use libp2p::gossipsub;
 
@@ -1268,6 +1269,7 @@ async fn handle_gossipsub_repair(
                         // Schedule delayed repair
                         let rc = repair_coordinator.clone();
                         let st = store.clone();
+                        let ct = content_tracker.clone();
                         let cid = signal.content_id;
                         let seg = signal.segment_index;
                         drop(store_guard);
@@ -1279,8 +1281,9 @@ async fn handle_gossipsub_repair(
                                 Ok(m) => m,
                                 Err(_) => return,
                             };
+                            let providers = ct.lock().await.get_providers(&cid);
                             let mut coord = rc.lock().await;
-                            coord.execute_repair(&store_guard, &manifest, cid, seg, &[]);
+                            coord.execute_repair(&store_guard, &manifest, cid, seg, &providers);
                         });
                     }
                 }
@@ -1307,6 +1310,7 @@ async fn handle_gossipsub_scaling(
     scaling_coordinator: &Arc<Mutex<crate::scaling::ScalingCoordinator>>,
     store: &Arc<Mutex<datacraft_store::FsStore>>,
     _max_storage_bytes: u64,
+    content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
     use libp2p::gossipsub;
     use craftec_network::behaviour::CraftBehaviourEvent;
@@ -1331,11 +1335,13 @@ async fn handle_gossipsub_scaling(
                         drop(store_guard);
                         let coord_clone = scaling_coordinator.clone();
                         let store_clone = store.clone();
+                        let ct = content_tracker.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(delay).await;
                             let store_guard = store_clone.lock().await;
+                            let providers = ct.lock().await.get_providers(&cid);
                             let coord = coord_clone.lock().await;
-                            coord.execute_scaling(&store_guard, cid, &[]);
+                            coord.execute_scaling(&store_guard, cid, &providers);
                         });
                     }
                 }

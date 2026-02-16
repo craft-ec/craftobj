@@ -267,19 +267,51 @@ impl ChallengerManager {
                             scorer.lock().await.record_success(&peer, latency);
                         }
 
-                        let storage_node = crate::pdp::peer_id_to_local_pubkey(&peer);
-                        let receipt = create_storage_receipt(
-                            cid, storage_node, self.local_pubkey,
-                            segment_index, piece_id, nonce, proof_hash,
+                        // Cross-verify using our own local pieces for this segment
+                        // TODO: Implement full PDP challenge-response wire protocol
+                        // (challenger sends nonce + byte positions, prover returns bytes).
+                        // For now, we use the piece request protocol and verify locally.
+                        let own_pieces = self.load_own_pieces(store, &cid, segment_index);
+                        let verification = crate::pdp::cross_verify_piece(
+                            &own_pieces,
+                            &coefficients,
+                            &data,
+                            &byte_positions,
                         );
+
+                        let passed = match verification {
+                            crate::pdp::CrossVerifyResult::Verified => {
+                                debug!("PDP cross-verification passed for {} seg{} from {}", cid, segment_index, peer);
+                                true
+                            }
+                            crate::pdp::CrossVerifyResult::InsufficientBasis => {
+                                // Fall back to basic "piece received" for v1
+                                debug!("PDP cross-verification inconclusive for {} seg{} from {} (insufficient basis), accepting", cid, segment_index, peer);
+                                true
+                            }
+                            crate::pdp::CrossVerifyResult::Failed => {
+                                warn!("PDP cross-verification FAILED for {} seg{} from {} — data mismatch!", cid, segment_index, peer);
+                                false
+                            }
+                        };
+
+                        let receipt = if passed {
+                            let storage_node = crate::pdp::peer_id_to_local_pubkey(&peer);
+                            Some(create_storage_receipt(
+                                cid, storage_node, self.local_pubkey,
+                                segment_index, piece_id, nonce, proof_hash,
+                            ))
+                        } else {
+                            None
+                        };
 
                         pdp_results.push(ProviderPdpResult {
                             peer_id: peer,
                             segment_index,
                             piece_id,
                             coefficients,
-                            passed: true,
-                            receipt: Some(receipt),
+                            passed,
+                            receipt,
                         });
                     }
                     Err(e) => {
@@ -408,6 +440,22 @@ impl ChallengerManager {
             healing,
             challenger_receipt: Some(challenger_receipt),
         })
+    }
+
+    /// Load our own pieces for a given CID and segment from local store.
+    /// Returns (data, coefficients) pairs for cross-verification.
+    fn load_own_pieces(&self, store: &FsStore, cid: &ContentId, segment_index: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let piece_ids = match store.list_pieces(cid, segment_index) {
+            Ok(ids) => ids,
+            Err(_) => return Vec::new(),
+        };
+        let mut pieces = Vec::new();
+        for pid in &piece_ids {
+            if let Ok((data, coeff)) = store.get_piece(cid, segment_index, pid) {
+                pieces.push((data, coeff));
+            }
+        }
+        pieces
     }
 
     async fn resolve_providers(&self, cid: ContentId) -> Result<Vec<PeerId>, String> {

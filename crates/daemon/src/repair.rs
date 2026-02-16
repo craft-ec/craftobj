@@ -176,15 +176,14 @@ impl RepairCoordinator {
             return None;
         }
 
-        // Generate one new piece
-        let result = health::heal_content(store, manifest, 1);
+        // Generate one new piece for the specific segment
+        let result = health::heal_segment(store, &content_id, segment_index, 1);
         if result.pieces_generated == 0 {
             warn!("Repair failed for {}/seg{}: {:?}", content_id, segment_index, result.errors);
             return None;
         }
 
         // Find the piece we just generated (latest piece not in our previous list)
-        // For simplicity, get the list of pieces after healing and find the newest
         let pieces_after = store.list_pieces(&content_id, segment_index).ok()?;
         let piece_id = *pieces_after.last()?;
 

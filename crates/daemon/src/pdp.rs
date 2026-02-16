@@ -82,6 +82,161 @@ pub fn compute_proof_hash(piece_data: &[u8], byte_positions: &[u32], coefficient
 }
 
 // ---------------------------------------------------------------------------
+// Cross-verification via GF(2^8) linear algebra
+// ---------------------------------------------------------------------------
+
+/// Result of cross-verification attempt.
+#[derive(Debug, Clone)]
+pub enum CrossVerifyResult {
+    /// Full verification passed — prover's data matches challenger's computation.
+    Verified,
+    /// Full verification failed — data mismatch (fraud or corruption).
+    Failed,
+    /// Challenger's pieces don't span the prover's coefficient vector.
+    /// Falls back to basic "piece received" verification for v1.
+    InsufficientBasis,
+}
+
+/// Attempt to cross-verify a prover's piece using the challenger's own local pieces.
+///
+/// The challenger tries to express the prover's coefficient vector as a linear
+/// combination of its own coefficient vectors using GF(2^8) Gaussian elimination.
+/// If possible, it computes the expected data bytes at the given positions and
+/// compares them with the prover's actual data.
+///
+/// # Arguments
+/// * `own_pieces` - Challenger's local pieces for the same segment (data + coefficients)
+/// * `prover_coefficients` - The prover's piece coefficient vector
+/// * `prover_data` - The prover's piece data
+/// * `byte_positions` - Positions to verify within the piece data
+///
+/// # Returns
+/// `CrossVerifyResult` indicating whether verification passed, failed, or was inconclusive.
+pub fn cross_verify_piece(
+    own_pieces: &[(Vec<u8>, Vec<u8>)], // (data, coefficients) pairs
+    prover_coefficients: &[u8],
+    prover_data: &[u8],
+    byte_positions: &[u32],
+) -> CrossVerifyResult {
+    use craftec_erasure::gf256::GF256;
+
+    if own_pieces.is_empty() || prover_coefficients.is_empty() {
+        return CrossVerifyResult::InsufficientBasis;
+    }
+
+    let k = prover_coefficients.len();
+
+    // Build coefficient matrix from our own pieces
+    let mut own_coeffs: Vec<Vec<u8>> = Vec::new();
+    let mut own_data: Vec<&[u8]> = Vec::new();
+    for (data, coeff) in own_pieces {
+        if coeff.len() == k {
+            own_coeffs.push(coeff.clone());
+            own_data.push(data);
+        }
+    }
+
+    if own_coeffs.is_empty() {
+        return CrossVerifyResult::InsufficientBasis;
+    }
+
+    // We need to find scalars α_i such that:
+    //   Σ α_i * own_coeffs[i] = prover_coefficients
+    // This is equivalent to solving a linear system.
+    //
+    // Augmented matrix: [own_coeffs^T | prover_coefficients^T]
+    // Each row corresponds to one coefficient dimension (k rows),
+    // each column is one of our pieces + the prover target.
+
+    let n = own_coeffs.len(); // number of our pieces
+    // Build augmented matrix: k rows × (n+1) columns
+    let mut matrix: Vec<Vec<u8>> = Vec::with_capacity(k);
+    for row in 0..k {
+        let mut r = Vec::with_capacity(n + 1);
+        for col in 0..n {
+            r.push(own_coeffs[col][row]);
+        }
+        r.push(prover_coefficients[row]);
+        matrix.push(r);
+    }
+
+    // Gaussian elimination to solve for alphas
+    let cols = n + 1;
+    let mut pivot_col = 0;
+    let mut pivot_rows = Vec::new();
+    for row in 0..k {
+        if pivot_col >= n {
+            break;
+        }
+        // Find pivot
+        let pivot = (row..k).find(|&r| matrix[r][pivot_col] != 0);
+        let pivot_idx = match pivot {
+            Some(p) => p,
+            None => {
+                // Try next column? No — we go column by column up to n
+                // Skip this column if no pivot
+                pivot_col += 1;
+                continue;
+            }
+        };
+        matrix.swap(row, pivot_idx);
+        let inv = match GF256::inv(matrix[row][pivot_col]) {
+            Some(v) => v,
+            None => { pivot_col += 1; continue; }
+        };
+        for c in 0..cols {
+            matrix[row][c] = GF256::mul(matrix[row][c], inv);
+        }
+        for other in 0..k {
+            if other == row { continue; }
+            let factor = matrix[other][pivot_col];
+            if factor == 0 { continue; }
+            for c in 0..cols {
+                let val = GF256::mul(factor, matrix[row][c]);
+                matrix[other][c] = GF256::add(matrix[other][c], val);
+            }
+        }
+        pivot_rows.push((row, pivot_col));
+        pivot_col += 1;
+    }
+
+    // Check consistency: any row with all zeros in first n columns but non-zero in last column
+    // means the system is inconsistent (prover's vector is NOT in our span).
+    for row in 0..k {
+        let all_zero = (0..n).all(|c| matrix[row][c] == 0);
+        if all_zero && matrix[row][n] != 0 {
+            return CrossVerifyResult::InsufficientBasis;
+        }
+    }
+
+    // Extract the solution alphas from the augmented column
+    let mut alphas = vec![0u8; n];
+    for &(row, col) in &pivot_rows {
+        alphas[col] = matrix[row][n];
+    }
+
+    // Now compute expected data at the byte positions:
+    // expected_byte[pos] = Σ α_i * own_data[i][pos]
+    for &pos in byte_positions {
+        let pos = pos as usize;
+        if pos >= prover_data.len() {
+            continue;
+        }
+        let mut expected = 0u8;
+        for (i, &alpha) in alphas.iter().enumerate() {
+            if alpha == 0 { continue; }
+            let own_byte = if pos < own_data[i].len() { own_data[i][pos] } else { 0 };
+            expected = GF256::add(expected, GF256::mul(alpha, own_byte));
+        }
+        if expected != prover_data[pos] {
+            return CrossVerifyResult::Failed;
+        }
+    }
+
+    CrossVerifyResult::Verified
+}
+
+// ---------------------------------------------------------------------------
 // Wire encoding (length-prefixed JSON)
 // ---------------------------------------------------------------------------
 

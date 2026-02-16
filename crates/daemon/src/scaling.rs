@@ -164,22 +164,31 @@ impl ScalingCoordinator {
             }
         }
 
-        // We must hold ≥2 pieces for this content to create a recombination.
-        // Check segment 0 as proxy.
-        let pieces = match store.list_pieces(&signal.content_id, 0) {
-            Ok(p) if p.len() >= 2 => p,
-            _ => {
-                debug!(
-                    "Not a provider for {} (no pieces or <2), skipping scaling",
-                    signal.content_id
-                );
+        // We must hold ≥2 pieces for ANY segment to create a recombination.
+        let manifest = match store.get_manifest(&signal.content_id) {
+            Ok(m) => m,
+            Err(_) => {
+                debug!("No manifest for {}, skipping scaling", signal.content_id);
                 return None;
             }
         };
 
+        let mut total_local = 0usize;
+        for seg in 0..manifest.segment_count as u32 {
+            total_local += store.list_pieces(&signal.content_id, seg).unwrap_or_default().len();
+        }
+
+        if total_local < 2 {
+            debug!(
+                "Not a provider for {} (total {} pieces < 2), skipping scaling",
+                signal.content_id, total_local
+            );
+            return None;
+        }
+
         info!(
             "Scheduling scaling push for {}: demand_level={}, have {} local pieces",
-            signal.content_id, signal.demand_level, pieces.len()
+            signal.content_id, signal.demand_level, total_local
         );
 
         self.recent_scaling.insert(signal.content_id, Instant::now());
@@ -195,10 +204,27 @@ impl ScalingCoordinator {
         content_id: ContentId,
         known_providers: &[PeerId],
     ) {
-        // Collect existing pieces from segment 0 for recombination
-        let piece_ids = match store.list_pieces(&content_id, 0) {
-            Ok(ids) if ids.len() >= 2 => ids,
-            _ => {
+        // Find a segment with ≥2 pieces for recombination
+        let manifest = match store.get_manifest(&content_id) {
+            Ok(m) => m,
+            Err(_) => {
+                debug!("No manifest for scaling {}", content_id);
+                return;
+            }
+        };
+
+        let mut best_seg: Option<(u32, Vec<[u8; 32]>)> = None;
+        for seg in 0..manifest.segment_count as u32 {
+            if let Ok(ids) = store.list_pieces(&content_id, seg) {
+                if ids.len() >= 2 && (best_seg.is_none() || ids.len() > best_seg.as_ref().unwrap().1.len()) {
+                    best_seg = Some((seg, ids));
+                }
+            }
+        }
+
+        let (segment_index, piece_ids) = match best_seg {
+            Some(s) => s,
+            None => {
                 debug!("Not enough pieces for scaling recombination of {}", content_id);
                 return;
             }
@@ -206,7 +232,7 @@ impl ScalingCoordinator {
 
         let mut existing_pieces = Vec::new();
         for pid in &piece_ids {
-            if let Ok((data, coeff)) = store.get_piece(&content_id, 0, pid) {
+            if let Ok((data, coeff)) = store.get_piece(&content_id, segment_index, pid) {
                 existing_pieces.push(craftec_erasure::CodedPiece {
                     data,
                     coefficients: coeff,
@@ -230,7 +256,7 @@ impl ScalingCoordinator {
 
         let new_pid = datacraft_store::piece_id_from_coefficients(&new_piece.coefficients);
 
-        info!("Scaling: created new piece for {}, selecting push target", content_id);
+        info!("Scaling: created new piece for {}/seg{}, selecting push target", content_id, segment_index);
 
         // Select push target: prefer non-providers, fall back to providers.
         let target = push_target::select_push_target(
@@ -242,11 +268,10 @@ impl ScalingCoordinator {
             Some(p) => p,
             None => {
                 // Store locally as fallback
-                let _ = store.store_piece(&content_id, 0, &new_pid, &new_piece.data, &new_piece.coefficients);
-                // Update storage Merkle tree (best-effort, non-blocking)
+                let _ = store.store_piece(&content_id, segment_index, &new_pid, &new_piece.data, &new_piece.coefficients);
                 if let Some(ref mt) = self.merkle_tree {
                     if let Ok(mut tree) = mt.try_lock() {
-                        tree.insert(&content_id, 0, &new_pid);
+                        tree.insert(&content_id, segment_index, &new_pid);
                     }
                 }
                 debug!("No push target available for scaling {}, stored locally", content_id);
@@ -259,7 +284,7 @@ impl ScalingCoordinator {
         if self.command_tx.send(DataCraftCommand::PushPiece {
             peer_id: target_peer,
             content_id,
-            segment_index: 0,
+            segment_index,
             piece_id: new_pid,
             coefficients: new_piece.coefficients,
             piece_data: new_piece.data,
@@ -267,7 +292,7 @@ impl ScalingCoordinator {
         }).is_err() {
             warn!("Failed to send PushPiece command for scaling {}", content_id);
         } else {
-            info!("Scaling: pushing piece to {} for {}", target_peer, content_id);
+            info!("Scaling: pushing piece to {} for {}/seg{}", target_peer, content_id, segment_index);
         }
     }
 
@@ -437,9 +462,20 @@ mod tests {
                 .as_secs(),
         };
 
-        // Create a store with ≥2 pieces so we count as a provider
+        // Create a store with manifest + ≥2 pieces so we count as a provider
         let tmp = tempfile::tempdir().unwrap();
         let store = datacraft_store::FsStore::new(tmp.path()).unwrap();
+        let manifest = datacraft_core::ContentManifest {
+            content_id: cid,
+            content_hash: cid.0,
+            segment_size: 10_240_000,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 200,
+            creator: String::new(),
+            signature: vec![],
+        };
+        store.store_manifest(&manifest).unwrap();
         let piece_data = vec![0u8; 100];
         let coeff1 = vec![1u8, 0, 0];
         let coeff2 = vec![0u8, 1, 0];

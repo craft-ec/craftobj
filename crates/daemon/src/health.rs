@@ -166,7 +166,61 @@ pub struct HealingResult {
     pub errors: Vec<String>,
 }
 
-/// Generate new pieces via RLNC recombination to heal a CID.
+/// Generate new pieces via RLNC recombination for a specific segment.
+pub fn heal_segment(
+    store: &FsStore,
+    content_id: &ContentId,
+    segment_index: u32,
+    pieces_needed: usize,
+) -> HealingResult {
+    let mut generated = 0;
+    let mut errors = Vec::new();
+
+    let piece_ids = match store.list_pieces(content_id, segment_index) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return HealingResult { pieces_generated: 0, errors: vec![format!("segment {}: {}", segment_index, e)] };
+        }
+    };
+
+    if piece_ids.len() < 2 {
+        return HealingResult { pieces_generated: 0, errors: vec![format!("segment {}: need ≥2 pieces to recombine, have {}", segment_index, piece_ids.len())] };
+    }
+
+    let mut existing_pieces = Vec::new();
+    for pid in &piece_ids {
+        if let Ok((data, coeff)) = store.get_piece(content_id, segment_index, pid) {
+            existing_pieces.push(craftec_erasure::CodedPiece { data, coefficients: coeff });
+        }
+    }
+
+    if existing_pieces.len() < 2 {
+        return HealingResult { pieces_generated: 0, errors: vec![format!("segment {}: could not read ≥2 pieces", segment_index)] };
+    }
+
+    for _ in 0..pieces_needed {
+        match craftec_erasure::create_piece_from_existing(&existing_pieces) {
+            Ok(new_piece) => {
+                let new_pid = datacraft_store::piece_id_from_coefficients(&new_piece.coefficients);
+                match store.store_piece(content_id, segment_index, &new_pid, &new_piece.data, &new_piece.coefficients) {
+                    Ok(()) => {
+                        info!("Generated healing piece for {}/seg{}", content_id, segment_index);
+                        generated += 1;
+                    }
+                    Err(e) => errors.push(format!("store failed: {}", e)),
+                }
+            }
+            Err(e) => {
+                errors.push(format!("recombination failed: {}", e));
+                break;
+            }
+        }
+    }
+
+    HealingResult { pieces_generated: generated, errors }
+}
+
+/// Generate new pieces via RLNC recombination to heal a CID (all segments).
 pub fn heal_content(
     store: &FsStore,
     manifest: &ContentManifest,
