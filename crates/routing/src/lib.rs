@@ -4,12 +4,12 @@
 //!
 //! DHT keys:
 //! - `/datacraft/providers/<cid_hex>` — provider records
-//! - `/datacraft/manifest/<cid_hex>` — serialized ChunkManifest
+//! - `/datacraft/manifest/<cid_hex>` — serialized ContentManifest
 
 use std::time::Duration;
 
 use datacraft_core::{
-    ChunkManifest, ContentId, DataCraftError, RemovalNotice, Result,
+    ContentManifest, ContentId, DataCraftError, RemovalNotice, Result,
     MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,
     REMOVAL_DHT_PREFIX,
     access::AccessList,
@@ -84,7 +84,7 @@ impl ContentRouter {
     /// Publish a manifest to the DHT as a record.
     pub fn publish_manifest(
         behaviour: &mut CraftBehaviour,
-        manifest: &ChunkManifest,
+        manifest: &ContentManifest,
         local_peer_id: &PeerId,
     ) -> Result<kad::QueryId> {
         let key = manifest_dht_key(&manifest.content_id);
@@ -230,7 +230,7 @@ impl ContentRouter {
 }
 
 /// Parse a manifest from a DHT record value.
-pub fn parse_manifest_record(value: &[u8]) -> Result<ChunkManifest> {
+pub fn parse_manifest_record(value: &[u8]) -> Result<ContentManifest> {
     serde_json::from_slice(value)
         .map_err(|e| DataCraftError::ManifestError(e.to_string()))
 }
@@ -296,12 +296,10 @@ mod tests {
         let key = rekey_dht_key(&cid, &recipient);
         let key_str = String::from_utf8(key).unwrap();
         assert!(key_str.starts_with("/datacraft/rekey/"));
-        // Should contain cid hex + "/" + recipient hex
-        assert!(key_str.contains("/"));
         let parts: Vec<&str> = key_str.strip_prefix("/datacraft/rekey/").unwrap().split('/').collect();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].len(), 64); // CID hex
-        assert_eq!(parts[1].len(), 64); // recipient DID hex
+        assert_eq!(parts[0].len(), 64);
+        assert_eq!(parts[1].len(), 64);
     }
 
     #[test]
@@ -376,23 +374,20 @@ mod tests {
 
     #[test]
     fn test_parse_manifest_record() {
-        use datacraft_core::default_erasure_config;
-
         let cid = ContentId::from_bytes(b"test");
-        let manifest = ChunkManifest {
+        let manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            k: 4,
-            chunk_size: 65536,
-            chunk_count: 1,
-            erasure_config: default_erasure_config(),
-            content_size: 1024,
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 1024,
             creator: String::new(),
             signature: vec![],
         };
         let value = serde_json::to_vec(&manifest).unwrap();
         let parsed = parse_manifest_record(&value).unwrap();
         assert_eq!(parsed.content_id, manifest.content_id);
-        assert_eq!(parsed.content_size, 1024);
+        assert_eq!(parsed.total_size, 1024);
     }
 }
