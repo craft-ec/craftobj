@@ -49,6 +49,8 @@ pub struct DataCraftHandler {
     node_signing_key: Option<ed25519_dalek::SigningKey>,
     /// Eviction manager for recording access on fetch.
     eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
+    /// Storage Merkle tree for incremental updates on store operations.
+    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
 }
 
 impl DataCraftHandler {
@@ -75,7 +77,12 @@ impl DataCraftHandler {
             event_sender: None,
             node_signing_key: None,
             eviction_manager: None,
+            merkle_tree: None,
         }
+    }
+
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+        self.merkle_tree = Some(tree);
     }
 
     pub fn set_eviction_manager(&mut self, mgr: Arc<Mutex<crate::eviction::EvictionManager>>) {
@@ -129,6 +136,7 @@ impl DataCraftHandler {
             event_sender: None,
             node_signing_key: None,
             eviction_manager: None,
+            merkle_tree: None,
         }
     }
 
@@ -678,6 +686,10 @@ impl DataCraftHandler {
                         if let Err(e) = client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients) {
                             warn!("Failed to store piece: {}", e);
                             continue;
+                        }
+                        // Update storage Merkle tree
+                        if let Some(ref mt) = self.merkle_tree {
+                            mt.lock().await.insert(content_id, seg_idx, &piece_id);
                         }
                         fetched += 1;
                     }

@@ -326,6 +326,7 @@ pub async fn run_daemon_with_config(
     handler.set_daemon_config(daemon_config_shared, data_dir.clone());
     handler.set_eviction_manager(eviction_manager.clone());
     handler.set_event_sender(event_tx.clone());
+    handler.set_merkle_tree(merkle_tree.clone());
     if let Some(key) = node_signing_key {
         handler.set_node_signing_key(key);
     }
@@ -353,6 +354,7 @@ pub async fn run_daemon_with_config(
     // Shared PDP rank data between challenger and eviction loops
     let pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>> = Arc::new(Mutex::new(HashMap::new()));
     challenger_mgr.set_pdp_ranks(pdp_ranks.clone());
+    challenger_mgr.set_merkle_tree(merkle_tree.clone());
 
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
@@ -398,9 +400,9 @@ pub async fn run_daemon_with_config(
 
     // Scaling: coordinator for demand-driven piece acquisition
     let scaling_command_tx = command_tx.clone();
-    let scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>> = Arc::new(Mutex::new(
-        crate::scaling::ScalingCoordinator::new(local_peer_id, scaling_command_tx),
-    ));
+    let mut scaling_coord = crate::scaling::ScalingCoordinator::new(local_peer_id, scaling_command_tx);
+    scaling_coord.set_merkle_tree(merkle_tree.clone());
+    let scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>> = Arc::new(Mutex::new(scaling_coord));
 
     // Aggregator config — configurable epoch, default 10 min
     let aggregator_config = crate::aggregator::AggregatorConfig {

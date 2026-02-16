@@ -107,6 +107,8 @@ pub struct ScalingCoordinator {
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
     /// Track which CIDs we've recently attempted scaling for (avoid duplicates).
     recent_scaling: HashMap<ContentId, Instant>,
+    /// Storage Merkle tree for incremental updates on local store.
+    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
 }
 
 impl ScalingCoordinator {
@@ -119,7 +121,12 @@ impl ScalingCoordinator {
             command_tx,
             peer_scorer: None,
             recent_scaling: HashMap::new(),
+            merkle_tree: None,
         }
+    }
+
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+        self.merkle_tree = Some(tree);
     }
 
     pub fn set_peer_scorer(&mut self, scorer: Arc<Mutex<PeerScorer>>) {
@@ -236,6 +243,12 @@ impl ScalingCoordinator {
             None => {
                 // Store locally as fallback
                 let _ = store.store_piece(&content_id, 0, &new_pid, &new_piece.data, &new_piece.coefficients);
+                // Update storage Merkle tree (best-effort, non-blocking)
+                if let Some(ref mt) = self.merkle_tree {
+                    if let Ok(mut tree) = mt.try_lock() {
+                        tree.insert(&content_id, 0, &new_pid);
+                    }
+                }
                 debug!("No push target available for scaling {}, stored locally", content_id);
                 return;
             }

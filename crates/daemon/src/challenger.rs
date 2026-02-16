@@ -11,6 +11,7 @@ use datacraft_core::{ContentId, StorageReceipt};
 use datacraft_store::FsStore;
 use ed25519_dalek::SigningKey;
 use libp2p::PeerId;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -29,6 +30,12 @@ pub const CHALLENGE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Minimum time between challenge rounds for the same CID.
 pub const MIN_ROUND_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Maximum number of CIDs to challenge per round (sampled randomly).
+pub const MAX_CIDS_PER_ROUND: usize = 10;
+
+/// Maximum number of providers to challenge per CID per round (sampled randomly).
+pub const MAX_PROVIDERS_PER_CID: usize = 5;
 
 #[derive(Debug)]
 struct ProvidedCid {
@@ -49,6 +56,8 @@ pub struct ChallengerManager {
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
     /// Shared PDP rank data for eviction retirement checks.
     pdp_ranks: Option<Arc<Mutex<PdpRankData>>>,
+    /// Storage Merkle tree for updating after healing.
+    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
 }
 
 /// Shared PDP rank data: maps CID → (k, segment_index → rank).
@@ -71,7 +80,12 @@ impl ChallengerManager {
             persistent_store: None,
             peer_scorer: None,
             pdp_ranks: None,
+            merkle_tree: None,
         }
+    }
+
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+        self.merkle_tree = Some(tree);
     }
 
     pub fn set_pdp_ranks(&mut self, ranks: Arc<Mutex<PdpRankData>>) {
@@ -106,7 +120,7 @@ impl ChallengerManager {
     /// Check all provided CIDs and run challenge rounds for those that are due.
     pub async fn periodic_check(&mut self, store: &FsStore) -> usize {
         let now = Instant::now();
-        let due_cids: Vec<ContentId> = self
+        let mut due_cids: Vec<ContentId> = self
             .provided_cids
             .iter()
             .filter(|(_, state)| {
@@ -117,6 +131,12 @@ impl ChallengerManager {
             })
             .map(|(cid, _)| *cid)
             .collect();
+
+        // Sample a subset of due CIDs to bound per-round work
+        if due_cids.len() > MAX_CIDS_PER_ROUND {
+            due_cids.shuffle(&mut rand::thread_rng());
+            due_cids.truncate(MAX_CIDS_PER_ROUND);
+        }
 
         let mut rounds_run = 0;
         for cid in due_cids {
@@ -178,18 +198,23 @@ impl ChallengerManager {
         let segments_to_check: Vec<u32> = if segment_count <= 5 {
             (0..segment_count).collect()
         } else {
-            use rand::seq::SliceRandom;
             let mut all: Vec<u32> = (0..segment_count).collect();
             all.shuffle(&mut rand::thread_rng());
             all.truncate(5);
             all
         };
 
-        let other_providers: Vec<PeerId> = providers
+        let mut other_providers: Vec<PeerId> = providers
             .iter()
             .filter(|p| **p != self.local_peer_id)
             .copied()
             .collect();
+
+        // Sample a subset of providers to bound per-CID work
+        if other_providers.len() > MAX_PROVIDERS_PER_CID {
+            other_providers.shuffle(&mut rand::thread_rng());
+            other_providers.truncate(MAX_PROVIDERS_PER_CID);
+        }
 
         // Step 1: Query full inventory from all providers to get ALL coefficient vectors
         // for accurate network rank computation.
@@ -318,7 +343,16 @@ impl ChallengerManager {
                 }
             }
 
-            Some(health::heal_content(store, &manifest, health.pieces_needed))
+            let result = health::heal_content(store, &manifest, health.pieces_needed);
+            // Rebuild Merkle tree after healing added new pieces
+            if result.pieces_generated > 0 {
+                if let Some(ref mt) = self.merkle_tree {
+                    if let Ok(new_tree) = datacraft_store::merkle::StorageMerkleTree::build_from_store(store) {
+                        *mt.lock().await = new_tree;
+                    }
+                }
+            }
+            Some(result)
         } else {
             None
         };
@@ -495,5 +529,130 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_sampled_cid_selection_bounded() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut mgr = ChallengerManager::new(PeerId::random(), [0u8; 32], tx);
+
+        // Register more CIDs than MAX_CIDS_PER_ROUND
+        let num_cids = MAX_CIDS_PER_ROUND + 20;
+        for i in 0..num_cids {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            id[1] = (i >> 8) as u8;
+            mgr.register_cid(ContentId(id), None);
+        }
+
+        let now = Instant::now();
+        let mut due_cids: Vec<ContentId> = mgr
+            .provided_cids
+            .iter()
+            .filter(|(_, state)| {
+                state.last_challenged
+                    .map(|t| now.duration_since(t) >= MIN_ROUND_INTERVAL)
+                    .unwrap_or(true)
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+
+        assert_eq!(due_cids.len(), num_cids);
+
+        // Apply sampling
+        if due_cids.len() > MAX_CIDS_PER_ROUND {
+            due_cids.shuffle(&mut rand::thread_rng());
+            due_cids.truncate(MAX_CIDS_PER_ROUND);
+        }
+
+        assert_eq!(due_cids.len(), MAX_CIDS_PER_ROUND);
+    }
+
+    #[test]
+    fn test_sampled_provider_selection_bounded() {
+        // Simulate provider sampling logic
+        let mut providers: Vec<PeerId> = (0..20).map(|_| PeerId::random()).collect();
+        assert_eq!(providers.len(), 20);
+
+        if providers.len() > MAX_PROVIDERS_PER_CID {
+            providers.shuffle(&mut rand::thread_rng());
+            providers.truncate(MAX_PROVIDERS_PER_CID);
+        }
+
+        assert_eq!(providers.len(), MAX_PROVIDERS_PER_CID);
+    }
+
+    #[test]
+    fn test_sampling_no_op_when_under_limit() {
+        // When fewer CIDs than limit, all are kept
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut mgr = ChallengerManager::new(PeerId::random(), [0u8; 32], tx);
+
+        for i in 0..3u8 {
+            mgr.register_cid(ContentId([i; 32]), None);
+        }
+
+        let mut due_cids: Vec<ContentId> = mgr.provided_cids.keys().copied().collect();
+        if due_cids.len() > MAX_CIDS_PER_ROUND {
+            due_cids.shuffle(&mut rand::thread_rng());
+            due_cids.truncate(MAX_CIDS_PER_ROUND);
+        }
+
+        assert_eq!(due_cids.len(), 3); // All kept, not truncated
+    }
+
+    #[test]
+    fn test_merkle_root_changes_on_piece_operations() {
+        use datacraft_store::merkle::StorageMerkleTree;
+
+        let mut tree = StorageMerkleTree::new();
+        let initial_root = tree.root();
+
+        let cid = ContentId([1u8; 32]);
+        let piece = [2u8; 32];
+        tree.insert(&cid, 0, &piece);
+        let after_insert = tree.root();
+        assert_ne!(initial_root, after_insert, "Root must change after insert");
+
+        let piece2 = [3u8; 32];
+        tree.insert(&cid, 1, &piece2);
+        let after_second = tree.root();
+        assert_ne!(after_insert, after_second, "Root must change after second insert");
+
+        tree.remove(&cid, 1, &piece2);
+        assert_eq!(tree.root(), after_insert, "Root must revert after remove");
+
+        tree.remove(&cid, 0, &piece);
+        assert_eq!(tree.root(), initial_root, "Root must revert to empty after all removed");
+    }
+
+    #[test]
+    fn test_merkle_root_in_capability_announcement() {
+        use datacraft_core::CapabilityAnnouncement;
+        use datacraft_store::merkle::StorageMerkleTree;
+
+        let mut tree = StorageMerkleTree::new();
+        tree.insert(&ContentId([1u8; 32]), 0, &[2u8; 32]);
+        let root = tree.root();
+
+        // Simulate what announce_capabilities_periodically does
+        let announcement = CapabilityAnnouncement {
+            peer_id: vec![0u8; 32],
+            capabilities: vec![],
+            timestamp: 0,
+            signature: vec![],
+            storage_committed_bytes: 0,
+            storage_used_bytes: 0,
+            region: None,
+            storage_root: root,
+        };
+
+        assert_eq!(announcement.storage_root, root);
+        assert_ne!(announcement.storage_root, [0u8; 32], "Storage root should not be zero after insert");
+
+        // Serialize and deserialize to verify it roundtrips
+        let json = serde_json::to_vec(&announcement).unwrap();
+        let deserialized: CapabilityAnnouncement = serde_json::from_slice(&json).unwrap();
+        assert_eq!(deserialized.storage_root, root);
     }
 }
