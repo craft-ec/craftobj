@@ -1099,6 +1099,29 @@ impl DataCraftHandler {
         }))
     }
 
+    /// Delete content from local store only (no network propagation).
+    /// For client-side content the user published or fetched — safe to remove.
+    async fn handle_data_delete_local(&self, params: Option<Value>) -> Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
+        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+
+        // Delete pieces + manifest from local store
+        {
+            let client = self.client.lock().await;
+            client.store().delete_content(&content_id).map_err(|e| e.to_string())?;
+        }
+
+        // Remove from content tracker
+        if let Some(ref tracker) = self.content_tracker {
+            let mut t = tracker.lock().await;
+            t.remove(&content_id);
+        }
+
+        info!("Deleted local content {}", content_id);
+        Ok(serde_json::json!({ "deleted": true }))
+    }
+
     async fn handle_data_remove(&self, params: Option<Value>) -> Result<Value, String> {
         let params = params.ok_or("missing params")?;
         let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
@@ -1919,6 +1942,7 @@ impl IpcHandler for DataCraftHandler {
                 "receipt.storage.list" => self.handle_storage_receipt_list(params).await,
                 "data.providers" => self.handle_data_providers(params).await,
                 "data.remove" => self.handle_data_remove(params).await,
+                "data.delete_local" => self.handle_data_delete_local(params).await,
                 "access.grant" => self.handle_access_grant(params).await,
                 "access.revoke" => self.handle_access_revoke(params).await,
                 "access.revoke_rotate" => self.handle_access_revoke_rotate(params).await,
