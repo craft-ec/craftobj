@@ -402,7 +402,7 @@ pub async fn run_daemon_with_config(
         }
         _ = crate::reannounce::content_maintenance_loop(
             content_tracker,
-            command_tx_for_maintenance,
+            command_tx_for_maintenance.clone(),
             client.clone(),
             daemon_config.reannounce_interval_secs,
             event_tx.clone(),
@@ -410,9 +410,42 @@ pub async fn run_daemon_with_config(
         ) => {
             info!("Content maintenance loop ended");
         }
+        _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id) => {
+            info!("Scaling maintenance loop ended");
+        }
     }
 
     Ok(())
+}
+
+/// Periodically check demand and broadcast signals for hot content.
+async fn scaling_maintenance_loop(
+    demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
+    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    local_peer_id: libp2p::PeerId,
+) {
+    use std::time::Duration;
+    // Initial delay
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        let mut tracker = demand_tracker.lock().await;
+        let hot_cids = tracker.check_demand();
+        for (cid, demand_level) in hot_cids {
+            if tracker.should_broadcast_demand(&cid) {
+                let signal = crate::scaling::create_demand_signal(cid, demand_level, 0, &local_peer_id);
+                if let Ok(data) = bincode::serialize(&signal) {
+                    let _ = command_tx.send(DataCraftCommand::BroadcastDemandSignal {
+                        signal_data: data,
+                    });
+                    info!("Broadcasting demand signal for {}: level={}", cid, demand_level);
+                }
+            }
+        }
+        tracker.cleanup();
+    }
 }
 
 /// Drive the swarm event loop.

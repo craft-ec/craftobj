@@ -31,6 +31,7 @@ const MAX_SIGNAL_AGE: Duration = Duration::from_secs(300);
 const BASE_SCALING_DELAY: Duration = Duration::from_secs(15);
 
 /// Tracks fetch request rates per CID to detect demand.
+#[derive(Default)]
 pub struct DemandTracker {
     /// Fetch timestamps per content ID.
     fetches: HashMap<ContentId, Vec<Instant>>,
@@ -40,10 +41,7 @@ pub struct DemandTracker {
 
 impl DemandTracker {
     pub fn new() -> Self {
-        Self {
-            fetches: HashMap::new(),
-            last_broadcast: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Record that we served a piece for this content.
