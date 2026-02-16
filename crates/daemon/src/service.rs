@@ -1394,6 +1394,25 @@ async fn handle_protocol_events(
                         Err(_) => {}
                     }
                 }
+
+                // Query DHT for other providers — needed for repair/scaling push target selection
+                let tracker_clone = content_tracker.clone();
+                let cmd_tx = command_tx.clone();
+                tokio::spawn(async move {
+                    // Small delay to let other nodes announce first
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let cmd = DataCraftCommand::ResolveProviders { content_id, reply_tx };
+                    if cmd_tx.send(cmd).is_ok() {
+                        if let Ok(Ok(providers)) = reply_rx.await {
+                            let mut t = tracker_clone.lock().await;
+                            for peer in &providers {
+                                t.add_provider(&content_id, *peer);
+                            }
+                            info!("Storage node discovered {} providers for {}", providers.len(), content_id);
+                        }
+                    }
+                });
             }
             DataCraftEvent::DhtError { content_id, error } => {
                 warn!("DHT error for {}: {}", content_id, error);

@@ -153,6 +153,10 @@ async fn check_providers(
             let count = providers.len();
             debug!("Content {} has {} providers", content_id, count);
             let mut t = tracker.lock().await;
+            // Track individual provider PeerIds for push target selection
+            for peer in &providers {
+                t.add_provider(content_id, *peer);
+            }
             t.update_provider_count(content_id, count);
             if count > 0 {
                 if let Some(state) = t.get(content_id) {

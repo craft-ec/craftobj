@@ -155,7 +155,7 @@ impl ContentTracker {
             remote_pieces: 0,
             segment_count: manifest.segment_count,
             k,
-            provider_count: 0,
+            provider_count: 2, // At minimum: publisher + self
             last_announced: None,
             last_checked: None,
             created_at: now,
@@ -208,7 +208,14 @@ impl ContentTracker {
 
     /// Record a provider PeerId for a CID (from DHT discovery or gossipsub).
     pub fn add_provider(&mut self, content_id: &ContentId, peer: PeerId) {
-        self.providers.entry(*content_id).or_default().insert(peer);
+        let set = self.providers.entry(*content_id).or_default();
+        set.insert(peer);
+        // Keep provider_count in sync with actual known providers
+        if let Some(state) = self.states.get_mut(content_id) {
+            if set.len() > state.provider_count {
+                state.provider_count = set.len();
+            }
+        }
     }
 
     /// Get known provider PeerIds for a CID.
