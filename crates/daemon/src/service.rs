@@ -417,7 +417,7 @@ pub async fn run_daemon_with_config(
         ) => {
             info!("Content maintenance loop ended");
         }
-        _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id) => {
+        _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone()) => {
             info!("Scaling maintenance loop ended");
         }
         _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone()) => {
@@ -433,6 +433,7 @@ async fn scaling_maintenance_loop(
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     local_peer_id: libp2p::PeerId,
+    peer_scorer: Arc<Mutex<crate::peer_scorer::PeerScorer>>,
 ) {
     use std::time::Duration;
     // Initial delay
@@ -444,7 +445,19 @@ async fn scaling_maintenance_loop(
         let mut tracker = demand_tracker.lock().await;
         let hot_cids = tracker.check_demand();
         for (cid, demand_level) in hot_cids {
-            if tracker.should_broadcast_demand(&cid) {
+            // TODO: pass actual non_providers_exist check from content_tracker/DHT
+            if tracker.should_broadcast_demand(&cid, true) {
+                // Don't broadcast if all known peers are already providers —
+                // scaling can't place pieces if there's nobody new.
+                let has_targets = crate::push_target::has_non_provider_targets(
+                    &local_peer_id,
+                    &[], // TODO: pass actual provider PeerIds when content_tracker tracks them
+                    &Some(peer_scorer.clone()),
+                );
+                if !has_targets {
+                    debug!("Skipping scaling notice for {}: no non-provider targets", cid);
+                    continue;
+                }
                 let signal = crate::scaling::create_demand_signal(cid, demand_level, 0, &local_peer_id);
                 if let Ok(data) = bincode::serialize(&signal) {
                     let _ = command_tx.send(DataCraftCommand::BroadcastDemandSignal {

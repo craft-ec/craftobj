@@ -44,6 +44,28 @@ pub fn select_push_target(
     ranked.iter().find(|p| **p != *local_peer_id).copied()
 }
 
+/// Check whether any non-provider peers exist (i.e., scaling can actually place pieces).
+/// Returns `true` if at least one known peer is NOT in `known_providers` and is not us.
+pub fn has_non_provider_targets(
+    local_peer_id: &PeerId,
+    known_providers: &[PeerId],
+    peer_scorer: &Option<Arc<Mutex<PeerScorer>>>,
+) -> bool {
+    let scorer = match peer_scorer.as_ref() {
+        Some(s) => s,
+        None => return false,
+    };
+    let scorer_guard = match scorer.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    let result = scorer_guard
+        .iter()
+        .any(|(p, _)| *p != *local_peer_id && !known_providers.contains(p));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +124,32 @@ mod tests {
         let local = PeerId::random();
         let target = select_push_target(&local, &[], &None);
         assert_eq!(target, None);
+    }
+
+    #[test]
+    fn test_has_non_provider_targets_true() {
+        let local = PeerId::random();
+        let provider = PeerId::random();
+        let non_provider = PeerId::random();
+        let scorer = make_scorer(&[(provider, 1.0), (non_provider, 0.5)]);
+        assert!(has_non_provider_targets(&local, &[provider], &scorer));
+    }
+
+    #[test]
+    fn test_all_peers_are_providers_no_scaling() {
+        let local = PeerId::random();
+        let p1 = PeerId::random();
+        let p2 = PeerId::random();
+        let scorer = make_scorer(&[(p1, 1.0), (p2, 0.5)]);
+        // All known peers are providers → no non-provider targets
+        assert!(!has_non_provider_targets(&local, &[p1, p2], &scorer));
+    }
+
+    #[test]
+    fn test_has_non_provider_targets_empty() {
+        let local = PeerId::random();
+        let scorer = make_scorer(&[]);
+        assert!(!has_non_provider_targets(&local, &[], &scorer));
     }
 
     #[test]

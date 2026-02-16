@@ -74,8 +74,14 @@ impl DemandTracker {
         hot
     }
 
-    /// Check if we should broadcast a demand signal for this CID (rate-limited).
-    pub fn should_broadcast_demand(&mut self, content_id: &ContentId) -> bool {
+    /// Check if we should broadcast a demand signal for this CID.
+    /// Rate-limited and only broadcasts when non-provider peers exist —
+    /// if every peer is already a provider, there's nobody to scale to.
+    pub fn should_broadcast_demand(&mut self, content_id: &ContentId, non_providers_exist: bool) -> bool {
+        if !non_providers_exist {
+            debug!("All peers are providers for {}, skipping scaling broadcast", content_id);
+            return false;
+        }
         let now = Instant::now();
         if let Some(last) = self.last_broadcast.get(content_id) {
             if now.duration_since(*last) < Duration::from_secs(SIGNAL_COOLDOWN_SECS) {
@@ -319,11 +325,11 @@ mod tests {
         let mut tracker = DemandTracker::new();
         let cid = ContentId([2u8; 32]);
 
-        // First broadcast allowed
-        assert!(tracker.should_broadcast_demand(&cid));
+        // First broadcast allowed (non-providers exist)
+        assert!(tracker.should_broadcast_demand(&cid, true));
 
         // Second broadcast within cooldown blocked
-        assert!(!tracker.should_broadcast_demand(&cid));
+        assert!(!tracker.should_broadcast_demand(&cid, true));
     }
 
     #[test]
@@ -451,10 +457,20 @@ mod tests {
     fn test_demand_tracker_cleanup() {
         let mut tracker = DemandTracker::new();
         let cid = ContentId([3u8; 32]);
-        tracker.should_broadcast_demand(&cid);
+        tracker.should_broadcast_demand(&cid, true);
         assert!(!tracker.last_broadcast.is_empty());
         // cleanup won't remove recent entries
         tracker.cleanup();
         assert!(!tracker.last_broadcast.is_empty());
+    }
+
+    #[test]
+    fn test_no_scaling_broadcast_when_all_providers() {
+        let mut tracker = DemandTracker::new();
+        let cid = ContentId([4u8; 32]);
+        // No non-providers → should not broadcast
+        assert!(!tracker.should_broadcast_demand(&cid, false));
+        // Confirm no broadcast was recorded
+        assert!(!tracker.last_broadcast.contains_key(&cid));
     }
 }
