@@ -68,6 +68,8 @@ pub struct DataCraftProtocol {
     persistent_receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     /// Shared removal cache — checked before serving pieces.
     removal_cache: Option<Arc<Mutex<crate::removal_cache::RemovalCache>>>,
+    /// Demand tracker for scaling — records fetches when serving pieces.
+    demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
 }
 
 /// Tracks what we're waiting for from a DHT query.
@@ -90,6 +92,7 @@ impl DataCraftProtocol {
             pending_queries: Arc::new(Mutex::new(HashMap::new())),
             persistent_receipt_store: None,
             removal_cache: None,
+            demand_tracker: None,
         }
     }
 
@@ -101,6 +104,10 @@ impl DataCraftProtocol {
     /// Set the removal cache for pre-serve checks.
     pub fn set_removal_cache(&mut self, cache: Arc<Mutex<crate::removal_cache::RemovalCache>>) {
         self.removal_cache = Some(cache);
+    }
+
+    pub fn set_demand_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandTracker>>) {
+        self.demand_tracker = Some(tracker);
     }
 
     /// Register this protocol with the shared libp2p swarm.
@@ -580,6 +587,11 @@ impl DataCraftProtocol {
                 let response = encode_piece_response(datacraft_core::WireStatus::Ok, &coefficients, &data);
                 if let Err(e) = stream.write_all(&response).await {
                     error!("Failed to write response: {}", e);
+                }
+                // Record fetch for demand tracking (scaling)
+                if let Some(ref dt) = self.demand_tracker {
+                    let mut tracker = dt.lock().await;
+                    tracker.record_fetch(content_id);
                 }
             }
             _ => {

@@ -213,19 +213,12 @@ impl RepairCoordinator {
         Some(piece_id)
     }
 
-    /// Compute delay based on peer score. Higher score = shorter delay.
+    /// Compute random delay for repair coordination.
+    /// All nodes wait a random interval (0.5s–BASE_REPAIR_DELAY) and listen for
+    /// announcements. First to finish wins, others cancel. Simple and proven.
     fn compute_delay(&self) -> Duration {
-        // Without a scorer, use random delay
-        // With a scorer, we'd compute score_percentile and do: base * (1 - percentile)
-        // For now, random 1-10s since we can't synchronously query the scorer
         let delay_secs = rand::random::<f64>() * BASE_REPAIR_DELAY.as_secs_f64();
         Duration::from_secs_f64(delay_secs.max(0.5))
-    }
-
-    /// Compute delay with explicit score percentile (0.0 = worst, 1.0 = best).
-    pub fn compute_delay_with_score(score_percentile: f64) -> Duration {
-        let delay = BASE_REPAIR_DELAY.as_secs_f64() * (1.0 - score_percentile.clamp(0.0, 1.0));
-        Duration::from_secs_f64(delay.max(0.5))
     }
 
     /// Clean up stale pending repairs (older than MAX_SIGNAL_AGE).
@@ -328,19 +321,15 @@ mod tests {
     }
 
     #[test]
-    fn test_delay_based_coordination() {
-        // Higher score = shorter delay
-        let delay_high = RepairCoordinator::compute_delay_with_score(0.9);
-        let delay_low = RepairCoordinator::compute_delay_with_score(0.1);
-        assert!(delay_high < delay_low, "Higher score should give shorter delay");
-
-        // Best score should give minimum delay
-        let delay_best = RepairCoordinator::compute_delay_with_score(1.0);
-        assert!(delay_best.as_secs_f64() <= 0.5 + 0.01);
-
-        // Worst score should give ~full base delay
-        let delay_worst = RepairCoordinator::compute_delay_with_score(0.0);
-        assert!(delay_worst.as_secs_f64() >= BASE_REPAIR_DELAY.as_secs_f64() - 0.01);
+    fn test_random_delay_bounds() {
+        // Random delay should be between 0.5s and BASE_REPAIR_DELAY
+        let tx = make_tx();
+        let coord = RepairCoordinator::new(PeerId::random(), tx);
+        for _ in 0..100 {
+            let delay = coord.compute_delay();
+            assert!(delay.as_secs_f64() >= 0.5, "Delay should be at least 0.5s");
+            assert!(delay <= BASE_REPAIR_DELAY, "Delay should not exceed base");
+        }
     }
 
     #[test]

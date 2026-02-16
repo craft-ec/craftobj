@@ -82,6 +82,10 @@ pub enum DataCraftCommand {
     BroadcastRepairMessage {
         repair_data: Vec<u8>,
     },
+    /// Broadcast a demand signal via gossipsub (scaling).
+    BroadcastDemandSignal {
+        signal_data: Vec<u8>,
+    },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
     /// Push a manifest to a remote storage peer.

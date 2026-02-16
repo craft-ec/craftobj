@@ -201,6 +201,12 @@ pub async fn run_daemon_with_config(
     {
         error!("Failed to subscribe to repair topic: {:?}", e);
     }
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .subscribe_topic(datacraft_core::SCALING_TOPIC)
+    {
+        error!("Failed to subscribe to scaling topic: {:?}", e);
+    }
 
     // Peer scorer — tracks capabilities and reliability
     let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
@@ -226,6 +232,10 @@ pub async fn run_daemon_with_config(
 
     // Wire removal cache into the protocol for pre-serve checks
     protocol.set_removal_cache(removal_cache.clone());
+
+    // Create demand tracker early so we can wire it into protocol before Arc wrapping
+    let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::new()));
+    protocol.set_demand_tracker(demand_tracker.clone());
 
     let protocol = Arc::new(protocol);
 
@@ -359,6 +369,12 @@ pub async fn run_daemon_with_config(
     repair_coord.set_peer_scorer(peer_scorer.clone());
     let repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>> = Arc::new(Mutex::new(repair_coord));
 
+    // Scaling: coordinator for demand-driven piece acquisition
+    let scaling_command_tx = command_tx.clone();
+    let scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>> = Arc::new(Mutex::new(
+        crate::scaling::ScalingCoordinator::new(local_peer_id, scaling_command_tx),
+    ));
+
     // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
@@ -369,7 +385,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -418,6 +434,8 @@ async fn drive_swarm(
     max_storage_bytes: u64,
     repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>>,
     store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
+    scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
+    demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -496,6 +514,7 @@ async fn drive_swarm(
                         handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
                         handle_gossipsub_storage_receipt(&event, &event_tx).await;
                         handle_gossipsub_repair(&event, &repair_coordinator, &store_for_repair, &event_tx).await;
+                        handle_gossipsub_scaling(&event, &scaling_coordinator, &store_for_repair, max_storage_bytes).await;
                         // Pass events to our protocol handler
                         protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
@@ -713,6 +732,14 @@ async fn handle_command(
             if let Err(e) = swarm.behaviour_mut()
                 .publish_to_topic(datacraft_core::REPAIR_TOPIC, repair_data) {
                 warn!("Failed to broadcast repair message via gossipsub: {:?}", e);
+            }
+        }
+
+        DataCraftCommand::BroadcastDemandSignal { signal_data } => {
+            debug!("Broadcasting demand signal via gossipsub ({} bytes)", signal_data.len());
+            if let Err(e) = swarm.behaviour_mut()
+                .publish_to_topic(datacraft_core::SCALING_TOPIC, signal_data) {
+                warn!("Failed to broadcast demand signal via gossipsub: {:?}", e);
             }
         }
 
@@ -967,6 +994,49 @@ async fn handle_gossipsub_repair(
                 }
                 Err(e) => {
                     debug!("Failed to parse repair message from gossipsub: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Handle incoming demand/scaling signals from gossipsub.
+async fn handle_gossipsub_scaling(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+    scaling_coordinator: &Arc<Mutex<crate::scaling::ScalingCoordinator>>,
+    store: &Arc<Mutex<datacraft_store::FsStore>>,
+    max_storage_bytes: u64,
+) {
+    use libp2p::gossipsub;
+    use craftec_network::behaviour::CraftBehaviourEvent;
+
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        message, ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::SCALING_TOPIC {
+            match bincode::deserialize::<datacraft_core::DemandSignal>(&message.data) {
+                Ok(signal) => {
+                    debug!(
+                        "Received demand signal for {}: level={}, providers={}",
+                        signal.content_id, signal.demand_level, signal.current_providers
+                    );
+                    let store_guard = store.lock().await;
+                    let mut coord = scaling_coordinator.lock().await;
+                    if let Some(delay) = coord.handle_demand_signal(&signal, &store_guard, max_storage_bytes) {
+                        let cid = signal.content_id;
+                        drop(store_guard);
+                        let coord_clone = scaling_coordinator.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let coord = coord_clone.lock().await;
+                            coord.execute_scaling(cid);
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to parse demand signal from gossipsub: {}", e);
                 }
             }
         }

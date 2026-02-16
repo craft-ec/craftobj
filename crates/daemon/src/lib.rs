@@ -21,6 +21,7 @@ pub mod protocol;
 pub mod reannounce;
 pub mod repair;
 pub mod receipt_store;
+pub mod scaling;
 pub mod removal_cache;
 pub mod service;
 pub mod settlement;
