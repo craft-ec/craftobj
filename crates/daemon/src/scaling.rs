@@ -1,19 +1,22 @@
 //! Scaling Coordinator
 //!
-//! Demand-driven piece acquisition via gossipsub.
+//! Demand-driven piece distribution via gossipsub (push-based).
 //! When content is hot (high fetch rate), serving nodes publish demand signals.
-//! Other storage nodes evaluate whether to acquire pieces for that content,
-//! creating a pull-based complement to push distribution.
+//! Existing providers see the signal, create a new piece via RLNC recombination,
+//! and push it to the highest-rated non-provider node — same pattern as repair.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datacraft_core::{ContentId, DemandSignal};
+use datacraft_store::FsStore;
 use libp2p::PeerId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::commands::DataCraftCommand;
+use crate::peer_scorer::PeerScorer;
 
 /// Minimum fetches in the demand window to consider content "hot".
 const DEMAND_THRESHOLD: u32 = 10;
@@ -28,7 +31,7 @@ const SIGNAL_COOLDOWN_SECS: u64 = 300; // 5 minutes
 const MAX_SIGNAL_AGE: Duration = Duration::from_secs(300);
 
 /// Base delay for scaling coordination (avoid thundering herd).
-const BASE_SCALING_DELAY: Duration = Duration::from_secs(15);
+const BASE_SCALING_DELAY: Duration = Duration::from_secs(10);
 
 /// Tracks fetch request rates per CID to detect demand.
 #[derive(Default)]
@@ -89,10 +92,12 @@ impl DemandTracker {
     }
 }
 
-/// Coordinates scaling: evaluates demand signals and acquires pieces.
+/// Coordinates scaling: providers create pieces and push them to non-provider nodes.
+/// Push-based — same pattern as repair.
 pub struct ScalingCoordinator {
     local_peer_id: PeerId,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
     /// Track which CIDs we've recently attempted scaling for (avoid duplicates).
     recent_scaling: HashMap<ContentId, Instant>,
 }
@@ -105,17 +110,22 @@ impl ScalingCoordinator {
         Self {
             local_peer_id,
             command_tx,
+            peer_scorer: None,
             recent_scaling: HashMap::new(),
         }
     }
 
-    /// Evaluate whether to acquire pieces for a CID based on a demand signal.
-    /// Returns Some(delay) if we should proceed, None if we should skip.
-    pub fn handle_demand_signal(
+    pub fn set_peer_scorer(&mut self, scorer: Arc<Mutex<PeerScorer>>) {
+        self.peer_scorer = Some(scorer);
+    }
+
+    /// Handle an incoming scaling notice (demand signal) from gossipsub.
+    /// Called by nodes that ARE providers for this CID.
+    /// Returns Some(delay) if we should proceed with push, None if we should skip.
+    pub fn handle_scaling_notice(
         &mut self,
         signal: &DemandSignal,
-        store: &datacraft_store::FsStore,
-        max_storage_bytes: u64,
+        store: &FsStore,
     ) -> Option<Duration> {
         // Check signal age
         let now_ts = SystemTime::now()
@@ -123,7 +133,7 @@ impl ScalingCoordinator {
             .unwrap_or_default()
             .as_secs();
         if now_ts.saturating_sub(signal.timestamp) > MAX_SIGNAL_AGE.as_secs() {
-            debug!("Ignoring stale demand signal for {}", signal.content_id);
+            debug!("Ignoring stale scaling notice for {}", signal.content_id);
             return None;
         }
 
@@ -140,113 +150,127 @@ impl ScalingCoordinator {
             }
         }
 
-        // Already holding pieces for this content? Skip.
-        // Check segment 0 as a proxy — if we hold any pieces, we're already participating.
-        if let Ok(pieces) = store.list_pieces(&signal.content_id, 0) {
-            if !pieces.is_empty() {
-                debug!("Already holding pieces for {}, skipping scaling", signal.content_id);
+        // We must hold ≥2 pieces for this content to create a recombination.
+        // Check segment 0 as proxy.
+        let pieces = match store.list_pieces(&signal.content_id, 0) {
+            Ok(p) if p.len() >= 2 => p,
+            _ => {
+                debug!(
+                    "Not a provider for {} (no pieces or <2), skipping scaling",
+                    signal.content_id
+                );
                 return None;
             }
-        }
-
-        // Storage capacity check
-        let used = store.disk_usage().unwrap_or(0);
-        if max_storage_bytes > 0 && used >= max_storage_bytes {
-            debug!("Storage full ({}/{}), skipping scaling for {}", used, max_storage_bytes, signal.content_id);
-            return None;
-        }
-
-        // Economics check: is the content tracked/funded? We check if a manifest exists.
-        if store.get_manifest(&signal.content_id).is_err() {
-            debug!("No manifest for {}, skipping scaling (unfunded/unknown content)", signal.content_id);
-            return None;
-        }
+        };
 
         info!(
-            "Accepting demand signal for {}: demand_level={}, current_providers={}",
-            signal.content_id, signal.demand_level, signal.current_providers
+            "Scheduling scaling push for {}: demand_level={}, have {} local pieces",
+            signal.content_id, signal.demand_level, pieces.len()
         );
 
         self.recent_scaling.insert(signal.content_id, Instant::now());
 
-        // Delay-based coordination: random delay to avoid thundering herd
-        let delay_secs = rand::random::<f64>() * BASE_SCALING_DELAY.as_secs_f64();
-        Some(Duration::from_secs_f64(delay_secs.max(1.0)))
+        Some(self.compute_delay())
     }
 
-    /// Execute scaling: request a piece from providers, store it, announce on DHT.
-    /// This sends a command to resolve providers and fetch a piece.
+    /// Execute scaling: create a new piece via RLNC recombination and push it
+    /// to the highest-rated non-provider node.
     pub fn execute_scaling(
         &self,
+        store: &FsStore,
         content_id: ContentId,
     ) {
-        info!("Executing scaling for {}: resolving providers", content_id);
+        // Collect existing pieces from segment 0 for recombination
+        let piece_ids = match store.list_pieces(&content_id, 0) {
+            Ok(ids) if ids.len() >= 2 => ids,
+            _ => {
+                debug!("Not enough pieces for scaling recombination of {}", content_id);
+                return;
+            }
+        };
 
-        // Request provider resolution → then fetch a piece from one of them
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self.command_tx.send(DataCraftCommand::ResolveProviders {
-            content_id,
-            reply_tx,
-        }).is_err() {
-            warn!("Failed to send ResolveProviders command for scaling");
+        let mut existing_pieces = Vec::new();
+        for pid in &piece_ids {
+            if let Ok((data, coeff)) = store.get_piece(&content_id, 0, pid) {
+                existing_pieces.push(craftec_erasure::CodedPiece {
+                    data,
+                    coefficients: coeff,
+                });
+            }
+        }
+
+        if existing_pieces.len() < 2 {
+            debug!("Could not read enough pieces for scaling {}", content_id);
             return;
         }
 
-        let command_tx = self.command_tx.clone();
-        let cid = content_id;
-
-        // Spawn async task to complete the fetch
-        tokio::spawn(async move {
-            let providers = match reply_rx.await {
-                Ok(Ok(p)) if !p.is_empty() => p,
-                _ => {
-                    debug!("No providers found for scaling {}", cid);
-                    return;
-                }
-            };
-
-            // Pick a random provider and request any piece for segment 0
-            let provider = providers[rand::random::<usize>() % providers.len()];
-            let (piece_tx, piece_rx) = tokio::sync::oneshot::channel();
-            if command_tx.send(DataCraftCommand::RequestPiece {
-                peer_id: provider,
-                content_id: cid,
-                segment_index: 0,
-                piece_id: [0u8; 32], // "any piece"
-                reply_tx: piece_tx,
-            }).is_err() {
+        // Create one new piece via RLNC recombination
+        let new_piece = match craftec_erasure::create_piece_from_existing(&existing_pieces) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Scaling recombination failed for {}: {}", content_id, e);
                 return;
             }
+        };
 
-            match piece_rx.await {
-                Ok(Ok((_data, _coefficients))) => {
-                    info!("Scaling: acquired piece for {} from {}", cid, provider);
-                    // The piece is received via the protocol handler which stores it.
-                    // Announce as provider
-                    let (ann_tx, _ann_rx) = tokio::sync::oneshot::channel();
-                    let _ = command_tx.send(DataCraftCommand::AnnounceProvider {
-                        content_id: cid,
-                        manifest: datacraft_core::ContentManifest {
-                            content_id: cid,
-                            content_hash: [0u8; 32],
-                            segment_size: 0,
-                            piece_size: 0,
-                            segment_count: 0,
-                            total_size: 0,
-                            creator: String::new(),
-                            signature: Vec::new(),
-                        },
-                        reply_tx: ann_tx,
-                    });
-                }
-                Ok(Err(e)) => {
-                    debug!("Scaling piece request failed for {}: {}", cid, e);
-                }
-                Err(_) => {
-                    debug!("Scaling piece request channel closed for {}", cid);
-                }
+        let new_pid = datacraft_store::piece_id_from_coefficients(&new_piece.coefficients);
+
+        info!("Scaling: created new piece for {}, selecting push target", content_id);
+
+        // Select highest-rated non-provider node to push to.
+        // Use peer scorer if available, else we can't push (no known peers).
+        let target = self.select_push_target();
+        let target_peer = match target {
+            Some(p) => p,
+            None => {
+                // Store locally as fallback
+                let _ = store.store_piece(&content_id, 0, &new_pid, &new_piece.data, &new_piece.coefficients);
+                debug!("No push target available for scaling {}, stored locally", content_id);
+                return;
             }
-        });
+        };
+
+        // Push piece to target node
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        if self.command_tx.send(DataCraftCommand::PushPiece {
+            peer_id: target_peer,
+            content_id,
+            segment_index: 0,
+            piece_id: new_pid,
+            coefficients: new_piece.coefficients,
+            piece_data: new_piece.data,
+            reply_tx,
+        }).is_err() {
+            warn!("Failed to send PushPiece command for scaling {}", content_id);
+        } else {
+            info!("Scaling: pushing piece to {} for {}", target_peer, content_id);
+        }
+    }
+
+    /// Select the highest-rated non-provider node for push.
+    /// Returns None if no peer scorer or no peers available.
+    fn select_push_target(&self) -> Option<PeerId> {
+        let scorer = self.peer_scorer.as_ref()?;
+
+        // We need to block briefly to access the scorer.
+        // In real async code this would be awaited; here we try_lock.
+        let scorer_guard = scorer.try_lock().ok()?;
+
+        // Get all known peers, ranked by score (highest first)
+        let all_peers: Vec<PeerId> = scorer_guard.iter().map(|(p, _)| *p).collect();
+        if all_peers.is_empty() {
+            return None;
+        }
+
+        let ranked = scorer_guard.rank_peers(&all_peers);
+        // Pick the highest-ranked peer that isn't us
+        ranked.into_iter().find(|p| *p != self.local_peer_id)
+    }
+
+    /// Compute random delay for scaling coordination (same as repair).
+    fn compute_delay(&self) -> Duration {
+        let delay_secs = rand::random::<f64>() * BASE_SCALING_DELAY.as_secs_f64();
+        Duration::from_secs_f64(delay_secs.max(0.5))
     }
 
     /// Clean up stale entries.
@@ -350,8 +374,8 @@ mod tests {
                 .as_secs(),
         };
 
-        let store = datacraft_store::FsStore::new(&tempfile::tempdir().unwrap().path()).unwrap();
-        assert!(coord.handle_demand_signal(&signal, &store, 0).is_none());
+        let store = datacraft_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
+        assert!(coord.handle_scaling_notice(&signal, &store).is_none());
     }
 
     #[test]
@@ -367,12 +391,12 @@ mod tests {
             timestamp: 1000, // very old
         };
 
-        let store = datacraft_store::FsStore::new(&tempfile::tempdir().unwrap().path()).unwrap();
-        assert!(coord.handle_demand_signal(&signal, &store, 0).is_none());
+        let store = datacraft_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
+        assert!(coord.handle_scaling_notice(&signal, &store).is_none());
     }
 
     #[test]
-    fn test_scaling_coordinator_skips_no_capacity() {
+    fn test_scaling_non_provider_ignores_notice() {
         let tx = make_tx();
         let mut coord = ScalingCoordinator::new(PeerId::random(), tx);
 
@@ -387,13 +411,55 @@ mod tests {
                 .as_secs(),
         };
 
-        let store = datacraft_store::FsStore::new(&tempfile::tempdir().unwrap().path()).unwrap();
-        // max_storage_bytes = 1 byte (essentially full since disk_usage returns 0 or more)
-        // Actually disk_usage of empty store is 0, so 1 byte limit won't trigger unless used > 0
-        // This tests the path exists; real capacity check depends on actual usage
-        let result = coord.handle_demand_signal(&signal, &store, u64::MAX);
-        // No manifest → should be None (economics check)
-        assert!(result.is_none());
+        // Empty store — we're not a provider
+        let store = datacraft_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
+        assert!(coord.handle_scaling_notice(&signal, &store).is_none());
+    }
+
+    #[test]
+    fn test_scaling_provider_accepts_notice() {
+        let tx = make_tx();
+        let mut coord = ScalingCoordinator::new(PeerId::random(), tx);
+        let cid = ContentId([5u8; 32]);
+
+        let signal = DemandSignal {
+            content_id: cid,
+            demand_level: 20,
+            current_providers: 2,
+            reporter: PeerId::random().to_bytes().to_vec(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+
+        // Create a store with ≥2 pieces so we count as a provider
+        let tmp = tempfile::tempdir().unwrap();
+        let store = datacraft_store::FsStore::new(tmp.path()).unwrap();
+        let piece_data = vec![0u8; 100];
+        let coeff1 = vec![1u8, 0, 0];
+        let coeff2 = vec![0u8, 1, 0];
+        let pid1 = datacraft_store::piece_id_from_coefficients(&coeff1);
+        let pid2 = datacraft_store::piece_id_from_coefficients(&coeff2);
+        store.store_piece(&cid, 0, &pid1, &piece_data, &coeff1).unwrap();
+        store.store_piece(&cid, 0, &pid2, &piece_data, &coeff2).unwrap();
+
+        let result = coord.handle_scaling_notice(&signal, &store);
+        assert!(result.is_some());
+        let delay = result.unwrap();
+        assert!(delay.as_secs_f64() >= 0.5);
+        assert!(delay <= BASE_SCALING_DELAY);
+    }
+
+    #[test]
+    fn test_random_delay_bounds() {
+        let tx = make_tx();
+        let coord = ScalingCoordinator::new(PeerId::random(), tx);
+        for _ in 0..100 {
+            let delay = coord.compute_delay();
+            assert!(delay.as_secs_f64() >= 0.5, "Delay should be at least 0.5s");
+            assert!(delay <= BASE_SCALING_DELAY, "Delay should not exceed base");
+        }
     }
 
     #[test]

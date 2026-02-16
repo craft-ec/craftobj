@@ -1081,12 +1081,13 @@ async fn handle_gossipsub_repair(
     }
 }
 
-/// Handle incoming demand/scaling signals from gossipsub.
+/// Handle incoming demand/scaling signals from gossipsub (push-based).
+/// Providers see the notice, create a piece via RLNC recombination, and push to non-provider.
 async fn handle_gossipsub_scaling(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     scaling_coordinator: &Arc<Mutex<crate::scaling::ScalingCoordinator>>,
     store: &Arc<Mutex<datacraft_store::FsStore>>,
-    max_storage_bytes: u64,
+    _max_storage_bytes: u64,
 ) {
     use libp2p::gossipsub;
     use craftec_network::behaviour::CraftBehaviourEvent;
@@ -1100,19 +1101,22 @@ async fn handle_gossipsub_scaling(
             match bincode::deserialize::<datacraft_core::DemandSignal>(&message.data) {
                 Ok(signal) => {
                     debug!(
-                        "Received demand signal for {}: level={}, providers={}",
+                        "Received scaling notice for {}: level={}, providers={}",
                         signal.content_id, signal.demand_level, signal.current_providers
                     );
                     let store_guard = store.lock().await;
                     let mut coord = scaling_coordinator.lock().await;
-                    if let Some(delay) = coord.handle_demand_signal(&signal, &store_guard, max_storage_bytes) {
+                    // Only providers (nodes holding ≥2 pieces) will get Some(delay)
+                    if let Some(delay) = coord.handle_scaling_notice(&signal, &store_guard) {
                         let cid = signal.content_id;
                         drop(store_guard);
                         let coord_clone = scaling_coordinator.clone();
+                        let store_clone = store.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(delay).await;
+                            let store_guard = store_clone.lock().await;
                             let coord = coord_clone.lock().await;
-                            coord.execute_scaling(cid);
+                            coord.execute_scaling(&store_guard, cid);
                         });
                     }
                 }
