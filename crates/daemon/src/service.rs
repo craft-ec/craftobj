@@ -8,7 +8,7 @@ use std::sync::Arc;
 use craftec_ipc::IpcServer;
 use craftec_network::{build_swarm, NetworkConfig};
 use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, ChunkManifest, CapabilityAnnouncement, DataCraftCapability};
+use datacraft_core::{ContentId, ContentManifest, CapabilityAnnouncement, DataCraftCapability};
 use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
@@ -74,7 +74,7 @@ enum PendingRequest {
         reply_tx: oneshot::Sender<Result<Vec<libp2p::PeerId>, String>>,
     },
     GetManifest {
-        reply_tx: oneshot::Sender<Result<ChunkManifest, String>>,
+        reply_tx: oneshot::Sender<Result<ContentManifest, String>>,
     },
     GetAccessList {
         reply_tx: oneshot::Sender<Result<datacraft_core::access::AccessList, String>>,
@@ -166,15 +166,7 @@ pub async fn run_daemon_with_config(
     // Create and register DataCraft protocol
     let mut protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
 
-    // Extract ed25519 signing key from libp2p keypair for receipt signing
-    if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {
-        let secret_bytes = ed25519_kp.secret();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(secret_bytes.as_ref().try_into().expect("ed25519 secret is 32 bytes"));
-        protocol.set_signing_key(signing_key);
-        debug!("Configured protocol with ed25519 signing key for TransferReceipts");
-    }
-
-    let (incoming_streams, coord_streams) = protocol.register(&mut swarm)
+    let incoming_streams = protocol.register(&mut swarm)
         .map_err(|e| format!("Failed to register DataCraft protocol: {}", e))?;
 
     // Subscribe to gossipsub topics
@@ -369,9 +361,6 @@ pub async fn run_daemon_with_config(
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
             info!("Incoming streams handler ended");
-        }
-        _ = handle_incoming_coord_streams(coord_streams, protocol.clone()) => {
-            info!("Incoming coord streams handler ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone()) => {
             info!("Protocol events handler ended");
@@ -625,30 +614,14 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::RequestShard { peer_id, content_id, chunk_index, shard_index, local_public_key, reply_tx } => {
-            debug!("Handling request shard command: {}/{}/{} from {}", content_id, chunk_index, shard_index, peer_id);
+        DataCraftCommand::RequestPiece { peer_id, content_id, segment_index, piece_id, reply_tx } => {
+            debug!("Handling request piece command: {}/{} from {}", content_id, segment_index, peer_id);
             
             let result = protocol
-                .request_shard_from_peer(swarm.behaviour_mut(), peer_id, &content_id, chunk_index, shard_index, &local_public_key)
+                .request_piece_from_peer(swarm.behaviour_mut(), peer_id, &content_id, segment_index, &piece_id)
                 .await;
             
             let _ = reply_tx.send(result);
-        }
-        
-        DataCraftCommand::QueryMaxShardIndex { peer_id, content_id, reply_tx } => {
-            debug!("Querying max shard index for {} from {}", content_id, peer_id);
-            
-            let result = protocol
-                .query_max_shard_index(swarm.behaviour_mut(), peer_id, &content_id)
-                .await;
-            
-            let _ = reply_tx.send(result);
-        }
-        
-        DataCraftCommand::Extend { content_id: _, reply_tx } => {
-            // The extend flow is orchestrated by the handler, not here.
-            warn!("Extend command received in swarm loop — should be orchestrated by handler");
-            let _ = reply_tx.send(Err("Extend should be orchestrated by the IPC handler".into()));
         }
 
         DataCraftCommand::PutReKey { content_id, entry, reply_tx } => {
@@ -719,11 +692,11 @@ async fn handle_command(
             }
         }
 
-        DataCraftCommand::PushShard { peer_id, content_id, chunk_index, shard_index, shard_data, reply_tx } => {
-            debug!("Handling push shard command: {}/{}/{} to {}", content_id, chunk_index, shard_index, peer_id);
+        DataCraftCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
+            debug!("Handling push piece command: {}/{} to {}", content_id, segment_index, peer_id);
             
             let result = protocol
-                .push_shard_to_peer(swarm.behaviour_mut(), peer_id, &content_id, chunk_index, shard_index, &shard_data)
+                .push_piece_to_peer(swarm.behaviour_mut(), peer_id, &content_id, segment_index, &piece_id, &coefficients, &piece_data)
                 .await;
             
             let _ = reply_tx.send(result);
@@ -990,10 +963,10 @@ async fn handle_protocol_events(
             }
             
             DataCraftEvent::ManifestRetrieved { content_id, manifest } => {
-                info!("Retrieved manifest for {} ({} chunks)", content_id, manifest.chunk_count);
+                info!("Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count);
                 let _ = daemon_event_tx.send(DaemonEvent::ManifestRetrieved {
                     content_id: content_id.to_hex(),
-                    chunks: manifest.chunk_count as u32,
+                    segments: manifest.segment_count,
                 });
                 
                 // Find and respond to the waiting request
@@ -1013,9 +986,9 @@ async fn handle_protocol_events(
                 }
             }
 
-            DataCraftEvent::ShardPushReceived { content_id } => {
+            DataCraftEvent::PiecePushReceived { content_id } => {
                 let mut t = content_tracker.lock().await;
-                t.increment_local_shards(&content_id);
+                t.increment_local_pieces(&content_id);
             }
             DataCraftEvent::ManifestPushReceived { content_id, manifest } => {
                 info!("Received manifest push for {} — tracking as storage provider", content_id);
@@ -1072,24 +1045,5 @@ async fn run_challenger_loop(
             info!("Challenger completed {} rounds", rounds);
             let _ = event_tx.send(DaemonEvent::ChallengerRoundCompleted { rounds: rounds as u32 });
         }
-    }
-}
-
-/// Handle incoming shard coordination streams from peers.
-async fn handle_incoming_coord_streams(
-    mut incoming: libp2p_stream::IncomingStreams,
-    protocol: Arc<DataCraftProtocol>,
-) {
-    use futures::StreamExt;
-
-    info!("Starting incoming shard coordination streams handler");
-
-    while let Some((peer, stream)) = incoming.next().await {
-        debug!("Received incoming shard-coord stream from peer: {}", peer);
-
-        let protocol_clone = protocol.clone();
-        tokio::spawn(async move {
-            protocol_clone.handle_incoming_coord_stream(stream).await;
-        });
     }
 }
