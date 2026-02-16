@@ -1705,12 +1705,8 @@ impl DataCraftHandler {
         let client = self.client.lock().await;
         let store = client.store();
 
-        let k = if let Some(ref tracker) = self.content_tracker {
-            let t = tracker.lock().await;
-            t.get(&cid).map(|s| s.k).unwrap_or(0)
-        } else {
-            0
-        };
+        // Get manifest for per-segment k calculation
+        let manifest = store.get_manifest(&cid).ok();
 
         let segments_list = store.list_segments(&cid).unwrap_or_default();
         let mut segments_json = Vec::new();
@@ -1718,6 +1714,10 @@ impl DataCraftHandler {
             let pieces = store.list_pieces(&cid, seg).unwrap_or_default();
             let piece_ids: Vec<String> = pieces.iter().map(|p| hex::encode(p)).collect();
             let local_count = pieces.len();
+            // Use per-segment k (last segment may have fewer source pieces)
+            let k = manifest.as_ref()
+                .map(|m| m.k_for_segment(seg as usize))
+                .unwrap_or(0);
             segments_json.push(serde_json::json!({
                 "index": seg,
                 "k": k,
