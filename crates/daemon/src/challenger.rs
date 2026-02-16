@@ -163,59 +163,73 @@ impl ChallengerManager {
             .get_manifest(&cid)
             .map_err(|e| format!("Failed to get manifest: {}", e))?;
 
-        // For each segment, get our local pieces and their coefficients
-        // Then challenge other providers
-        let mut pdp_results = Vec::new();
-        let _other_providers: Vec<PeerId> = providers
+        // Determine which segments to sample: all if ≤5, random subset otherwise
+        let segment_count = manifest.segment_count as u32;
+        let segments_to_check: Vec<u32> = if segment_count <= 5 {
+            (0..segment_count).collect()
+        } else {
+            use rand::seq::SliceRandom;
+            let mut all: Vec<u32> = (0..segment_count).collect();
+            all.shuffle(&mut rand::thread_rng());
+            all.truncate(5);
+            all
+        };
+
+        let other_providers: Vec<PeerId> = providers
             .iter()
             .filter(|p| **p != self.local_peer_id)
             .copied()
             .collect();
 
-        // Simplified: request a random piece from each provider and verify
-        for &peer in &_other_providers {
-            let segment_index = 0u32; // Sample segment 0 for now
-            let any_piece = [0u8; 32]; // "any piece"
-            let nonce: [u8; 32] = rand::thread_rng().gen();
+        // Challenge each provider for each sampled segment, collecting coefficient vectors
+        let mut pdp_results = Vec::new();
 
-            let challenge_start = Instant::now();
-            match self.request_piece(peer, cid, segment_index, &any_piece).await {
-                Ok((coefficients, data)) => {
-                    let latency = challenge_start.elapsed();
-                    let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
-                    let byte_positions: Vec<u32> = (0..16.min(data.len() as u32)).collect();
-                    let proof_hash = compute_proof_hash(&data, &byte_positions, &coefficients, &nonce);
+        for &segment_index in &segments_to_check {
+            for &peer in &other_providers {
+                let any_piece = [0u8; 32]; // "any piece"
+                let nonce: [u8; 32] = rand::thread_rng().gen();
 
-                    if let Some(ref scorer) = self.peer_scorer {
-                        scorer.lock().await.record_success(&peer, latency);
+                let challenge_start = Instant::now();
+                match self.request_piece(peer, cid, segment_index, &any_piece).await {
+                    Ok((coefficients, data)) => {
+                        let latency = challenge_start.elapsed();
+                        let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+                        let byte_positions: Vec<u32> = (0..16.min(data.len() as u32)).collect();
+                        let proof_hash = compute_proof_hash(&data, &byte_positions, &coefficients, &nonce);
+
+                        if let Some(ref scorer) = self.peer_scorer {
+                            scorer.lock().await.record_success(&peer, latency);
+                        }
+
+                        let storage_node = crate::pdp::peer_id_to_local_pubkey(&peer);
+                        let receipt = create_storage_receipt(
+                            cid, storage_node, self.local_pubkey,
+                            segment_index, piece_id, nonce, proof_hash,
+                        );
+
+                        pdp_results.push(ProviderPdpResult {
+                            peer_id: peer,
+                            segment_index,
+                            piece_id,
+                            coefficients,
+                            passed: true,
+                            receipt: Some(receipt),
+                        });
                     }
-
-                    let storage_node = crate::pdp::peer_id_to_local_pubkey(&peer);
-                    let receipt = create_storage_receipt(
-                        cid, storage_node, self.local_pubkey,
-                        segment_index, piece_id, nonce, proof_hash,
-                    );
-
-                    pdp_results.push(ProviderPdpResult {
-                        peer_id: peer,
-                        segment_index,
-                        piece_id,
-                        passed: true,
-                        receipt: Some(receipt),
-                    });
-                }
-                Err(e) => {
-                    debug!("PDP challenge to {} failed: {}", peer, e);
-                    if let Some(ref scorer) = self.peer_scorer {
-                        scorer.lock().await.record_timeout(&peer);
+                    Err(e) => {
+                        debug!("PDP challenge to {} for segment {} failed: {}", peer, segment_index, e);
+                        if let Some(ref scorer) = self.peer_scorer {
+                            scorer.lock().await.record_timeout(&peer);
+                        }
+                        pdp_results.push(ProviderPdpResult {
+                            peer_id: peer,
+                            segment_index,
+                            piece_id: [0u8; 32],
+                            coefficients: vec![],
+                            passed: false,
+                            receipt: None,
+                        });
                     }
-                    pdp_results.push(ProviderPdpResult {
-                        peer_id: peer,
-                        segment_index: 0,
-                        piece_id: [0u8; 32],
-                        passed: false,
-                        receipt: None,
-                    });
                 }
             }
         }
@@ -225,10 +239,12 @@ impl ChallengerManager {
             results: pdp_results,
         };
 
-        // Assess health using rank
-        let live_count = round_result.passed_count();
+        // Compute true rank per segment from coefficient vectors
+        let rank_map = health::compute_network_rank(&round_result.results);
+        let min_rank = health::min_rank_across_segments(&rank_map);
+
         let tier_info = self.provided_cids.get(&cid).and_then(|s| s.tier_info.clone());
-        let health = health::assess_health(cid, manifest.k(), live_count, round_result.results.len(), tier_info.as_ref());
+        let health = health::assess_health(cid, manifest.k(), min_rank, round_result.results.len(), tier_info.as_ref());
 
         // Heal if needed
         let healing = if health.needs_healing && health.pieces_needed > 0 {

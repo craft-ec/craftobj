@@ -81,6 +81,29 @@ pub fn assess_health(
     }
 }
 
+/// Compute the true rank per segment from PDP results using coefficient vector independence.
+///
+/// Groups passed results by segment_index, collects their coefficient vectors,
+/// and calls `craftec_erasure::check_independence()` to get the matrix rank per segment.
+pub fn compute_network_rank(results: &[ProviderPdpResult]) -> std::collections::HashMap<u32, usize> {
+    let mut by_segment: std::collections::HashMap<u32, Vec<Vec<u8>>> = std::collections::HashMap::new();
+    for r in results {
+        if r.passed && !r.coefficients.is_empty() {
+            by_segment.entry(r.segment_index).or_default().push(r.coefficients.clone());
+        }
+    }
+    by_segment.into_iter().map(|(seg, vecs)| {
+        let rank = craftec_erasure::check_independence(&vecs);
+        (seg, rank)
+    }).collect()
+}
+
+/// Return the minimum rank across all segments (health is only as good as the weakest).
+/// If no segments have data, returns 0.
+pub fn min_rank_across_segments(rank_map: &std::collections::HashMap<u32, usize>) -> usize {
+    rank_map.values().copied().min().unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // PDP results
 // ---------------------------------------------------------------------------
@@ -90,6 +113,8 @@ pub struct ProviderPdpResult {
     pub peer_id: PeerId,
     pub segment_index: u32,
     pub piece_id: [u8; 32],
+    /// Coefficient vector for this piece (used to compute true rank).
+    pub coefficients: Vec<u8>,
     pub passed: bool,
     pub receipt: Option<StorageReceipt>,
 }
@@ -252,6 +277,93 @@ mod tests {
     }
 
     #[test]
+    fn test_dependent_vectors_give_rank_1() {
+        // Two linearly dependent coefficient vectors should give rank 1, not 2
+        let results = vec![
+            ProviderPdpResult {
+                peer_id: PeerId::random(),
+                segment_index: 0,
+                piece_id: [1u8; 32],
+                coefficients: vec![1, 0, 0],
+                passed: true,
+                receipt: None,
+            },
+            ProviderPdpResult {
+                peer_id: PeerId::random(),
+                segment_index: 0,
+                piece_id: [2u8; 32],
+                // [2, 0, 0] is a scalar multiple of [1, 0, 0] — linearly dependent
+                coefficients: vec![2, 0, 0],
+                passed: true,
+                receipt: None,
+            },
+        ];
+        let ranks = compute_network_rank(&results);
+        assert_eq!(*ranks.get(&0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_independent_vectors_give_rank_2() {
+        let results = vec![
+            ProviderPdpResult {
+                peer_id: PeerId::random(),
+                segment_index: 0,
+                piece_id: [1u8; 32],
+                coefficients: vec![1, 0, 0],
+                passed: true,
+                receipt: None,
+            },
+            ProviderPdpResult {
+                peer_id: PeerId::random(),
+                segment_index: 0,
+                piece_id: [2u8; 32],
+                coefficients: vec![0, 1, 0],
+                passed: true,
+                receipt: None,
+            },
+        ];
+        let ranks = compute_network_rank(&results);
+        assert_eq!(*ranks.get(&0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_multi_segment_min_rank() {
+        let results = vec![
+            // Segment 0: 2 independent vectors → rank 2
+            ProviderPdpResult {
+                peer_id: PeerId::random(), segment_index: 0,
+                piece_id: [1u8; 32], coefficients: vec![1, 0, 0],
+                passed: true, receipt: None,
+            },
+            ProviderPdpResult {
+                peer_id: PeerId::random(), segment_index: 0,
+                piece_id: [2u8; 32], coefficients: vec![0, 1, 0],
+                passed: true, receipt: None,
+            },
+            // Segment 1: 1 vector → rank 1 (weakest)
+            ProviderPdpResult {
+                peer_id: PeerId::random(), segment_index: 1,
+                piece_id: [3u8; 32], coefficients: vec![1, 0, 0],
+                passed: true, receipt: None,
+            },
+        ];
+        let ranks = compute_network_rank(&results);
+        assert_eq!(*ranks.get(&0).unwrap(), 2);
+        assert_eq!(*ranks.get(&1).unwrap(), 1);
+        assert_eq!(min_rank_across_segments(&ranks), 1);
+    }
+
+    #[test]
+    fn test_healing_triggers_when_rank_below_tier() {
+        let cid = ContentId([99u8; 32]);
+        let tier = TierInfo { min_piece_ratio: 2.0 };
+        // k=3, rank=2 → need 6, have 2 → healing needed
+        let health = assess_health(cid, 3, 2, 5, Some(&tier));
+        assert!(health.needs_healing);
+        assert_eq!(health.pieces_needed, 4); // ceil(2.0 * 3) - 2 = 4
+    }
+
+    #[test]
     fn test_pdp_round_result_counts() {
         let piece_id = [5u8; 32];
         let results = PdpRoundResult {
@@ -261,6 +373,7 @@ mod tests {
                     peer_id: PeerId::random(),
                     segment_index: 0,
                     piece_id,
+                    coefficients: vec![1, 0, 0],
                     passed: true,
                     receipt: Some(create_storage_receipt(
                         ContentId([0u8; 32]), [1u8; 32], [2u8; 32], 0, piece_id, [0u8; 32], [0u8; 32],
@@ -270,6 +383,7 @@ mod tests {
                     peer_id: PeerId::random(),
                     segment_index: 0,
                     piece_id: [6u8; 32],
+                    coefficients: vec![],
                     passed: false,
                     receipt: None,
                 },
