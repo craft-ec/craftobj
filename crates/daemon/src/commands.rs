@@ -2,7 +2,7 @@
 //!
 //! Commands sent from IPC handler to the swarm event loop for DHT operations.
 
-use datacraft_core::{ContentId, ChunkManifest, DataCraftCapability};
+use datacraft_core::{ContentId, ContentManifest, DataCraftCapability};
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
@@ -12,7 +12,7 @@ pub enum DataCraftCommand {
     /// Announce this node as a provider for a content ID.
     AnnounceProvider {
         content_id: ContentId,
-        manifest: ChunkManifest,
+        manifest: ContentManifest,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Resolve providers for a content ID.
@@ -23,34 +23,23 @@ pub enum DataCraftCommand {
     /// Get a manifest from the DHT.
     GetManifest {
         content_id: ContentId,
-        reply_tx: oneshot::Sender<Result<ChunkManifest, String>>,
+        reply_tx: oneshot::Sender<Result<ContentManifest, String>>,
     },
-    /// Request a shard from a remote peer.
-    RequestShard {
+    /// Request a piece from a remote peer.
+    ///
+    /// `piece_id` of all zeros means "any random piece for this segment".
+    RequestPiece {
         peer_id: PeerId,
         content_id: ContentId,
-        chunk_index: u32,
-        shard_index: u8,
-        /// Requester's public key (for signing TransferReceipts).
-        local_public_key: [u8; 32],
-        reply_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+        segment_index: u32,
+        piece_id: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(Vec<u8>, Vec<u8>), String>>,
     },
     /// Publish a capability announcement via gossipsub.
     PublishCapabilities {
         capabilities: Vec<DataCraftCapability>,
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
-    },
-    /// Query a peer for their max shard index for a CID.
-    QueryMaxShardIndex {
-        peer_id: PeerId,
-        content_id: ContentId,
-        reply_tx: oneshot::Sender<Result<Option<u8>, String>>,
-    },
-    /// Extend a CID: fetch k shards, coordinate index, generate new parity, store + announce.
-    Extend {
-        content_id: ContentId,
-        reply_tx: oneshot::Sender<Result<u8, String>>,
     },
     /// Store a re-encryption key in the DHT for access grant.
     PutReKey {
@@ -98,13 +87,14 @@ pub enum DataCraftCommand {
         manifest_json: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
-    /// Push a shard to a remote storage peer (proactive distribution).
-    PushShard {
+    /// Push a piece to a remote storage peer (proactive distribution).
+    PushPiece {
         peer_id: PeerId,
         content_id: ContentId,
-        chunk_index: u32,
-        shard_index: u8,
-        shard_data: Vec<u8>,
+        segment_index: u32,
+        piece_id: [u8; 32],
+        coefficients: Vec<u8>,
+        piece_data: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
 }

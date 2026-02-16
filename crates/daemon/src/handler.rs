@@ -137,7 +137,6 @@ impl DataCraftHandler {
 
         let options = PublishOptions {
             encrypted,
-            erasure_config: None,
         };
 
         let file_name = std::path::Path::new(path)
@@ -150,7 +149,7 @@ impl DataCraftHandler {
         let client = self.client.clone();
         let path_buf = PathBuf::from(path);
         let signing_key = self.node_signing_key.clone();
-        let (result, manifest) = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let mut client = client.blocking_lock();
             let result = if let Some(ref key) = signing_key {
                 client
@@ -161,16 +160,12 @@ impl DataCraftHandler {
                     .publish(&path_buf, &options)
                     .map_err(|e| e.to_string())?
             };
-            let manifest = client
-                .store()
-                .get_manifest(&result.content_id)
-                .map_err(|e| format!("Failed to get manifest: {}", e))?;
-            Ok::<_, String>((result, manifest))
+            Ok::<_, String>(result)
         })
         .await
         .map_err(|e| format!("publish task panicked: {}", e))??;
-
-        let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+        let manifest = result.manifest.clone();
+        let manifest_k = manifest.k();
 
         // Track in content tracker
         if let Some(ref tracker) = self.content_tracker {
@@ -217,8 +212,8 @@ impl DataCraftHandler {
             let _ = tx.send(DaemonEvent::ContentPublished {
                 content_id: result.content_id.to_hex(),
                 size: result.total_size,
-                chunks: result.chunk_count as u32,
-                shards: total_shards,
+                segments: result.segment_count,
+                pieces_per_segment: manifest_k,
             });
         }
 
@@ -232,9 +227,9 @@ impl DataCraftHandler {
                         name: state.name,
                         size: state.size,
                         stage: state.stage.to_string(),
-                        local_shards: state.local_shards,
-                        remote_shards: state.remote_shards,
-                        total_shards: state.total_shards,
+                        local_pieces: state.local_pieces,
+                        remote_pieces: state.remote_pieces,
+                        total_pieces: state.segment_count * state.k,
                         provider_count: state.provider_count,
                         summary,
                     });
@@ -250,7 +245,7 @@ impl DataCraftHandler {
         let mut response = serde_json::json!({
             "cid": result.content_id.to_hex(),
             "size": result.total_size,
-            "chunks": result.chunk_count as u64,
+            "segments": result.segment_count as u64,
         });
         if let Some(key) = &result.encryption_key {
             response["key"] = Value::String(hex::encode(key));
@@ -313,11 +308,11 @@ impl DataCraftHandler {
                                 Ok(Ok(manifest)) => {
                                     debug!("Retrieved manifest for {} from DHT", cid);
                                     
-                                    // Milestone 3 & 4: Try to fetch missing shards from providers for full P2P pipeline
-                                    if let Err(e) = self.fetch_missing_shards_from_peers(&cid, &manifest, &providers, command_tx).await {
-                                        debug!("P2P shard transfer failed: {}, falling back to local reconstruction", e);
+                                    // Try to fetch missing pieces from providers for full P2P pipeline
+                                    if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
+                                        debug!("P2P piece transfer failed: {}, falling back to local reconstruction", e);
                                     } else {
-                                        debug!("Successfully fetched missing shards via P2P, proceeding to reconstruction");
+                                        debug!("Successfully fetched pieces via P2P, proceeding to reconstruction");
                                     }
                                 }
                                 Ok(Err(e)) => {
@@ -394,7 +389,7 @@ impl DataCraftHandler {
                 let mut obj = serde_json::json!({
                     "content_id": item.content_id.to_hex(),
                     "total_size": item.total_size,
-                    "chunk_count": item.chunk_count,
+                    "segment_count": item.segment_count,
                     "pinned": item.pinned,
                     "creator": creator,
                 });
@@ -402,9 +397,9 @@ impl DataCraftHandler {
                     obj["name"] = serde_json::json!(state.name);
                     obj["encrypted"] = serde_json::json!(state.encrypted);
                     obj["stage"] = serde_json::json!(state.stage.to_string());
-                    obj["total_shards"] = serde_json::json!(state.total_shards);
-                    obj["local_shards"] = serde_json::json!(state.local_shards);
-                    obj["remote_shards"] = serde_json::json!(state.remote_shards);
+                    obj["total_pieces"] = serde_json::json!(state.segment_count * state.k);
+                    obj["local_pieces"] = serde_json::json!(state.local_pieces);
+                    obj["remote_pieces"] = serde_json::json!(state.remote_pieces);
                     obj["provider_count"] = serde_json::json!(state.provider_count);
                     obj["last_announced"] = serde_json::json!(state.last_announced);
                     obj["role"] = serde_json::json!(match state.role {
@@ -431,7 +426,6 @@ impl DataCraftHandler {
         let store = store.lock().await;
         Ok(serde_json::json!({
             "storage": store.storage_receipt_count(),
-            "transfer": store.transfer_receipt_count(),
         }))
     }
 
@@ -463,18 +457,10 @@ impl DataCraftHandler {
             crate::receipt_store::ReceiptEntry::Storage(r) => serde_json::json!({
                 "type": "storage",
                 "cid": r.content_id.to_hex(),
-                "shard_index": r.shard_index,
+                "segment_index": r.segment_index,
+                "piece_id": hex::encode(r.piece_id),
                 "storage_node": hex::encode(r.storage_node),
                 "challenger": hex::encode(r.challenger),
-                "timestamp": r.timestamp,
-            }),
-            crate::receipt_store::ReceiptEntry::Transfer(r) => serde_json::json!({
-                "type": "transfer",
-                "cid": r.content_id.to_hex(),
-                "shard_index": r.shard_index,
-                "server_node": hex::encode(r.server_node),
-                "requester": hex::encode(r.requester),
-                "bytes_served": r.bytes_served,
                 "timestamp": r.timestamp,
             }),
         }).collect();
@@ -516,7 +502,8 @@ impl DataCraftHandler {
                 "cid": r.content_id.to_hex(),
                 "storage_node": hex::encode(r.storage_node),
                 "challenger": hex::encode(r.challenger),
-                "shard_index": r.shard_index,
+                "segment_index": r.segment_index,
+                "piece_id": hex::encode(r.piece_id),
                 "timestamp": r.timestamp,
                 "nonce": hex::encode(r.nonce),
                 "proof_hash": hex::encode(r.proof_hash),
@@ -573,237 +560,129 @@ impl DataCraftHandler {
         serde_json::to_value(summary).map_err(|e| e.to_string())
     }
 
-    /// Extend a CID by generating a new parity shard.
+    /// Extend a CID by generating new coded pieces via RLNC recombination.
     async fn handle_extend(&self, params: Option<Value>) -> Result<Value, String> {
         let cid = extract_cid(params)?;
-        let command_tx = self.command_tx.as_ref().ok_or("no network available")?;
 
-        // 1. Get manifest (local or DHT)
         let manifest = {
             let client = self.client.lock().await;
-            match client.store().get_manifest(&cid) {
-                Ok(m) => m,
-                Err(_) => {
-                    drop(client);
-                    let (tx, rx) = oneshot::channel();
-                    command_tx.send(DataCraftCommand::GetManifest { content_id: cid, reply_tx: tx })
-                        .map_err(|e| e.to_string())?;
-                    rx.await.map_err(|e| e.to_string())??
-                }
-            }
+            client.store().get_manifest(&cid).map_err(|e| e.to_string())?
         };
 
-        // 2. Resolve providers
-        let (tx, rx) = oneshot::channel();
-        command_tx.send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
-            .map_err(|e| e.to_string())?;
-        let providers = rx.await.map_err(|e| e.to_string())??;
-
-        if providers.is_empty() {
-            return Err("no providers found for CID".into());
-        }
-
-        // 3. Query all providers for max shard index
-        let mut global_max: Option<u8> = None;
-        {
+        // Generate new pieces via recombination for each segment
+        let result = {
             let client = self.client.lock().await;
-            if let Some(local_max) = client.store().max_shard_index_for_content(&cid) {
-                global_max = Some(local_max);
-            }
-        }
-
-        for &provider in &providers {
-            let (tx, rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::QueryMaxShardIndex {
-                peer_id: provider,
-                content_id: cid,
-                reply_tx: tx,
-            }).map_err(|e| e.to_string())?;
-
-            if let Ok(Ok(Some(idx))) = rx.await {
-                global_max = Some(global_max.map_or(idx, |m| m.max(idx)));
-            }
-        }
-
-        // 4. Claim next index
-        let k = manifest.k as u8;
-        let initial_total = (manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards) as u8;
-        let target_index = match global_max {
-            Some(max) => max.checked_add(1).ok_or("shard index overflow")?,
-            None => initial_total,
+            crate::health::heal_content(client.store(), &manifest, 1)
         };
 
-        if target_index < k {
-            return Err(format!("target index {} < k={}", target_index, k));
+        if result.pieces_generated == 0 {
+            return Err(format!("failed to generate new pieces: {:?}", result.errors));
         }
 
-        debug!("Extending {} with parity shard at index {}", cid, target_index);
-
-        // 5. Ensure we have k data shards locally
-        {
-            let client = self.client.lock().await;
-            let store = client.store();
-            let mut missing = Vec::new();
-            for i in 0..manifest.k {
-                for chunk_idx in 0..manifest.chunk_count as u32 {
-                    if store.get_shard(&cid, chunk_idx, i as u8).is_err() {
-                        missing.push((chunk_idx, i as u8));
-                    }
-                }
-            }
-            drop(client);
-
-            for (chunk_idx, shard_idx) in missing {
-                let mut fetched = false;
-                for &provider in &providers {
-                    let (tx, rx) = oneshot::channel();
-                    command_tx.send(DataCraftCommand::RequestShard {
-                        peer_id: provider,
-                        content_id: cid,
-                        chunk_index: chunk_idx,
-                        shard_index: shard_idx,
-                        local_public_key: [0u8; 32],
-                        reply_tx: tx,
-                    }).map_err(|e| e.to_string())?;
-                    if let Ok(Ok(data)) = rx.await {
-                        let client = self.client.lock().await;
-                        client.store().put_shard(&cid, chunk_idx, shard_idx, &data)
-                            .map_err(|e| e.to_string())?;
-                        fetched = true;
-                        break;
-                    }
-                }
-                if !fetched {
-                    return Err(format!("failed to fetch data shard {}/{}", chunk_idx, shard_idx));
-                }
-            }
-        }
-
-        // 6. Generate parity shards + store
-        {
-            let client = self.client.lock().await;
-            datacraft_client::extension::extend_content(client.store(), &manifest, target_index)
-                .map_err(|e| e.to_string())?;
-        }
-
-        // 7. Announce as provider
-        {
+        // Announce as provider
+        if let Some(ref command_tx) = self.command_tx {
             let (tx, rx) = oneshot::channel();
             command_tx.send(DataCraftCommand::AnnounceProvider {
                 content_id: cid,
-                manifest: manifest.clone(),
+                manifest,
                 reply_tx: tx,
             }).map_err(|e| e.to_string())?;
             let _ = rx.await;
         }
 
-        debug!("Extended {} with parity shard index {}", cid, target_index);
+        debug!("Extended {} with {} new pieces", cid, result.pieces_generated);
 
         Ok(serde_json::json!({
             "cid": cid.to_hex(),
-            "shard_index": target_index,
+            "pieces_generated": result.pieces_generated,
         }))
     }
 
-    /// Fetch missing shards from remote peers using P2P transfer.
+    /// Fetch missing pieces from remote peers using P2P transfer.
     /// Providers are ranked by peer score — best peers tried first.
-    async fn fetch_missing_shards_from_peers(
+    async fn fetch_missing_pieces_from_peers(
         &self,
         content_id: &datacraft_core::ContentId,
-        manifest: &datacraft_core::ChunkManifest,
+        manifest: &datacraft_core::ContentManifest,
         providers: &[libp2p::PeerId],
         command_tx: &tokio::sync::mpsc::UnboundedSender<DataCraftCommand>,
     ) -> Result<(), String> {
-        debug!("Fetching missing shards for {} from {} providers", content_id, providers.len());
+        debug!("Fetching pieces for {} from {} providers", content_id, providers.len());
 
-        // Rank providers by peer score — try reliable peers first
         let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
             let s = scorer.lock().await;
             s.rank_peers(providers)
         } else {
             providers.to_vec()
         };
-        
-        let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
-        let client = self.client.lock().await;
-        let store = client.store();
-        
-        // For each chunk, try to fetch missing shards from providers
-        for chunk_idx in 0..manifest.chunk_count {
-            let chunk_idx_u32 = chunk_idx as u32;
-            // Check which shards we already have locally
-            for shard_idx in 0..total_shards {
-                if store.get_shard(content_id, chunk_idx_u32, shard_idx as u8).is_ok() {
-                    continue; // We already have this shard
+
+        // For each segment, check if we have enough pieces, if not request more
+        for seg_idx in 0..manifest.segment_count as u32 {
+            let k = manifest.k_for_segment(seg_idx as usize);
+            let local_count = {
+                let client = self.client.lock().await;
+                client.store().list_pieces(content_id, seg_idx).unwrap_or_default().len()
+            };
+
+            if local_count >= k {
+                continue; // Already have enough for this segment
+            }
+
+            let needed = k - local_count;
+            debug!("Segment {} needs {} more pieces", seg_idx, needed);
+
+            let mut fetched = 0;
+            for &provider in &ranked_providers {
+                if fetched >= needed {
+                    break;
                 }
-                
-                debug!("Trying to fetch missing shard {}/{}/{}", content_id, chunk_idx, shard_idx);
-                
-                // Try to fetch this shard from ranked providers (best score first)
-                let mut fetched = false;
-                for &provider in &ranked_providers {
-                    debug!("Requesting shard {}/{}/{} from provider {}", content_id, chunk_idx, shard_idx, provider);
-                    
-                    let request_start = std::time::Instant::now();
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    let command = DataCraftCommand::RequestShard {
-                        peer_id: provider,
-                        content_id: *content_id,
-                        chunk_index: chunk_idx_u32,
-                        shard_index: shard_idx as u8,
-                        local_public_key: [0u8; 32], // TODO: use actual node keypair public key
-                        reply_tx,
-                    };
-                    
-                    if command_tx.send(command).is_err() {
-                        continue;
+
+                let request_start = std::time::Instant::now();
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let command = DataCraftCommand::RequestPiece {
+                    peer_id: provider,
+                    content_id: *content_id,
+                    segment_index: seg_idx,
+                    piece_id: [0u8; 32], // "any piece"
+                    reply_tx,
+                };
+
+                if command_tx.send(command).is_err() {
+                    continue;
+                }
+
+                match reply_rx.await {
+                    Ok(Ok((coefficients, piece_data))) => {
+                        let latency = request_start.elapsed();
+                        let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+
+                        if let Some(ref scorer) = self.peer_scorer {
+                            scorer.lock().await.record_success(&provider, latency);
+                        }
+
+                        let client = self.client.lock().await;
+                        if let Err(e) = client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients) {
+                            warn!("Failed to store piece: {}", e);
+                            continue;
+                        }
+                        fetched += 1;
                     }
-                    
-                    match reply_rx.await {
-                        Ok(Ok(shard_data)) => {
-                            let latency = request_start.elapsed();
-                            debug!("Successfully received shard {}/{}/{} from {} in {:?}", content_id, chunk_idx, shard_idx, provider, latency);
-                            
-                            // Record successful interaction
-                            if let Some(ref scorer) = self.peer_scorer {
-                                scorer.lock().await.record_success(&provider, latency);
-                            }
-                            
-                            // Store the shard locally
-                            if let Err(e) = store.put_shard(content_id, chunk_idx_u32, shard_idx as u8, &shard_data) {
-                                warn!("Failed to store shard {}/{}/{}: {}", content_id, chunk_idx, shard_idx, e);
-                                continue;
-                            }
-                            
-                            fetched = true;
-                            break; // Found this shard, move to next
-                        }
-                        Ok(Err(e)) => {
-                            debug!("Failed to get shard {}/{}/{} from {}: {}", content_id, chunk_idx, shard_idx, provider, e);
-                            // Record failure
-                            if let Some(ref scorer) = self.peer_scorer {
-                                scorer.lock().await.record_failure(&provider);
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Channel error when requesting shard {}/{}/{}: {}", content_id, chunk_idx, shard_idx, e);
-                            // Channel error = timeout-like (peer didn't respond)
-                            if let Some(ref scorer) = self.peer_scorer {
-                                scorer.lock().await.record_timeout(&provider);
-                            }
+                    Ok(Err(e)) => {
+                        debug!("Failed to get piece from {}: {}", provider, e);
+                        if let Some(ref scorer) = self.peer_scorer {
+                            scorer.lock().await.record_failure(&provider);
                         }
                     }
-                }
-                
-                if !fetched {
-                    debug!("Failed to fetch shard {}/{}/{} from any provider", content_id, chunk_idx, shard_idx);
-                    // Continue trying other shards - we might have enough for erasure recovery
+                    Err(e) => {
+                        debug!("Channel error requesting piece: {}", e);
+                        if let Some(ref scorer) = self.peer_scorer {
+                            scorer.lock().await.record_timeout(&provider);
+                        }
+                    }
                 }
             }
         }
-        
-        drop(client); // Release the lock
-        debug!("Completed P2P shard fetching for {} - downloaded missing shards from {} providers", content_id, providers.len());
+
         Ok(())
     }
 
@@ -1030,7 +909,7 @@ impl DataCraftHandler {
             "new_cid": revocation.new_content_id.to_hex(),
             "new_key": hex::encode(&revocation.new_encryption_key),
             "new_size": revocation.new_total_size,
-            "new_chunks": revocation.new_chunk_count as u64,
+            "new_segments": revocation.new_segment_count as u64,
             "revoked": recipient_pubkey_hex,
             "re_grants": re_grants_json,
         }))
@@ -1325,7 +1204,8 @@ impl DataCraftHandler {
             content_id: datacraft_core::ContentId::from_bytes(&[0u8; 32]),
             storage_node,
             challenger: [0u8; 32],
-            shard_index: 0,
+            segment_index: 0,
+            piece_id: [0u8; 32],
             timestamp: 0,
             nonce: [0u8; 32],
             proof_hash: [0u8; 32],

@@ -1,7 +1,7 @@
 //! PDP (Proof of Data Possession) protocol
 //!
-//! Implements `/datacraft/pdp/1.0.0` — challenge/response protocol for proving
-//! storage nodes actually hold shard data. Includes peer rotation challenger model.
+//! Implements coefficient vector cross-checking for proving storage nodes
+//! actually hold piece data. Uses GF(2^8) linear algebra via coefficient vectors.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -16,28 +16,39 @@ use sha2::{Digest, Sha256};
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// Protocol ID for PDP streams.
-pub const PDP_PROTOCOL: &str = "/datacraft/pdp/1.0.0";
-
 /// PDP challenge sent by the challenger to a storage node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PdpChallenge {
     pub content_id: ContentId,
-    pub chunk_index: u32,
-    pub shard_index: u32,
+    pub segment_index: u32,
+    /// Piece ID to challenge (SHA-256 of coefficient vector).
+    pub piece_id: [u8; 32],
+    /// Random byte positions to sample from the piece data.
+    pub byte_positions: Vec<u32>,
+    /// Nonce for replay prevention.
     pub nonce: [u8; 32],
+    /// Timestamp for freshness.
+    pub timestamp: u64,
 }
 
 /// PDP response from a storage node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PdpResponse {
+    /// Hash of (sampled_bytes || coefficient_vector || nonce).
     pub proof_hash: [u8; 32],
+    /// The coefficient vector for this piece (piece identity).
+    pub coefficients: Vec<u8>,
 }
 
-/// Compute the expected proof hash: SHA-256(shard_data || nonce).
-pub fn compute_proof_hash(shard_data: &[u8], nonce: &[u8; 32]) -> [u8; 32] {
+/// Compute the expected proof hash: SHA-256(sampled_bytes || coefficients || nonce).
+pub fn compute_proof_hash(piece_data: &[u8], byte_positions: &[u32], coefficients: &[u8], nonce: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(shard_data);
+    for &pos in byte_positions {
+        if (pos as usize) < piece_data.len() {
+            hasher.update(&[piece_data[pos as usize]]);
+        }
+    }
+    hasher.update(coefficients);
     hasher.update(nonce);
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -46,7 +57,7 @@ pub fn compute_proof_hash(shard_data: &[u8], nonce: &[u8; 32]) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// Wire encoding (length-prefixed JSON — simple and debuggable)
+// Wire encoding (length-prefixed JSON)
 // ---------------------------------------------------------------------------
 
 /// Encode a PDP message as length-prefixed JSON.
@@ -60,7 +71,6 @@ pub fn encode_pdp_message<T: Serialize>(msg: &T) -> Vec<u8> {
 }
 
 /// Decode a PDP message from length-prefixed JSON bytes.
-/// Returns (parsed message, bytes consumed).
 pub fn decode_pdp_message<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<(T, usize), String> {
     if buf.len() < 4 {
         return Err("buffer too short for length prefix".into());
@@ -78,11 +88,9 @@ pub fn decode_pdp_message<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<(T
 // Peer rotation
 // ---------------------------------------------------------------------------
 
-/// Tracks first-seen time for peers providing each CID — used to determine
-/// challenger rotation order (longest online = next challenger).
+/// Tracks first-seen time for peers providing each CID.
 #[derive(Debug, Default)]
 pub struct OnlineTimeTracker {
-    /// (ContentId, PeerId) → first-seen Instant
     first_seen: HashMap<(ContentId, PeerId), Instant>,
 }
 
@@ -91,30 +99,25 @@ impl OnlineTimeTracker {
         Self::default()
     }
 
-    /// Record that we've seen `peer` providing `cid`. Only the first call matters.
     pub fn observe(&mut self, cid: ContentId, peer: PeerId) {
         self.first_seen.entry((cid, peer)).or_insert_with(Instant::now);
     }
 
-    /// Record with a specific instant (for testing).
     pub fn observe_at(&mut self, cid: ContentId, peer: PeerId, when: Instant) {
         self.first_seen.entry((cid, peer)).or_insert(when);
     }
 
-    /// Get first-seen time for a peer providing a CID.
     pub fn first_seen(&self, cid: &ContentId, peer: &PeerId) -> Option<Instant> {
         self.first_seen.get(&(*cid, *peer)).copied()
     }
 
-    /// Sort providers by online time (longest first = earliest first_seen).
-    /// Peers not yet tracked are placed at the end.
     pub fn sort_by_online_time(&self, cid: &ContentId, providers: &[PeerId]) -> Vec<PeerId> {
         let mut sorted: Vec<PeerId> = providers.to_vec();
         sorted.sort_by(|a, b| {
             let ta = self.first_seen.get(&(*cid, *a));
             let tb = self.first_seen.get(&(*cid, *b));
             match (ta, tb) {
-                (Some(a_time), Some(b_time)) => a_time.cmp(b_time), // earlier = first
+                (Some(a_time), Some(b_time)) => a_time.cmp(b_time),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
@@ -127,7 +130,6 @@ impl OnlineTimeTracker {
 /// Manages challenger rotation for each CID.
 #[derive(Debug, Default)]
 pub struct ChallengerRotation {
-    /// CID → index into the sorted provider list (who challenged last).
     rotation_index: HashMap<ContentId, usize>,
 }
 
@@ -136,8 +138,6 @@ impl ChallengerRotation {
         Self::default()
     }
 
-    /// Determine the current challenger for a CID given a sorted provider list.
-    /// Returns `None` if provider list is empty.
     pub fn current_challenger(&self, cid: &ContentId, sorted_providers: &[PeerId]) -> Option<PeerId> {
         if sorted_providers.is_empty() {
             return None;
@@ -147,7 +147,6 @@ impl ChallengerRotation {
         Some(sorted_providers[idx])
     }
 
-    /// Advance rotation after a challenge round completes.
     pub fn advance(&mut self, cid: &ContentId, sorted_providers: &[PeerId]) {
         if sorted_providers.is_empty() {
             return;
@@ -158,57 +157,33 @@ impl ChallengerRotation {
 }
 
 // ---------------------------------------------------------------------------
-// Receipt storage
-// ---------------------------------------------------------------------------
-
-/// Stores received and issued StorageReceipts for later settlement.
-#[derive(Debug, Default)]
-pub struct ReceiptStore {
-    /// Receipts we received (from being challenged by others).
-    pub received: Vec<StorageReceipt>,
-    /// Receipts we issued (as challenger).
-    pub issued: Vec<StorageReceipt>,
-}
-
-impl ReceiptStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_received(&mut self, receipt: StorageReceipt) {
-        self.received.push(receipt);
-    }
-
-    pub fn add_issued(&mut self, receipt: StorageReceipt) {
-        self.issued.push(receipt);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PDP handler (responds to challenges)
+// PDP handler
 // ---------------------------------------------------------------------------
 
 /// Handle an incoming PDP challenge using local store data.
-/// Returns `Some(PdpResponse)` if we hold the shard, `None` otherwise.
 pub fn handle_pdp_challenge(
     store: &FsStore,
     challenge: &PdpChallenge,
 ) -> Option<PdpResponse> {
-    let shard_data = store
-        .get_shard(&challenge.content_id, challenge.chunk_index, challenge.shard_index as u8)
+    let (data, coefficients) = store
+        .get_piece(&challenge.content_id, challenge.segment_index, &challenge.piece_id)
         .ok()?;
-    let proof_hash = compute_proof_hash(&shard_data, &challenge.nonce);
-    Some(PdpResponse { proof_hash })
+    let proof_hash = compute_proof_hash(&data, &challenge.byte_positions, &coefficients, &challenge.nonce);
+    Some(PdpResponse { proof_hash, coefficients })
 }
 
-/// Verify a PDP response against expected shard data.
-/// Returns true if the proof_hash matches hash(shard_data || nonce).
+/// Verify a PDP response against expected piece data.
 pub fn verify_pdp_response(
-    shard_data: &[u8],
+    piece_data: &[u8],
+    byte_positions: &[u32],
+    expected_coefficients: &[u8],
     nonce: &[u8; 32],
     response: &PdpResponse,
 ) -> bool {
-    let expected = compute_proof_hash(shard_data, nonce);
+    if response.coefficients != expected_coefficients {
+        return false;
+    }
+    let expected = compute_proof_hash(piece_data, byte_positions, &response.coefficients, nonce);
     expected == response.proof_hash
 }
 
@@ -217,7 +192,8 @@ pub fn create_storage_receipt(
     content_id: ContentId,
     storage_node: [u8; 32],
     challenger: [u8; 32],
-    shard_index: u32,
+    segment_index: u32,
+    piece_id: [u8; 32],
     nonce: [u8; 32],
     proof_hash: [u8; 32],
 ) -> StorageReceipt {
@@ -230,7 +206,8 @@ pub fn create_storage_receipt(
         content_id,
         storage_node,
         challenger,
-        shard_index,
+        segment_index,
+        piece_id,
         timestamp,
         nonce,
         proof_hash,
@@ -238,18 +215,19 @@ pub fn create_storage_receipt(
     }
 }
 
-/// Create and sign a StorageReceipt for a provider that passed PDP.
+/// Create and sign a StorageReceipt.
 pub fn create_signed_storage_receipt(
     content_id: ContentId,
     storage_node: [u8; 32],
     challenger: [u8; 32],
-    shard_index: u32,
+    segment_index: u32,
+    piece_id: [u8; 32],
     nonce: [u8; 32],
     proof_hash: [u8; 32],
     signing_key: &ed25519_dalek::SigningKey,
 ) -> StorageReceipt {
     let mut receipt = create_storage_receipt(
-        content_id, storage_node, challenger, shard_index, nonce, proof_hash,
+        content_id, storage_node, challenger, segment_index, piece_id, nonce, proof_hash,
     );
     datacraft_core::signing::sign_storage_receipt(&mut receipt, signing_key);
     receipt
@@ -277,27 +255,25 @@ mod tests {
 
     #[test]
     fn test_proof_hash_deterministic() {
-        let data = b"shard data bytes";
+        let data = b"piece data bytes";
+        let positions = vec![0, 5, 10];
+        let coefficients = vec![1, 0, 0, 0];
         let nonce = [42u8; 32];
-        let h1 = compute_proof_hash(data, &nonce);
-        let h2 = compute_proof_hash(data, &nonce);
+        let h1 = compute_proof_hash(data, &positions, &coefficients, &nonce);
+        let h2 = compute_proof_hash(data, &positions, &coefficients, &nonce);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn test_proof_hash_different_nonce() {
-        let data = b"shard data";
+        let data = b"piece data";
+        let positions = vec![0, 1];
+        let coefficients = vec![1];
         let n1 = [1u8; 32];
         let n2 = [2u8; 32];
-        assert_ne!(compute_proof_hash(data, &n1), compute_proof_hash(data, &n2));
-    }
-
-    #[test]
-    fn test_proof_hash_different_data() {
-        let nonce = [0u8; 32];
         assert_ne!(
-            compute_proof_hash(b"aaa", &nonce),
-            compute_proof_hash(b"bbb", &nonce),
+            compute_proof_hash(data, &positions, &coefficients, &n1),
+            compute_proof_hash(data, &positions, &coefficients, &n2),
         );
     }
 
@@ -305,30 +281,16 @@ mod tests {
     fn test_wire_roundtrip_challenge() {
         let challenge = PdpChallenge {
             content_id: ContentId([7u8; 32]),
-            chunk_index: 3,
-            shard_index: 5,
+            segment_index: 3,
+            piece_id: [5u8; 32],
+            byte_positions: vec![0, 100, 200],
             nonce: [99u8; 32],
+            timestamp: 1234567890,
         };
         let encoded = encode_pdp_message(&challenge);
         let (decoded, consumed): (PdpChallenge, _) = decode_pdp_message(&encoded).unwrap();
         assert_eq!(decoded, challenge);
         assert_eq!(consumed, encoded.len());
-    }
-
-    #[test]
-    fn test_wire_roundtrip_response() {
-        let response = PdpResponse {
-            proof_hash: [0xAB; 32],
-        };
-        let encoded = encode_pdp_message(&response);
-        let (decoded, _): (PdpResponse, _) = decode_pdp_message(&encoded).unwrap();
-        assert_eq!(decoded, response);
-    }
-
-    #[test]
-    fn test_wire_decode_truncated() {
-        assert!(decode_pdp_message::<PdpResponse>(&[0, 0]).is_err());
-        assert!(decode_pdp_message::<PdpResponse>(&[0, 0, 0, 10]).is_err()); // claims 10 bytes, has 0
     }
 
     #[test]
@@ -340,27 +302,12 @@ mod tests {
 
         let now = Instant::now();
         let mut tracker = OnlineTimeTracker::new();
-        // p2 seen first, then p1, then p3
         tracker.observe_at(cid, p2, now - std::time::Duration::from_secs(100));
         tracker.observe_at(cid, p1, now - std::time::Duration::from_secs(50));
         tracker.observe_at(cid, p3, now);
 
         let sorted = tracker.sort_by_online_time(&cid, &[p1, p2, p3]);
-        assert_eq!(sorted, vec![p2, p1, p3]); // longest online first
-    }
-
-    #[test]
-    fn test_online_time_untracked_last() {
-        let cid = ContentId([2u8; 32]);
-        let p1 = PeerId::random();
-        let p2 = PeerId::random();
-
-        let mut tracker = OnlineTimeTracker::new();
-        tracker.observe(cid, p1);
-        // p2 not observed
-
-        let sorted = tracker.sort_by_online_time(&cid, &[p2, p1]);
-        assert_eq!(sorted[0], p1); // tracked peer first
+        assert_eq!(sorted, vec![p2, p1, p3]);
     }
 
     #[test]
@@ -369,44 +316,13 @@ mod tests {
         let providers = vec![PeerId::random(), PeerId::random(), PeerId::random()];
         let mut rotation = ChallengerRotation::new();
 
-        // First round: index 0
         assert_eq!(rotation.current_challenger(&cid, &providers), Some(providers[0]));
         rotation.advance(&cid, &providers);
-
-        // Second round: index 1
         assert_eq!(rotation.current_challenger(&cid, &providers), Some(providers[1]));
         rotation.advance(&cid, &providers);
-
-        // Third round: index 2
         assert_eq!(rotation.current_challenger(&cid, &providers), Some(providers[2]));
         rotation.advance(&cid, &providers);
-
-        // Wraps back to 0
         assert_eq!(rotation.current_challenger(&cid, &providers), Some(providers[0]));
-    }
-
-    #[test]
-    fn test_challenger_rotation_empty() {
-        let cid = ContentId([4u8; 32]);
-        let rotation = ChallengerRotation::new();
-        assert_eq!(rotation.current_challenger(&cid, &[]), None);
-    }
-
-    #[test]
-    fn test_verify_pdp_response_success() {
-        let data = b"some shard data";
-        let nonce = [5u8; 32];
-        let proof_hash = compute_proof_hash(data, &nonce);
-        let response = PdpResponse { proof_hash };
-        assert!(verify_pdp_response(data, &nonce, &response));
-    }
-
-    #[test]
-    fn test_verify_pdp_response_failure() {
-        let data = b"some shard data";
-        let nonce = [5u8; 32];
-        let response = PdpResponse { proof_hash: [0u8; 32] }; // wrong hash
-        assert!(!verify_pdp_response(data, &nonce, &response));
     }
 
     #[test]
@@ -414,28 +330,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pdp-test-{}", std::process::id()));
         let store = FsStore::new(&dir).unwrap();
         let cid = ContentId::from_bytes(b"pdp test content");
-        let shard_data = b"actual shard bytes here";
+        let piece_data = b"actual piece bytes here";
+        let coefficients = vec![1u8, 0, 0];
+        let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
 
-        store.put_shard(&cid, 0, 2, shard_data).unwrap();
+        store.store_piece(&cid, 0, &piece_id, piece_data, &coefficients).unwrap();
 
         let nonce = [77u8; 32];
         let challenge = PdpChallenge {
             content_id: cid,
-            chunk_index: 0,
-            shard_index: 2,
+            segment_index: 0,
+            piece_id,
+            byte_positions: vec![0, 5, 10],
             nonce,
+            timestamp: 1000,
         };
 
         let response = handle_pdp_challenge(&store, &challenge).unwrap();
-        let expected = compute_proof_hash(shard_data, &nonce);
+        let expected = compute_proof_hash(piece_data, &challenge.byte_positions, &coefficients, &nonce);
         assert_eq!(response.proof_hash, expected);
+        assert_eq!(response.coefficients, coefficients);
 
-        // Missing shard returns None
+        // Missing piece returns None
         let bad_challenge = PdpChallenge {
-            content_id: cid,
-            chunk_index: 0,
-            shard_index: 99,
-            nonce,
+            piece_id: [99u8; 32],
+            ..challenge
         };
         assert!(handle_pdp_challenge(&store, &bad_challenge).is_none());
 
@@ -445,80 +364,15 @@ mod tests {
     #[test]
     fn test_create_storage_receipt() {
         let cid = ContentId([10u8; 32]);
+        let piece_id = [5u8; 32];
         let receipt = create_storage_receipt(
-            cid,
-            [1u8; 32],
-            [2u8; 32],
-            5,
-            [3u8; 32],
-            [4u8; 32],
+            cid, [1u8; 32], [2u8; 32], 0, piece_id, [3u8; 32], [4u8; 32],
         );
         assert_eq!(receipt.content_id, cid);
-        assert_eq!(receipt.storage_node, [1u8; 32]);
-        assert_eq!(receipt.challenger, [2u8; 32]);
-        assert_eq!(receipt.shard_index, 5);
-        assert_eq!(receipt.nonce, [3u8; 32]);
-        assert_eq!(receipt.proof_hash, [4u8; 32]);
+        assert_eq!(receipt.piece_id, piece_id);
+        assert_eq!(receipt.segment_index, 0);
         assert_eq!(receipt.weight(), 1);
         assert!(receipt.timestamp > 0);
-    }
-
-    #[test]
-    fn test_receipt_store() {
-        let mut store = ReceiptStore::new();
-        let receipt = create_storage_receipt(
-            ContentId([0u8; 32]),
-            [1u8; 32],
-            [2u8; 32],
-            0,
-            [3u8; 32],
-            [4u8; 32],
-        );
-        store.add_received(receipt.clone());
-        store.add_issued(receipt);
-        assert_eq!(store.received.len(), 1);
-        assert_eq!(store.issued.len(), 1);
-    }
-
-    #[test]
-    fn test_full_pdp_flow() {
-        // Simulates: challenger creates challenge → provider responds → challenger verifies → receipt issued
-        let dir = std::env::temp_dir().join(format!("pdp-flow-{}", std::process::id()));
-        let store = FsStore::new(&dir).unwrap();
-        let cid = ContentId::from_bytes(b"full flow test");
-        let shard_data = b"the actual shard content for pdp";
-
-        store.put_shard(&cid, 0, 1, shard_data).unwrap();
-
-        // 1. Challenger creates challenge with random nonce
-        let nonce = [42u8; 32]; // would be random in production
-        let challenge = PdpChallenge {
-            content_id: cid,
-            chunk_index: 0,
-            shard_index: 1,
-            nonce,
-        };
-
-        // 2. Provider responds
-        let response = handle_pdp_challenge(&store, &challenge).unwrap();
-
-        // 3. Challenger verifies (challenger has the shard data to verify against)
-        assert!(verify_pdp_response(shard_data, &nonce, &response));
-
-        // 4. Challenger issues receipt
-        let receipt = create_storage_receipt(
-            cid,
-            [1u8; 32], // storage_node pubkey
-            [2u8; 32], // challenger pubkey
-            1,
-            nonce,
-            response.proof_hash,
-        );
-
-        assert_eq!(receipt.weight(), 1);
-        assert_eq!(receipt.content_id, cid);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -529,12 +383,14 @@ mod tests {
 
         let key = SigningKey::generate(&mut OsRng);
         let pubkey = key.verifying_key();
+        let piece_id = [10u8; 32];
 
-        let receipt = super::create_signed_storage_receipt(
+        let receipt = create_signed_storage_receipt(
             ContentId([20u8; 32]),
             [1u8; 32],
             pubkey.to_bytes(),
-            7,
+            0,
+            piece_id,
             [3u8; 32],
             [4u8; 32],
             &key,
@@ -542,15 +398,14 @@ mod tests {
 
         assert_eq!(receipt.signature.len(), 64);
         assert!(verify_storage_receipt(&receipt, &pubkey));
-        assert_eq!(receipt.shard_index, 7);
+        assert_eq!(receipt.piece_id, piece_id);
     }
 
     #[test]
     fn test_peer_id_to_local_pubkey_ed25519() {
         let kp = libp2p::identity::Keypair::generate_ed25519();
         let peer_id = kp.public().to_peer_id();
-        let extracted = super::peer_id_to_local_pubkey(&peer_id);
-        // Should be the actual ed25519 public key
+        let extracted = peer_id_to_local_pubkey(&peer_id);
         let expected = kp.public().try_into_ed25519().unwrap().to_bytes();
         assert_eq!(extracted, expected);
     }

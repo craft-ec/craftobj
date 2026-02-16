@@ -19,11 +19,9 @@ pub enum DaemonEvent {
     ListeningOn { address: String },
 
     // -- Discovery status --
-    /// Periodic summary of network discovery state
     DiscoveryStatus {
         total_peers: usize,
         storage_peers: usize,
-        /// What the node is currently doing to find peers
         action: String,
     },
 
@@ -38,7 +36,7 @@ pub enum DaemonEvent {
     RemovalNoticeReceived { content_id: String, creator: String, valid: bool },
 
     // -- Actions (user-initiated) --
-    ContentPublished { content_id: String, size: u64, chunks: u32, shards: usize },
+    ContentPublished { content_id: String, size: u64, segments: usize, pieces_per_segment: usize },
     AccessGranted { content_id: String, recipient: String },
     AccessRevoked { content_id: String, recipient: String },
     ChannelOpened { channel_id: String, receiver: String, amount: u64 },
@@ -48,28 +46,24 @@ pub enum DaemonEvent {
 
     // -- DHT results --
     ProvidersResolved { content_id: String, count: usize },
-    ManifestRetrieved { content_id: String, chunks: u32 },
-    DhtError { content_id: String, error: String, /// What happens next
-        next_action: String },
+    ManifestRetrieved { content_id: String, segments: usize },
+    DhtError { content_id: String, error: String, next_action: String },
 
     // -- Content status --
-    /// Full status update for a content item — emitted after publish, announce, distribute, or provider check
     ContentStatus {
         content_id: String,
         name: String,
         size: u64,
         stage: String,
-        local_shards: usize,
-        remote_shards: usize,
-        total_shards: usize,
+        local_pieces: usize,
+        remote_pieces: usize,
+        total_pieces: usize,
         provider_count: usize,
-        /// Human-readable summary of what this means and what's next
         summary: String,
     },
 
     // -- Distribution --
-    ContentDistributed { content_id: String, shards_pushed: usize, total_shards: usize, target_peers: usize },
-    /// Distribution not possible — explains why and when retry happens
+    ContentDistributed { content_id: String, pieces_pushed: usize, total_pieces: usize, target_peers: usize },
     DistributionSkipped { reason: String, retry_secs: u64 },
 
     // -- Maintenance --
@@ -78,7 +72,7 @@ pub enum DaemonEvent {
 
     // -- PDP --
     ChallengerRoundCompleted { rounds: u32 },
-    ShardRequested { content_id: String, peer_id: String, chunk: u32, shard: u32 },
+    PieceRequested { content_id: String, peer_id: String, segment: u32 },
 }
 
 pub type EventSender = broadcast::Sender<DaemonEvent>;

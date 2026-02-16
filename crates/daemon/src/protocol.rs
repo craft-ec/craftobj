@@ -5,13 +5,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datacraft_core::{ContentId, ChunkManifest, TransferReceipt, TRANSFER_PROTOCOL, SHARD_COORD_PROTOCOL};
-use datacraft_core::signing::{sign_transfer_receipt, verify_transfer_receipt, peer_id_to_ed25519_pubkey};
+use datacraft_core::{ContentId, ContentManifest, TRANSFER_PROTOCOL};
 use datacraft_routing::ContentRouter;
 use datacraft_store::FsStore;
-use datacraft_transfer::{decode_shard_request, REQUEST_HEADER_SIZE};
+use datacraft_transfer::{
+    decode_piece_request, decode_piece_push, decode_manifest_push_header,
+    encode_piece_response, encode_piece_response_error,
+    PIECE_REQUEST_SIZE, MANIFEST_PUSH_HEADER_SIZE,
+};
 use craftec_network::{CraftBehaviour, behaviour::CraftBehaviourEvent};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use libp2p::kad;
 use libp2p::swarm::SwarmEvent;
 use libp2p_stream::IncomingStreams;
@@ -31,7 +33,7 @@ pub enum DataCraftEvent {
     /// DHT manifest record retrieved.
     ManifestRetrieved {
         content_id: ContentId,
-        manifest: ChunkManifest,
+        manifest: ContentManifest,
     },
     /// DHT access list record retrieved.
     AccessListRetrieved {
@@ -46,44 +48,12 @@ pub enum DataCraftEvent {
     /// Manifest received via push from another node (we're storing for them).
     ManifestPushReceived {
         content_id: ContentId,
-        manifest: ChunkManifest,
+        manifest: ContentManifest,
     },
-    /// Shard received via push — update local shard count in tracker.
-    ShardPushReceived {
+    /// Piece received via push — update local piece count in tracker.
+    PiecePushReceived {
         content_id: ContentId,
     },
-}
-
-/// In-memory receipt store for TransferReceipts received from requesters.
-#[derive(Debug, Default)]
-pub struct ReceiptStore {
-    receipts: Vec<TransferReceipt>,
-}
-
-impl ReceiptStore {
-    pub fn new() -> Self {
-        Self { receipts: Vec::new() }
-    }
-
-    /// Store a verified receipt.
-    pub fn add(&mut self, receipt: TransferReceipt) {
-        self.receipts.push(receipt);
-    }
-
-    /// Get all stored receipts.
-    pub fn receipts(&self) -> &[TransferReceipt] {
-        &self.receipts
-    }
-
-    /// Number of stored receipts.
-    pub fn len(&self) -> usize {
-        self.receipts.len()
-    }
-
-    /// Whether the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.receipts.is_empty()
-    }
 }
 
 /// DataCraft protocol handler for registration on shared libp2p swarm.
@@ -94,13 +64,9 @@ pub struct DataCraftProtocol {
     event_tx: mpsc::UnboundedSender<DataCraftEvent>,
     /// Pending DHT queries waiting for completion.
     pending_queries: Arc<Mutex<HashMap<kad::QueryId, PendingQuery>>>,
-    /// In-memory receipt store (legacy, kept for protocol-level caching).
-    receipt_store: Arc<Mutex<ReceiptStore>>,
     /// Persistent receipt store for durable receipt storage.
     persistent_receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
-    /// Node's signing key for creating TransferReceipts when requesting shards.
-    signing_key: Option<Arc<SigningKey>>,
-    /// Shared removal cache — checked before serving shards.
+    /// Shared removal cache — checked before serving pieces.
     removal_cache: Option<Arc<Mutex<crate::removal_cache::RemovalCache>>>,
 }
 
@@ -122,9 +88,7 @@ impl DataCraftProtocol {
             store,
             event_tx,
             pending_queries: Arc::new(Mutex::new(HashMap::new())),
-            receipt_store: Arc::new(Mutex::new(ReceiptStore::new())),
             persistent_receipt_store: None,
-            signing_key: None,
             removal_cache: None,
         }
     }
@@ -139,33 +103,18 @@ impl DataCraftProtocol {
         self.removal_cache = Some(cache);
     }
 
-    /// Set the node's signing key for creating signed TransferReceipts.
-    pub fn set_signing_key(&mut self, key: SigningKey) {
-        self.signing_key = Some(Arc::new(key));
-    }
-
-    /// Access the receipt store.
-    pub fn receipt_store(&self) -> &Arc<Mutex<ReceiptStore>> {
-        &self.receipt_store
-    }
-
     /// Register this protocol with the shared libp2p swarm.
-    /// Returns (transfer_streams, shard_coord_streams).
+    /// Returns incoming transfer streams.
     pub fn register(
         &self,
         swarm: &mut craftec_network::CraftSwarm,
-    ) -> Result<(IncomingStreams, IncomingStreams), Box<dyn std::error::Error>> {
+    ) -> Result<IncomingStreams, Box<dyn std::error::Error>> {
         debug!("Registering DataCraft transfer protocol: {}", TRANSFER_PROTOCOL);
-        debug!("Registering DataCraft shard coordination protocol: {}", SHARD_COORD_PROTOCOL);
-        
-        // Get stream control from the behavior
+
         let mut control = swarm.behaviour().stream_control();
-        
-        // Accept incoming streams for our protocols
         let transfer_streams = control.accept(libp2p::StreamProtocol::new(TRANSFER_PROTOCOL))?;
-        let coord_streams = control.accept(libp2p::StreamProtocol::new(SHARD_COORD_PROTOCOL))?;
-        
-        Ok((transfer_streams, coord_streams))
+
+        Ok(transfer_streams)
     }
 
     /// Announce this node as a provider for the given content ID.
@@ -183,7 +132,7 @@ impl DataCraftProtocol {
     pub async fn publish_manifest(
         &self,
         behaviour: &mut CraftBehaviour,
-        manifest: &ChunkManifest,
+        manifest: &ContentManifest,
         local_peer_id: &libp2p::PeerId,
     ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Publishing manifest for {} to DHT", manifest.content_id);
@@ -199,13 +148,12 @@ impl DataCraftProtocol {
     ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Resolving providers for {}", content_id);
         let query_id = ContentRouter::resolve(behaviour, content_id);
-        
-        // Track this query so we can match the response
+
         let mut queries = self.pending_queries.lock().await;
-        queries.insert(query_id, PendingQuery::ProvidersLookup { 
-            content_id: *content_id 
+        queries.insert(query_id, PendingQuery::ProvidersLookup {
+            content_id: *content_id
         });
-        
+
         Ok(())
     }
 
@@ -217,13 +165,12 @@ impl DataCraftProtocol {
     ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Getting manifest for {}", content_id);
         let query_id = ContentRouter::get_manifest(behaviour, content_id);
-        
-        // Track this query
+
         let mut queries = self.pending_queries.lock().await;
-        queries.insert(query_id, PendingQuery::ManifestLookup { 
-            content_id: *content_id 
+        queries.insert(query_id, PendingQuery::ManifestLookup {
+            content_id: *content_id
         });
-        
+
         Ok(())
     }
 
@@ -234,7 +181,7 @@ impl DataCraftProtocol {
         content_id: &ContentId,
     ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Getting access list for {} from DHT", content_id);
-        let query_id = datacraft_routing::ContentRouter::get_access_list(behaviour, content_id);
+        let query_id = ContentRouter::get_access_list(behaviour, content_id);
         let mut queries = self.pending_queries.lock().await;
         queries.insert(query_id, PendingQuery::AccessListLookup {
             content_id: *content_id,
@@ -248,9 +195,7 @@ impl DataCraftProtocol {
             SwarmEvent::Behaviour(CraftBehaviourEvent::Kademlia(kad_event)) => {
                 self.handle_kademlia_event(kad_event).await;
             }
-            _ => {
-                // Other events (connections, etc.) are handled by the main swarm loop
-            }
+            _ => {}
         }
     }
 
@@ -262,9 +207,7 @@ impl DataCraftProtocol {
             Event::OutboundQueryProgressed { id, result, .. } => {
                 self.handle_query_result(*id, result).await;
             }
-            _ => {
-                // Other Kademlia events not relevant for DataCraft
-            }
+            _ => {}
         }
     }
 
@@ -289,27 +232,27 @@ impl DataCraftProtocol {
             (PendingQuery::ProvidersLookup { content_id }, QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders { providers, .. }))) => {
                 debug!("Found {} providers for {}", providers.len(), content_id);
                 let provider_peers: Vec<libp2p::PeerId> = providers.iter().cloned().collect();
-                
+
                 let event = DataCraftEvent::ProvidersResolved {
                     content_id,
                     providers: provider_peers,
                 };
-                
+
                 if let Err(e) = self.event_tx.send(event) {
                     error!("Failed to send providers resolved event: {}", e);
                 }
             }
-            
+
             (PendingQuery::ManifestLookup { content_id }, QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(peer_record)))) => {
                 debug!("Found manifest record for {}", content_id);
-                
+
                 match datacraft_routing::parse_manifest_record(&peer_record.record.value) {
                     Ok(manifest) => {
                         let event = DataCraftEvent::ManifestRetrieved {
                             content_id,
                             manifest,
                         };
-                        
+
                         if let Err(e) = self.event_tx.send(event) {
                             error!("Failed to send manifest retrieved event: {}", e);
                         }
@@ -320,7 +263,7 @@ impl DataCraftProtocol {
                             content_id,
                             error: format!("Failed to parse manifest: {}", e),
                         };
-                        
+
                         if let Err(e) = self.event_tx.send(event) {
                             error!("Failed to send DHT error event: {}", e);
                         }
@@ -356,25 +299,24 @@ impl DataCraftProtocol {
 
             (pending, result) => {
                 debug!("Query {:?} completed with unhandled result: {:?}", pending, result);
-                
-                // Extract content_id for error reporting
+
                 let content_id = match pending {
                     PendingQuery::ProvidersLookup { content_id } => content_id,
                     PendingQuery::ManifestLookup { content_id } => content_id,
                     PendingQuery::AccessListLookup { content_id } => content_id,
                 };
-                
+
                 let error_msg = match result {
                     QueryResult::GetProviders(Err(e)) => format!("Providers lookup failed: {:?}", e),
                     QueryResult::GetRecord(Err(e)) => format!("Record lookup failed: {:?}", e),
                     _ => "Query completed with no results".to_string(),
                 };
-                
+
                 let event = DataCraftEvent::DhtError {
                     content_id,
                     error: error_msg,
                 };
-                
+
                 if let Err(e) = self.event_tx.send(event) {
                     error!("Failed to send DHT error event: {}", e);
                 }
@@ -382,334 +324,92 @@ impl DataCraftProtocol {
         }
     }
 
-    /// Request a shard from a remote peer.
+    /// Request a piece from a remote peer.
     ///
-    /// After receiving the shard successfully, creates and sends a TransferReceipt
-    /// back to the server node.
-    pub async fn request_shard_from_peer(
+    /// `piece_id` of all zeros means "any random piece for this segment".
+    /// Returns (coefficients, data) on success.
+    pub async fn request_piece_from_peer(
         &self,
         behaviour: &mut CraftBehaviour,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
-        chunk_index: u32,
-        shard_index: u8,
-        local_public_key: &[u8; 32],
-    ) -> Result<Vec<u8>, String> {
+        segment_index: u32,
+        piece_id: &[u8; 32],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
         use futures::{AsyncReadExt, AsyncWriteExt};
-        use datacraft_transfer::{encode_shard_request, encode_receipt, RESPONSE_HEADER_SIZE};
+        use datacraft_transfer::encode_piece_request;
         use datacraft_core::WireStatus;
 
         debug!(
-            "Requesting shard {}/{}/{} from peer {}",
-            content_id, chunk_index, shard_index, peer_id
+            "Requesting piece {}/{} from peer {}",
+            content_id, segment_index, peer_id
         );
 
-        // Get stream control from behavior
         let mut control = behaviour.stream_control();
-        
-        // Open stream to peer
+
         let mut stream = control
             .open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL))
             .await
             .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
 
-        // Send request using the existing wire protocol
-        let request = encode_shard_request(content_id, chunk_index, shard_index);
+        let request = encode_piece_request(content_id, segment_index, piece_id);
         stream.write_all(&request).await.map_err(|e| {
             format!("Failed to send request to {}: {}", peer_id, e)
         })?;
 
-        // Read response header
-        let mut header = [0u8; RESPONSE_HEADER_SIZE];
-        stream.read_exact(&mut header).await.map_err(|e| {
-            format!("Failed to read response header from {}: {}", peer_id, e)
+        // Read response: [status:1][coeff_len:4][coeff][data_len:4][data]
+        let mut status_byte = [0u8; 1];
+        stream.read_exact(&mut status_byte).await.map_err(|e| {
+            format!("Failed to read status from {}: {}", peer_id, e)
         })?;
 
-        let status = WireStatus::from_u8(header[0]).ok_or_else(|| {
-            format!("Invalid status byte from {}: {}", peer_id, header[0])
+        let status = WireStatus::from_u8(status_byte[0]).ok_or_else(|| {
+            format!("Invalid status byte from {}: {}", peer_id, status_byte[0])
         })?;
-        let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.map_err(|e| {
+            format!("Failed to read coeff_len from {}: {}", peer_id, e)
+        })?;
+        let coeff_len = u32::from_be_bytes(len_buf) as usize;
 
         match status {
             WireStatus::Ok => {
-                let mut payload = vec![0u8; payload_len];
-                stream.read_exact(&mut payload).await.map_err(|e| {
-                    format!("Failed to read payload from {}: {}", peer_id, e)
+                let mut coefficients = vec![0u8; coeff_len];
+                stream.read_exact(&mut coefficients).await.map_err(|e| {
+                    format!("Failed to read coefficients from {}: {}", peer_id, e)
+                })?;
+
+                stream.read_exact(&mut len_buf).await.map_err(|e| {
+                    format!("Failed to read data_len from {}: {}", peer_id, e)
+                })?;
+                let data_len = u32::from_be_bytes(len_buf) as usize;
+
+                let mut data = vec![0u8; data_len];
+                stream.read_exact(&mut data).await.map_err(|e| {
+                    format!("Failed to read data from {}: {}", peer_id, e)
                 })?;
 
                 debug!(
-                    "Successfully received shard {}/{}/{} ({} bytes) from peer {}",
-                    content_id, chunk_index, shard_index, payload.len(), peer_id
+                    "Received piece {}/{} ({} bytes data, {} bytes coeff) from {}",
+                    content_id, segment_index, data.len(), coefficients.len(), peer_id
                 );
 
-                // Create and send TransferReceipt back to the server
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                // Extract server's ed25519 public key from PeerId
-                let server_node = peer_id_to_ed25519_pubkey(&peer_id)
-                    .unwrap_or_else(|| {
-                        // Fallback: use truncated PeerId bytes
-                        let peer_bytes = peer_id.to_bytes();
-                        let mut key = [0u8; 32];
-                        let len = peer_bytes.len().min(32);
-                        key[..len].copy_from_slice(&peer_bytes[..len]);
-                        key
-                    });
-
-                let mut receipt = TransferReceipt {
-                    content_id: *content_id,
-                    server_node,
-                    requester: *local_public_key,
-                    shard_index: shard_index as u32,
-                    bytes_served: payload.len() as u64,
-                    timestamp,
-                    signature: vec![],
-                };
-
-                // Sign the receipt with our signing key
-                if let Some(ref signing_key) = self.signing_key {
-                    sign_transfer_receipt(&mut receipt, signing_key);
-                }
-
-                // Send receipt — best effort, don't fail the transfer if receipt send fails
-                match encode_receipt(&receipt) {
-                    Ok(encoded) => {
-                        if let Err(e) = stream.write_all(&encoded).await {
-                            warn!("Failed to send receipt to {}: {}", peer_id, e);
-                        } else {
-                            debug!("Sent TransferReceipt to {} for {}/{}/{}", peer_id, content_id, chunk_index, shard_index);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to encode receipt: {}", e);
-                    }
-                }
-
-                Ok(payload)
+                Ok((coefficients, data))
             }
             WireStatus::NotFound => {
                 Err(format!(
-                    "Shard {}/{}/{} not found on peer {}",
-                    content_id, chunk_index, shard_index, peer_id
+                    "Piece {}/{} not found on peer {}",
+                    content_id, segment_index, peer_id
                 ))
             }
             WireStatus::Error => {
-                let mut msg = vec![0u8; payload_len];
-                stream.read_exact(&mut msg).await.ok();
-                Err(format!(
-                    "Error from peer {}: {}",
-                    peer_id,
-                    String::from_utf8_lossy(&msg)
-                ))
+                Err(format!("Error from peer {}", peer_id))
             }
         }
     }
 
-    /// Query a remote peer for their max shard index for a given CID.
-    ///
-    /// Protocol: `/datacraft/shard-coord/1.0.0`
-    /// Request:  [content_id:32]
-    /// Response: [status:1][max_index:1]  (status 0=found, 1=not_found)
-    pub async fn query_max_shard_index(
-        &self,
-        behaviour: &mut CraftBehaviour,
-        peer_id: libp2p::PeerId,
-        content_id: &ContentId,
-    ) -> Result<Option<u8>, String> {
-        use futures::{AsyncReadExt, AsyncWriteExt};
-
-        debug!("Querying peer {} for max shard index of {}", peer_id, content_id);
-
-        let mut control = behaviour.stream_control();
-        let mut stream = control
-            .open_stream(peer_id, libp2p::StreamProtocol::new(SHARD_COORD_PROTOCOL))
-            .await
-            .map_err(|e| format!("Failed to open shard-coord stream to {}: {}", peer_id, e))?;
-
-        // Send content_id
-        stream.write_all(&content_id.0).await
-            .map_err(|e| format!("Failed to send query to {}: {}", peer_id, e))?;
-
-        // Read response: [status:1][max_index:1]
-        let mut resp = [0u8; 2];
-        stream.read_exact(&mut resp).await
-            .map_err(|e| format!("Failed to read response from {}: {}", peer_id, e))?;
-
-        match resp[0] {
-            0 => Ok(Some(resp[1])),
-            1 => Ok(None),
-            _ => Err(format!("Invalid shard-coord status from {}: {}", peer_id, resp[0])),
-        }
-    }
-
-    /// Handle an incoming shard coordination stream from a peer.
-    pub async fn handle_incoming_coord_stream(&self, mut stream: libp2p::Stream) {
-        use futures::{AsyncReadExt, AsyncWriteExt};
-
-        // Read content_id
-        let mut cid_bytes = [0u8; 32];
-        if let Err(e) = stream.read_exact(&mut cid_bytes).await {
-            error!("Failed to read shard-coord request: {}", e);
-            return;
-        }
-
-        let content_id = ContentId(cid_bytes);
-        let store = self.store.lock().await;
-
-        let response = match store.max_shard_index_for_content(&content_id) {
-            Some(max) => [0u8, max],       // status=found
-            None => [1u8, 0u8],            // status=not_found
-        };
-
-        if let Err(e) = stream.write_all(&response).await {
-            error!("Failed to write shard-coord response: {}", e);
-        }
-
-        debug!("Responded to shard-coord query for {}: {:?}", content_id, response);
-    }
-
-    /// Handle an incoming shard push from a peer.
-    ///
-    /// We already read REQUEST_HEADER_SIZE bytes; need to read the remaining push header
-    /// bytes (payload_len:4) plus the payload itself, then store.
-    async fn handle_incoming_push(&self, mut stream: libp2p::Stream, initial_header: &[u8]) {
-        use futures::{AsyncReadExt, AsyncWriteExt};
-        use datacraft_transfer::PUSH_HEADER_SIZE;
-
-        // We've read REQUEST_HEADER_SIZE (42) bytes. Push header is PUSH_HEADER_SIZE (46).
-        // Need 4 more bytes for payload_len.
-        let mut extra = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut extra).await {
-            error!("Failed to read push header remainder: {}", e);
-            return;
-        }
-
-        // Reconstruct full header
-        let mut full_header = vec![0u8; PUSH_HEADER_SIZE];
-        full_header[..REQUEST_HEADER_SIZE].copy_from_slice(initial_header);
-        full_header[REQUEST_HEADER_SIZE..].copy_from_slice(&extra);
-
-        let (content_id, chunk_index, shard_index, payload_len) =
-            match datacraft_transfer::decode_shard_push_header(&full_header) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Failed to decode push header: {}", e);
-                    let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-                    return;
-                }
-            };
-
-        // Sanity check payload size (max 16MB per shard)
-        if payload_len > 16 * 1024 * 1024 {
-            warn!("Push payload too large: {} bytes", payload_len);
-            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-            return;
-        }
-
-        // Read payload
-        let mut payload = vec![0u8; payload_len as usize];
-        if let Err(e) = stream.read_exact(&mut payload).await {
-            error!("Failed to read push payload: {}", e);
-            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-            return;
-        }
-
-        // Check removal cache
-        if let Some(ref cache) = self.removal_cache {
-            let cache = cache.lock().await;
-            if cache.is_removed(&content_id) {
-                warn!("Refusing pushed shard for removed content: {}", content_id);
-                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-                return;
-            }
-        }
-
-        // Store the shard
-        {
-            let store = self.store.lock().await;
-            match store.put_shard(&content_id, chunk_index, shard_index, &payload) {
-                Ok(()) => {
-                    info!(
-                        "Stored pushed shard {}/{}/{} ({} bytes)",
-                        content_id, chunk_index, shard_index, payload.len()
-                    );
-                    let _ = self.event_tx.send(DataCraftEvent::ShardPushReceived { content_id });
-                    let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
-                }
-                Err(e) => {
-                    error!("Failed to store pushed shard: {}", e);
-                    let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-                }
-            }
-        }
-    }
-
-    /// Push a shard to a remote peer for storage.
-    ///
-    /// Wire format: `[magic:4][type:1(ShardPush=5)][content_id:32][chunk_index:4][shard_index:1][payload_len:4][payload]`
-    /// Response: `[status:1]` (0=Ok, 2=Error)
-    async fn handle_incoming_manifest_push(&self, mut stream: libp2p::Stream, initial_header: &[u8]) {
-        use futures::{AsyncReadExt, AsyncWriteExt};
-
-        // We read REQUEST_HEADER_SIZE (42) bytes. ManifestPush header is 41 bytes.
-        // So initial_header[0..41] is the full header, initial_header[41] is first payload byte.
-        let header = &initial_header[..datacraft_transfer::MANIFEST_PUSH_HEADER_SIZE];
-        let (content_id, payload_len) = match datacraft_transfer::decode_manifest_push_header(header) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to decode manifest push header: {}", e);
-                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-                return;
-            }
-        };
-
-        // Sanity check (max 10MB manifest)
-        if payload_len > 10 * 1024 * 1024 {
-            warn!("Manifest push payload too large: {} bytes", payload_len);
-            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-            return;
-        }
-
-        // Read remaining payload (we already have 1 byte from the initial header read)
-        let mut payload = vec![0u8; payload_len as usize];
-        payload[0] = initial_header[datacraft_transfer::MANIFEST_PUSH_HEADER_SIZE]; // the extra byte
-        if payload_len > 1 {
-            if let Err(e) = stream.read_exact(&mut payload[1..]).await {
-                error!("Failed to read manifest push payload: {}", e);
-                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-                return;
-            }
-        }
-
-        // Parse and store manifest
-        match serde_json::from_slice::<datacraft_core::ChunkManifest>(&payload) {
-            Ok(manifest) => {
-                let store = self.store.lock().await;
-                match store.put_manifest(&manifest) {
-                    Ok(()) => {
-                        info!("Stored pushed manifest for {} ({} bytes)", content_id, payload_len);
-                        let _ = self.event_tx.send(DataCraftEvent::ManifestPushReceived {
-                            content_id,
-                            manifest: manifest.clone(),
-                        });
-                        let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
-                    }
-                    Err(e) => {
-                        error!("Failed to store pushed manifest: {}", e);
-                        let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to parse pushed manifest for {}: {}", content_id, e);
-                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
-            }
-        }
-    }
-
+    /// Push a manifest to a remote peer.
     pub async fn push_manifest_to_peer(
         &self,
         behaviour: &mut CraftBehaviour,
@@ -742,20 +442,22 @@ impl DataCraftProtocol {
         }
     }
 
-    pub async fn push_shard_to_peer(
+    /// Push a piece to a remote peer for storage.
+    pub async fn push_piece_to_peer(
         &self,
         behaviour: &mut CraftBehaviour,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
-        chunk_index: u32,
-        shard_index: u8,
-        shard_data: &[u8],
+        segment_index: u32,
+        piece_id: &[u8; 32],
+        coefficients: &[u8],
+        piece_data: &[u8],
     ) -> Result<(), String> {
         use futures::{AsyncReadExt, AsyncWriteExt};
 
         debug!(
-            "Pushing shard {}/{}/{} ({} bytes) to peer {}",
-            content_id, chunk_index, shard_index, shard_data.len(), peer_id
+            "Pushing piece {}/{}/{} ({} bytes) to peer {}",
+            content_id, segment_index, &hex::encode(&piece_id[..4]), piece_data.len(), peer_id
         );
 
         let mut control = behaviour.stream_control();
@@ -764,13 +466,11 @@ impl DataCraftProtocol {
             .await
             .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
 
-        // Send push message
-        let msg = datacraft_transfer::encode_shard_push(content_id, chunk_index, shard_index, shard_data);
+        let msg = datacraft_transfer::encode_piece_push(content_id, segment_index, piece_id, coefficients, piece_data);
         stream.write_all(&msg).await.map_err(|e| {
             format!("Failed to send push to {}: {}", peer_id, e)
         })?;
 
-        // Read single-byte status response
         let mut status = [0u8; 1];
         stream.read_exact(&mut status).await.map_err(|e| {
             format!("Failed to read push response from {}: {}", peer_id, e)
@@ -778,7 +478,7 @@ impl DataCraftProtocol {
 
         match datacraft_core::WireStatus::from_u8(status[0]) {
             Some(datacraft_core::WireStatus::Ok) => {
-                debug!("Successfully pushed shard {}/{}/{} to {}", content_id, chunk_index, shard_index, peer_id);
+                debug!("Successfully pushed piece {}/{} to {}", content_id, segment_index, peer_id);
                 Ok(())
             }
             _ => Err(format!("Push rejected by peer {} with status {}", peer_id, status[0])),
@@ -786,167 +486,256 @@ impl DataCraftProtocol {
     }
 
     /// Handle an incoming transfer stream from a peer.
-    ///
-    /// After serving a shard successfully, reads a TransferReceipt from the
-    /// requester, verifies it, and stores it for later settlement.
     pub async fn handle_incoming_stream(&self, mut stream: libp2p::Stream) {
         use futures::{AsyncReadExt, AsyncWriteExt};
 
         debug!("Handling incoming transfer stream");
-        
-        // Read the request header
-        let mut header = [0u8; REQUEST_HEADER_SIZE];
-        if let Err(e) = stream.read_exact(&mut header).await {
-            error!("Failed to read request header: {}", e);
+
+        // Read enough bytes to determine message type.
+        // PieceRequest = 73 bytes, ManifestPush header = 41 bytes, PiecePush header = 73+ bytes.
+        // All start with magic(4) + type(1).
+        let mut type_header = [0u8; 5];
+        if let Err(e) = stream.read_exact(&mut type_header).await {
+            error!("Failed to read type header: {}", e);
             return;
         }
 
-        // Check if this is a ShardPush message (type byte at offset 4)
-        if header[4] == datacraft_core::WireMessageType::ShardPush as u8 {
-            self.handle_incoming_push(stream, &header).await;
+        if type_header[0..4] != datacraft_core::WIRE_MAGIC {
+            error!("Invalid magic bytes");
             return;
         }
 
-        // Check if this is a ManifestPush message
-        if header[4] == datacraft_core::WireMessageType::ManifestPush as u8 {
-            self.handle_incoming_manifest_push(stream, &header).await;
+        let msg_type = type_header[4];
+
+        if msg_type == datacraft_core::WireMessageType::ManifestPush as u8 {
+            self.handle_incoming_manifest_push(stream, &type_header).await;
             return;
         }
 
-        // Decode the request
-        let (content_id, chunk_index, shard_index) = match decode_shard_request(&header) {
-            Ok(req) => req,
+        if msg_type == datacraft_core::WireMessageType::PiecePush as u8 {
+            self.handle_incoming_piece_push(stream, &type_header).await;
+            return;
+        }
+
+        if msg_type == datacraft_core::WireMessageType::PieceRequest as u8 {
+            self.handle_incoming_piece_request(stream, &type_header).await;
+            return;
+        }
+
+        error!("Unknown message type: {}", msg_type);
+    }
+
+    /// Handle an incoming piece request.
+    async fn handle_incoming_piece_request(&self, mut stream: libp2p::Stream, type_header: &[u8; 5]) {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        // Read remaining bytes of piece request: content_id(32) + segment_index(4) + piece_id(32) = 68
+        let mut rest = [0u8; 68];
+        if let Err(e) = stream.read_exact(&mut rest).await {
+            error!("Failed to read piece request body: {}", e);
+            return;
+        }
+
+        // Reconstruct full header
+        let mut full = [0u8; PIECE_REQUEST_SIZE];
+        full[..5].copy_from_slice(type_header);
+        full[5..].copy_from_slice(&rest);
+
+        let (content_id, segment_index, piece_id) = match decode_piece_request(&full) {
+            Ok(r) => r,
             Err(e) => {
-                error!("Failed to decode shard request: {}", e);
+                error!("Failed to decode piece request: {}", e);
                 return;
             }
         };
-
-        debug!(
-            "Serving shard request: {} chunk={} shard={}",
-            content_id, chunk_index, shard_index
-        );
 
         // Pre-serve check: reject if content has been removed
         if let Some(ref cache) = self.removal_cache {
             let cache = cache.lock().await;
             if cache.is_removed(&content_id) {
                 warn!("Refusing to serve removed content: {}", content_id);
-                let response = datacraft_transfer::encode_response(datacraft_core::WireStatus::NotFound, b"");
-                if let Err(e) = stream.write_all(&response).await {
-                    error!("Failed to write removal-rejected response: {}", e);
-                }
+                let response = encode_piece_response_error(datacraft_core::WireStatus::NotFound);
+                let _ = stream.write_all(&response).await;
                 return;
             }
         }
 
-        // Serve the shard from local store
-        let served_ok;
-        let bytes_served;
-        {
-            let store = self.store.lock().await;
-            match store.get_shard(&content_id, chunk_index, shard_index) {
-                Ok(data) => {
-                    debug!(
-                        "Serving shard {}/{}/{} ({} bytes)",
-                        content_id, chunk_index, shard_index, data.len()
-                    );
-                    bytes_served = data.len();
-                    let response = datacraft_transfer::encode_response(datacraft_core::WireStatus::Ok, &data);
-                    if let Err(e) = stream.write_all(&response).await {
-                        error!("Failed to write response: {}", e);
-                        return;
-                    }
-                    served_ok = true;
+        let store = self.store.lock().await;
+        let is_any = piece_id == [0u8; 32];
+
+        let result = if is_any {
+            store.get_random_piece(&content_id, segment_index)
+        } else {
+            store
+                .get_piece(&content_id, segment_index, &piece_id)
+                .map(|(data, coeff)| Some((piece_id, data, coeff)))
+        };
+
+        match result {
+            Ok(Some((_pid, data, coefficients))) => {
+                debug!(
+                    "Serving piece {}/{} ({} bytes data, {} bytes coeff)",
+                    content_id, segment_index, data.len(), coefficients.len()
+                );
+                let response = encode_piece_response(datacraft_core::WireStatus::Ok, &coefficients, &data);
+                if let Err(e) = stream.write_all(&response).await {
+                    error!("Failed to write response: {}", e);
                 }
-                Err(_) => {
-                    warn!("Shard not found: {}/{}/{}", content_id, chunk_index, shard_index);
-                    bytes_served = 0;
-                    let response = datacraft_transfer::encode_response(datacraft_core::WireStatus::NotFound, b"");
-                    if let Err(e) = stream.write_all(&response).await {
-                        error!("Failed to write not-found response: {}", e);
-                    }
-                    served_ok = false;
-                }
+            }
+            _ => {
+                warn!("Piece not found: {}/{}", content_id, segment_index);
+                let response = encode_piece_response_error(datacraft_core::WireStatus::NotFound);
+                let _ = stream.write_all(&response).await;
+            }
+        }
+    }
+
+    /// Handle an incoming piece push.
+    async fn handle_incoming_piece_push(&self, mut stream: libp2p::Stream, type_header: &[u8; 5]) {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        // PiecePush: [magic:4][type:1][content_id:32][segment_index:4][piece_id:32][coeff_len:4][coeff][data_len:4][data]
+        // We already read 5 bytes. Read the rest of the fixed header: 32+4+32 = 68 more for fixed part
+        let mut fixed_rest = [0u8; 68];
+        if let Err(e) = stream.read_exact(&mut fixed_rest).await {
+            error!("Failed to read piece push fixed header: {}", e);
+            return;
+        }
+
+        // coeff_len(4)
+        let mut coeff_len_buf = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut coeff_len_buf).await {
+            error!("Failed to read coeff_len: {}", e);
+            return;
+        }
+        let coeff_len = u32::from_be_bytes(coeff_len_buf) as usize;
+
+        let mut coefficients = vec![0u8; coeff_len];
+        if coeff_len > 0 {
+            if let Err(e) = stream.read_exact(&mut coefficients).await {
+                error!("Failed to read coefficients: {}", e);
+                return;
             }
         }
 
-        // After a successful shard serve, read the TransferReceipt from the requester
-        if served_ok {
-            // Read receipt header: magic(4) + type(1) + len(4) = 9 bytes
-            let mut receipt_header = [0u8; 9];
-            match stream.read_exact(&mut receipt_header).await {
+        // data_len(4)
+        let mut data_len_buf = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut data_len_buf).await {
+            error!("Failed to read data_len: {}", e);
+            return;
+        }
+        let data_len = u32::from_be_bytes(data_len_buf) as usize;
+
+        if data_len > 16 * 1024 * 1024 {
+            warn!("Push payload too large: {} bytes", data_len);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        let mut data = vec![0u8; data_len];
+        if let Err(e) = stream.read_exact(&mut data).await {
+            error!("Failed to read push data: {}", e);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        // Parse content_id, segment_index, piece_id from fixed_rest
+        let mut cid_bytes = [0u8; 32];
+        cid_bytes.copy_from_slice(&fixed_rest[0..32]);
+        let content_id = ContentId(cid_bytes);
+        let segment_index = u32::from_be_bytes([fixed_rest[32], fixed_rest[33], fixed_rest[34], fixed_rest[35]]);
+        let mut piece_id = [0u8; 32];
+        piece_id.copy_from_slice(&fixed_rest[36..68]);
+
+        // Check removal cache
+        if let Some(ref cache) = self.removal_cache {
+            let cache = cache.lock().await;
+            if cache.is_removed(&content_id) {
+                warn!("Refusing pushed piece for removed content: {}", content_id);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                return;
+            }
+        }
+
+        // Store the piece
+        {
+            let store = self.store.lock().await;
+            match store.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
                 Ok(()) => {
-                    if receipt_header[0..4] != datacraft_core::WIRE_MAGIC {
-                        warn!("Invalid magic in receipt from requester");
-                        return;
-                    }
-                    if receipt_header[4] != datacraft_core::WireMessageType::Receipt as u8 {
-                        warn!("Expected Receipt message type, got {}", receipt_header[4]);
-                        return;
-                    }
-                    let payload_len = u32::from_be_bytes([
-                        receipt_header[5], receipt_header[6],
-                        receipt_header[7], receipt_header[8],
-                    ]) as usize;
-                    let mut payload = vec![0u8; payload_len];
-                    if let Err(e) = stream.read_exact(&mut payload).await {
-                        warn!("Failed to read receipt payload: {}", e);
-                        return;
-                    }
-                    match bincode::deserialize::<TransferReceipt>(&payload) {
-                        Ok(receipt) => {
-                            // Basic validation: content_id and shard_index should match
-                            if receipt.content_id != content_id || receipt.shard_index != shard_index as u32 {
-                                warn!("Receipt content/shard mismatch");
-                                return;
-                            }
-                            if receipt.bytes_served != bytes_served as u64 {
-                                warn!("Receipt bytes_served mismatch: got {} expected {}", receipt.bytes_served, bytes_served);
-                                return;
-                            }
-
-                            // Verify receipt signature with requester's public key
-                            if receipt.signature.len() == 64 {
-                                if let Ok(pubkey) = VerifyingKey::from_bytes(&receipt.requester) {
-                                    if !verify_transfer_receipt(&receipt, &pubkey) {
-                                        warn!("TransferReceipt signature verification failed for {}/{}/{}", content_id, chunk_index, shard_index);
-                                        return;
-                                    }
-                                    debug!("TransferReceipt signature verified for {}/{}/{}", content_id, chunk_index, shard_index);
-                                } else {
-                                    debug!("Could not parse requester pubkey for verification, accepting unsigned");
-                                }
-                            } else {
-                                debug!("Receipt has no signature (unsigned), accepting for reputation tracking");
-                            }
-
-                            info!(
-                                "Stored TransferReceipt for {}/{}/{} ({} bytes)",
-                                content_id, chunk_index, shard_index, receipt.bytes_served
-                            );
-
-                            // Store in persistent receipt store if available
-                            if let Some(ref persistent_store) = self.persistent_receipt_store {
-                                let mut pstore = persistent_store.lock().await;
-                                if let Err(e) = pstore.add_transfer(receipt.clone()) {
-                                    warn!("Failed to persist receipt: {}", e);
-                                }
-                            }
-
-                            // Also keep in in-memory store
-                            let mut store = self.receipt_store.lock().await;
-                            store.add(receipt);
-                        }
-                        Err(e) => {
-                            warn!("Failed to deserialize receipt: {}", e);
-                        }
-                    }
+                    info!(
+                        "Stored pushed piece {}/{}/{} ({} bytes)",
+                        content_id, segment_index, &hex::encode(&piece_id[..4]), data.len()
+                    );
+                    let _ = self.event_tx.send(DataCraftEvent::PiecePushReceived { content_id });
+                    let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
                 }
                 Err(e) => {
-                    // Requester may have disconnected without sending receipt — tolerate this
-                    debug!("No receipt received from requester ({}), proceeding", e);
+                    error!("Failed to store pushed piece: {}", e);
+                    let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
                 }
+            }
+        }
+    }
+
+    /// Handle an incoming manifest push.
+    async fn handle_incoming_manifest_push(&self, mut stream: libp2p::Stream, type_header: &[u8; 5]) {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        // ManifestPush header: [magic:4][type:1][content_id:32][payload_len:4] = 41 bytes
+        // We read 5. Need 36 more.
+        let mut rest = [0u8; 36];
+        if let Err(e) = stream.read_exact(&mut rest).await {
+            error!("Failed to read manifest push header: {}", e);
+            return;
+        }
+
+        let mut full_header = [0u8; MANIFEST_PUSH_HEADER_SIZE];
+        full_header[..5].copy_from_slice(type_header);
+        full_header[5..].copy_from_slice(&rest);
+
+        let (content_id, payload_len) = match decode_manifest_push_header(&full_header) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to decode manifest push header: {}", e);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                return;
+            }
+        };
+
+        if payload_len > 10 * 1024 * 1024 {
+            warn!("Manifest push payload too large: {} bytes", payload_len);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        let mut payload = vec![0u8; payload_len as usize];
+        if let Err(e) = stream.read_exact(&mut payload).await {
+            error!("Failed to read manifest push payload: {}", e);
+            let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            return;
+        }
+
+        match serde_json::from_slice::<ContentManifest>(&payload) {
+            Ok(manifest) => {
+                let store = self.store.lock().await;
+                match store.store_manifest(&manifest) {
+                    Ok(()) => {
+                        info!("Stored pushed manifest for {} ({} bytes)", content_id, payload_len);
+                        let _ = self.event_tx.send(DataCraftEvent::ManifestPushReceived {
+                            content_id,
+                            manifest,
+                        });
+                        let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to store pushed manifest: {}", e);
+                        let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse pushed manifest for {}: {}", content_id, e);
+                let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
             }
         }
     }
