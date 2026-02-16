@@ -77,6 +77,8 @@ pub struct DataCraftProtocol {
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
     /// Stream pool for persistent outbound streams per peer.
     stream_pool: Option<Arc<Mutex<StreamPool>>>,
+    /// Bounded concurrency semaphore for inbound piece processing.
+    inbound_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Tracks what we're waiting for from a DHT query.
@@ -103,6 +105,9 @@ impl DataCraftProtocol {
             eviction_manager: None,
             merkle_tree: None,
             stream_pool: None,
+            // Bound concurrent piece storage operations (I/O + Merkle updates).
+            // 64 parallel stores saturates NVMe without overwhelming memory.
+            inbound_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         }
     }
 
@@ -838,7 +843,7 @@ impl DataCraftProtocol {
         let mut piece_id = [0u8; 32];
         piece_id.copy_from_slice(&fixed_rest[36..68]);
 
-        // Check removal cache
+        // Check removal cache (fast, in-memory — do before ack)
         if let Some(ref cache) = self.removal_cache {
             let cache = cache.lock().await;
             if cache.is_removed(&content_id) {
@@ -848,28 +853,40 @@ impl DataCraftProtocol {
             }
         }
 
-        // Store the piece
-        {
-            let store = self.store.lock().await;
-            match store.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
+        // Ack immediately — data is in memory, storage happens async.
+        // This unblocks the sender and frees the stream for the next piece.
+        let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
+
+        // Spawn storage work with bounded concurrency
+        let store = self.store.clone();
+        let merkle_tree = self.merkle_tree.clone();
+        let event_tx = self.event_tx.clone();
+        let sem = self.inbound_semaphore.clone();
+
+        tokio::spawn(async move {
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return, // semaphore closed
+            };
+
+            let s = store.lock().await;
+            match s.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
                 Ok(()) => {
                     info!(
                         "Stored pushed piece {}/{}/{} ({} bytes)",
                         content_id, segment_index, &hex::encode(&piece_id[..4]), data.len()
                     );
-                    // Update storage Merkle tree
-                    if let Some(ref mt) = self.merkle_tree {
+                    drop(s); // release store lock before merkle
+                    if let Some(ref mt) = merkle_tree {
                         mt.lock().await.insert(&content_id, segment_index, &piece_id);
                     }
-                    let _ = self.event_tx.send(DataCraftEvent::PiecePushReceived { content_id });
-                    let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
+                    let _ = event_tx.send(DataCraftEvent::PiecePushReceived { content_id });
                 }
                 Err(e) => {
                     error!("Failed to store pushed piece: {}", e);
-                    let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
                 }
             }
-        }
+        });
     }
 
     /// Handle an incoming manifest push.
