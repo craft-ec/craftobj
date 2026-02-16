@@ -296,9 +296,9 @@ async fn distribute_content(
             };
             if command_tx.send(cmd).is_ok() {
                 match reply_rx.await {
-                    Ok(Ok(())) => debug!("Pushed manifest for {} to {}", content_id, peer),
-                    Ok(Err(e)) => debug!("Manifest push to {} failed: {}", peer, e),
-                    Err(_) => {}
+                    Ok(Ok(())) => info!("Pushed manifest for {} to {}", content_id, peer),
+                    Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
+                    Err(_) => warn!("Manifest push reply channel dropped for {}", peer),
                 }
             }
         }
@@ -343,10 +343,10 @@ async fn distribute_content(
                         pushed_count += 1;
                     }
                     Ok(Err(e)) => {
-                        debug!("Push {}/{}/{} to {} failed: {}", content_id, chunk_idx, shard_idx, peer, e);
+                        warn!("Push {}/{}/{} to {} failed: {}", content_id, chunk_idx, shard_idx, peer, e);
                     }
                     Err(_) => {
-                        debug!("Push reply channel closed for {}/{}/{}", content_id, chunk_idx, shard_idx);
+                        warn!("Push reply channel closed for {}/{}/{}", content_id, chunk_idx, shard_idx);
                     }
                 }
             }

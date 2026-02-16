@@ -2,8 +2,7 @@
 //!
 //! The economics model uses Creator Pools (one per creator, funding multiple CIDs)
 //! with StorageReceipt (PDP) as the ONLY settlement mechanism for storage distribution.
-//! Premium egress uses payment channels (see `payment_channel` module).
-//! Free egress has no reward — best effort, volunteer.
+//! No per-byte egress pricing — PDP covers everything.
 
 use std::collections::HashMap;
 
@@ -26,9 +25,9 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Minimum shard health ratio (`live_shards / k`) guaranteed by the tier.
+    /// Minimum piece health ratio (live independent pieces / k) guaranteed by the tier.
     /// Free tier has no guarantee.
-    pub fn min_shard_ratio(&self) -> Option<f64> {
+    pub fn min_piece_ratio(&self) -> Option<f64> {
         match self {
             Tier::Free => None,
             Tier::Lite => Some(2.0),
@@ -90,13 +89,12 @@ pub const DEFAULT_PROTOCOL_FEE_BPS: u16 = 500;
 /// determines content availability — depleted pool → content degrades to free
 /// tier (volunteer serving only).
 ///
-/// Distribution is based solely on StorageReceipts (PDP). No transfer/egress
-/// settlement — premium egress uses payment channels directly.
+/// Distribution is based solely on StorageReceipts (PDP). Each PDP pass = 1 receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatorPool {
     /// Creator's public key (ed25519, 32 bytes).
     pub creator: [u8; 32],
-    /// Tier determining minimum shard health ratio for all the creator's CIDs.
+    /// Tier determining minimum piece health ratio for all the creator's CIDs.
     pub tier: Tier,
     /// USDC lamports remaining in the pool.
     pub balance: u64,
@@ -164,9 +162,6 @@ impl CreatorPool {
 pub type PublicKey = [u8; 32];
 
 /// Distribution of StorageReceipts across nodes.
-///
-/// Only StorageReceipts (PDP) are used for settlement. TransferReceipts
-/// are analytics-only and not included in distribution.
 #[derive(Debug, Clone, Default)]
 pub struct PoolDistribution {
     /// (node pubkey, receipt count) from StorageReceipts.
@@ -190,8 +185,6 @@ pub fn compute_distribution(storage_receipts: &[StorageReceipt]) -> PoolDistribu
 /// Compute the USDC lamports claimable by `node` from a creator pool.
 ///
 /// `node_payout = (node_receipts / total_receipts) * pool_balance * (10_000 - fee_bps) / 10_000`
-///
-/// Protocol fee is deducted from each claim.
 pub fn compute_claim(
     node: &PublicKey,
     distribution: &PoolDistribution,
@@ -215,58 +208,12 @@ pub fn compute_claim(
     }
 
     let gross = ((pool_balance as u128) * (node_count as u128) / (total as u128)) as u64;
-    // Deduct protocol fee
     (gross as u128 * (10_000 - protocol_fee_bps as u128) / 10_000) as u64
 }
 
 /// Compute the protocol fee amount for a given gross claim.
 pub fn protocol_fee(amount: u64, fee_bps: u16) -> u64 {
     (amount as u128 * fee_bps as u128 / 10_000) as u64
-}
-
-// ---------------------------------------------------------------------------
-// Protocol Egress Pricing
-// ---------------------------------------------------------------------------
-
-/// Fixed protocol-wide egress price: USDC lamports per byte.
-///
-/// All nodes charge the same rate — competition is on performance, not price.
-/// 1 USDC lamport = 0.000001 USDC, so 1 lamport/byte ≈ $1/MB ≈ $0.001/KB.
-pub const PROTOCOL_EGRESS_PRICE_PER_BYTE: u64 = 1;
-
-/// Compute the egress cost for a given number of bytes.
-pub fn compute_egress_cost(bytes: u64) -> u64 {
-    bytes.saturating_mul(PROTOCOL_EGRESS_PRICE_PER_BYTE)
-}
-
-/// Egress pricing helper with the protocol rate constant.
-#[derive(Debug, Clone, Copy)]
-pub struct EgressPricing {
-    /// USDC lamports per byte.
-    pub rate_per_byte: u64,
-}
-
-impl Default for EgressPricing {
-    fn default() -> Self {
-        Self { rate_per_byte: PROTOCOL_EGRESS_PRICE_PER_BYTE }
-    }
-}
-
-impl EgressPricing {
-    /// Create with the default protocol rate.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Compute cost for the given byte count.
-    pub fn cost(&self, bytes: u64) -> u64 {
-        bytes.saturating_mul(self.rate_per_byte)
-    }
-
-    /// Check if a voucher amount covers the given byte count.
-    pub fn covers(&self, voucher_amount: u64, bytes: u64) -> bool {
-        voucher_amount >= self.cost(bytes)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,13 +253,13 @@ pub fn eviction_priority(stored_cids: &[StoredCid], policy: EvictionPolicy) -> V
 
     match policy {
         EvictionPolicy::LRU => {
-            unfunded.sort_by_key(|c| c.last_accessed); // oldest access first
+            unfunded.sort_by_key(|c| c.last_accessed);
         }
         EvictionPolicy::LeastFetched => {
-            unfunded.sort_by_key(|c| c.fetch_count); // fewest fetches first
+            unfunded.sort_by_key(|c| c.fetch_count);
         }
         EvictionPolicy::Oldest => {
-            unfunded.sort_by_key(|c| c.stored_at); // stored earliest first
+            unfunded.sort_by_key(|c| c.stored_at);
         }
     }
 
@@ -330,12 +277,12 @@ mod tests {
     // -- Tier tests --
 
     #[test]
-    fn test_tier_shard_ratios() {
-        assert_eq!(Tier::Free.min_shard_ratio(), None);
-        assert_eq!(Tier::Lite.min_shard_ratio(), Some(2.0));
-        assert_eq!(Tier::Standard.min_shard_ratio(), Some(3.0));
-        assert_eq!(Tier::Pro.min_shard_ratio(), Some(5.0));
-        assert_eq!(Tier::Enterprise.min_shard_ratio(), Some(10.0));
+    fn test_tier_piece_ratios() {
+        assert_eq!(Tier::Free.min_piece_ratio(), None);
+        assert_eq!(Tier::Lite.min_piece_ratio(), Some(2.0));
+        assert_eq!(Tier::Standard.min_piece_ratio(), Some(3.0));
+        assert_eq!(Tier::Pro.min_piece_ratio(), Some(5.0));
+        assert_eq!(Tier::Enterprise.min_piece_ratio(), Some(10.0));
     }
 
     #[test]
@@ -409,7 +356,6 @@ mod tests {
         assert!(pool.funds_cid(&cid2));
         assert_eq!(pool.funded_cids.len(), 2);
 
-        // Adding duplicate is a no-op
         pool.add_cid(cid1);
         assert_eq!(pool.funded_cids.len(), 2);
 
@@ -437,7 +383,8 @@ mod tests {
             content_id: cid,
             storage_node: node,
             challenger: [0u8; 32],
-            shard_index: 0,
+            segment_index: 0,
+            piece_id: [0u8; 32],
             timestamp: 1000,
             nonce: [0u8; 32],
             proof_hash: [0u8; 32],
@@ -474,17 +421,15 @@ mod tests {
     fn test_compute_claim_proportional() {
         let node_a = [1u8; 32];
         let node_b = [2u8; 32];
-        let balance = 1_000_000u64; // 1 USDC
+        let balance = 1_000_000u64;
 
         let dist = PoolDistribution {
             storage_receipts: vec![(node_a, 3), (node_b, 1)],
         };
 
-        // With 0% fee for easy math
         let claim_a = compute_claim(&node_a, &dist, balance, 0);
         let claim_b = compute_claim(&node_b, &dist, balance, 0);
 
-        // A gets 3/4 = 750k, B gets 1/4 = 250k
         assert_eq!(claim_a, 750_000);
         assert_eq!(claim_b, 250_000);
         assert_eq!(claim_a + claim_b, balance);
@@ -499,9 +444,7 @@ mod tests {
             storage_receipts: vec![(node, 10)],
         };
 
-        // 5% fee (500 bps)
         let claim = compute_claim(&node, &dist, balance, 500);
-        // gross = 1_000_000, net = 1_000_000 * 9500 / 10000 = 950_000
         assert_eq!(claim, 950_000);
     }
 
@@ -515,11 +458,9 @@ mod tests {
             storage_receipts: vec![(node_a, 1), (node_b, 1)],
         };
 
-        // 10% fee (1000 bps)
         let claim_a = compute_claim(&node_a, &dist, balance, 1000);
         let claim_b = compute_claim(&node_b, &dist, balance, 1000);
 
-        // Each gets 500k gross, 450k net
         assert_eq!(claim_a, 450_000);
         assert_eq!(claim_b, 450_000);
     }
@@ -544,49 +485,13 @@ mod tests {
 
     #[test]
     fn test_protocol_fee_calculation() {
-        assert_eq!(protocol_fee(1_000_000, 500), 50_000); // 5%
-        assert_eq!(protocol_fee(1_000_000, 1000), 100_000); // 10%
-        assert_eq!(protocol_fee(1_000_000, 0), 0); // 0%
-        assert_eq!(protocol_fee(0, 500), 0); // zero amount
+        assert_eq!(protocol_fee(1_000_000, 500), 50_000);
+        assert_eq!(protocol_fee(1_000_000, 1000), 100_000);
+        assert_eq!(protocol_fee(1_000_000, 0), 0);
+        assert_eq!(protocol_fee(0, 500), 0);
     }
 
     // -- Eviction tests --
-
-    // -- Egress pricing tests --
-
-    #[test]
-    fn test_egress_price_constant() {
-        assert_eq!(PROTOCOL_EGRESS_PRICE_PER_BYTE, 1);
-    }
-
-    #[test]
-    fn test_compute_egress_cost() {
-        assert_eq!(compute_egress_cost(0), 0);
-        assert_eq!(compute_egress_cost(1024), 1024); // 1KB = 1024 lamports
-        assert_eq!(compute_egress_cost(1_000_000), 1_000_000); // 1MB = 1 USDC
-    }
-
-    #[test]
-    fn test_compute_egress_cost_overflow() {
-        // Should saturate, not panic
-        assert_eq!(compute_egress_cost(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn test_egress_pricing_struct() {
-        let pricing = EgressPricing::new();
-        assert_eq!(pricing.rate_per_byte, PROTOCOL_EGRESS_PRICE_PER_BYTE);
-        assert_eq!(pricing.cost(65536), 65536);
-    }
-
-    #[test]
-    fn test_egress_pricing_covers() {
-        let pricing = EgressPricing::new();
-        assert!(pricing.covers(100, 100));
-        assert!(pricing.covers(200, 100));
-        assert!(!pricing.covers(50, 100));
-        assert!(pricing.covers(0, 0));
-    }
 
     #[test]
     fn test_eviction_excludes_funded() {

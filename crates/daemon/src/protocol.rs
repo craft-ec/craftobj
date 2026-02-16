@@ -43,6 +43,15 @@ pub enum DataCraftEvent {
         content_id: ContentId,
         error: String,
     },
+    /// Manifest received via push from another node (we're storing for them).
+    ManifestPushReceived {
+        content_id: ContentId,
+        manifest: ChunkManifest,
+    },
+    /// Shard received via push — update local shard count in tracker.
+    ShardPushReceived {
+        content_id: ContentId,
+    },
 }
 
 /// In-memory receipt store for TransferReceipts received from requesters.
@@ -627,6 +636,7 @@ impl DataCraftProtocol {
                         "Stored pushed shard {}/{}/{} ({} bytes)",
                         content_id, chunk_index, shard_index, payload.len()
                     );
+                    let _ = self.event_tx.send(DataCraftEvent::ShardPushReceived { content_id });
                     let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
                 }
                 Err(e) => {
@@ -681,6 +691,10 @@ impl DataCraftProtocol {
                 match store.put_manifest(&manifest) {
                     Ok(()) => {
                         info!("Stored pushed manifest for {} ({} bytes)", content_id, payload_len);
+                        let _ = self.event_tx.send(DataCraftEvent::ManifestPushReceived {
+                            content_id,
+                            manifest: manifest.clone(),
+                        });
                         let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
                     }
                     Err(e) => {

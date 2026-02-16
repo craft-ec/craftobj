@@ -95,14 +95,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists
     std::fs::create_dir_all(&data_dir)?;
 
-    // Generate or load keypair
-    let keypair = Keypair::generate_ed25519();
+    // Load or generate persistent node identity
+    let key_path = data_dir.join("node.key");
+    let node_signing_key = craftec_keystore::load_or_generate_keypair(&key_path)
+        .map_err(|e| format!("Failed to load/generate node keypair: {}", e))?;
+
+    // Derive libp2p keypair from the same ed25519 secret
+    let secret_bytes = node_signing_key.secret_key_bytes();
+    let mut ed_secret = secret_bytes.to_vec();
+    let ed_libp2p = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut ed_secret)
+        .expect("valid ed25519 secret");
+    let keypair = Keypair::from(libp2p::identity::ed25519::Keypair::from(ed_libp2p));
     let peer_id = keypair.public().to_peer_id();
+
+    let node_pubkey_hex = hex::encode(node_signing_key.public_key_bytes());
 
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║  DataCraft Daemon                                          ║");
     eprintln!("╠══════════════════════════════════════════════════════════════╣");
     eprintln!("║  Peer ID:    {}  ║", &peer_id.to_string()[..46]);
+    eprintln!("║  Pubkey:     {:<47}║", &node_pubkey_hex[..46]);
     eprintln!("║  Data dir:   {:<47}║", data_dir.display());
     eprintln!("║  IPC socket: {:<47}║", &socket_path);
     if ws_port > 0 {
@@ -123,5 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("DataCraft daemon starting with peer ID {}", peer_id);
 
-    service::run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, config_path).await
+    // Convert craftec SigningKeypair to ed25519_dalek SigningKey
+    let dalek_key = ed25519_dalek::SigningKey::from_bytes(&node_signing_key.secret_key_bytes());
+
+    service::run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, config_path, Some(dalek_key)).await
 }

@@ -14,6 +14,22 @@ use tracing::{debug, info, warn};
 /// Default re-announcement threshold in seconds (20 minutes).
 pub const DEFAULT_REANNOUNCE_THRESHOLD_SECS: u64 = 1200;
 
+/// Role this node plays for a piece of content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentRole {
+    /// This node published/created the content.
+    Publisher,
+    /// This node is storing shards on behalf of the network.
+    StorageProvider,
+}
+
+impl Default for ContentRole {
+    fn default() -> Self {
+        Self::Publisher
+    }
+}
+
 /// Lifecycle stage of content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +73,9 @@ pub struct ContentState {
     pub encrypted: bool,
     pub name: String,
     pub size: u64,
+    /// Role this node plays for this content.
+    #[serde(default)]
+    pub role: ContentRole,
 }
 
 /// Persistent content lifecycle tracker.
@@ -105,10 +124,55 @@ impl ContentTracker {
             encrypted,
             name,
             size: manifest.content_size,
+            role: ContentRole::Publisher,
         };
 
         self.states.insert(content_id, state);
         self.save();
+    }
+
+    /// Track content this node is storing on behalf of the network.
+    pub fn track_stored(
+        &mut self,
+        content_id: ContentId,
+        manifest: &ChunkManifest,
+    ) {
+        // Don't override if we're already tracking as publisher
+        if let Some(existing) = self.states.get(&content_id) {
+            if existing.role == ContentRole::Publisher {
+                return;
+            }
+        }
+
+        let total_shards = manifest.erasure_config.data_shards + manifest.erasure_config.parity_shards;
+        let now = now_secs();
+
+        let state = ContentState {
+            content_id,
+            stage: ContentStage::Distributed, // we received it, it's distributed to us
+            total_shards,
+            local_shards: 0, // will be updated as shards arrive
+            remote_shards: 0,
+            provider_count: 0,
+            last_announced: None,
+            last_checked: None,
+            created_at: now,
+            encrypted: false,
+            name: String::new(),
+            size: manifest.content_size,
+            role: ContentRole::StorageProvider,
+        };
+
+        self.states.insert(content_id, state);
+        self.save();
+    }
+
+    /// Increment local shard count (called when a shard is received via push).
+    pub fn increment_local_shards(&mut self, content_id: &ContentId) {
+        if let Some(state) = self.states.get_mut(content_id) {
+            state.local_shards += 1;
+            // Don't save on every shard — too noisy. Save periodically in maintenance.
+        }
     }
 
     /// Mark content as announced to DHT.
@@ -173,6 +237,7 @@ impl ContentTracker {
         self.states
             .values()
             .filter(|s| {
+                // Any node holding content should announce as provider
                 s.stage == ContentStage::Chunked
                     || match s.last_announced {
                         Some(ts) => now.saturating_sub(ts) > self.reannounce_threshold_secs,
@@ -187,7 +252,10 @@ impl ContentTracker {
     pub fn needs_distribution(&self) -> Vec<ContentId> {
         self.states
             .values()
-            .filter(|s| s.local_shards > 0 && s.remote_shards < s.total_shards)
+            .filter(|s| {
+                // Any node holding shards can distribute to other storage peers
+                s.local_shards > 0
+            })
             .map(|s| s.content_id)
             .collect()
     }
@@ -224,6 +292,7 @@ impl ContentTracker {
                         encrypted: false, // can't tell from manifest alone
                         name: cid.to_hex()[..12].to_string(),
                         size: manifest.content_size,
+                        role: ContentRole::Publisher, // imported from local store = we published it
                     };
                     self.states.insert(cid, state);
                     imported += 1;

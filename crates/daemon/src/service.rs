@@ -94,7 +94,7 @@ pub async fn run_daemon(
     network_config: NetworkConfig,
     ws_port: u16,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None).await
+    run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None, None).await
 }
 
 /// Run the DataCraft daemon with an optional config file path override.
@@ -105,6 +105,7 @@ pub async fn run_daemon_with_config(
     network_config: NetworkConfig,
     ws_port: u16,
     config_path: Option<std::path::PathBuf>,
+    node_signing_key: Option<ed25519_dalek::SigningKey>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Load daemon config (writes defaults if no config file exists yet)
     let daemon_config = match config_path {
@@ -294,6 +295,9 @@ pub async fn run_daemon_with_config(
     handler.set_own_capabilities(own_capabilities.clone());
     handler.set_daemon_config(daemon_config_shared, data_dir.clone());
     handler.set_event_sender(event_tx.clone());
+    if let Some(key) = node_signing_key {
+        handler.set_node_signing_key(key);
+    }
     let handler = Arc::new(handler);
 
     info!("Starting IPC server on {}", socket_path);
@@ -369,7 +373,7 @@ pub async fn run_daemon_with_config(
         _ = handle_incoming_coord_streams(coord_streams, protocol.clone()) => {
             info!("Incoming coord streams handler ended");
         }
-        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone()) => {
+        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone()) => {
             info!("Protocol events handler ended");
         }
         _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes) => {
@@ -964,6 +968,7 @@ async fn handle_protocol_events(
     event_rx: &mut mpsc::UnboundedReceiver<DataCraftEvent>,
     pending_requests: PendingRequests,
     daemon_event_tx: EventSender,
+    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
     info!("Starting protocol events handler");
     
@@ -1008,6 +1013,15 @@ async fn handle_protocol_events(
                 }
             }
 
+            DataCraftEvent::ShardPushReceived { content_id } => {
+                let mut t = content_tracker.lock().await;
+                t.increment_local_shards(&content_id);
+            }
+            DataCraftEvent::ManifestPushReceived { content_id, manifest } => {
+                info!("Received manifest push for {} — tracking as storage provider", content_id);
+                let mut t = content_tracker.lock().await;
+                t.track_stored(content_id, &manifest);
+            }
             DataCraftEvent::DhtError { content_id, error } => {
                 warn!("DHT error for {}: {}", content_id, error);
                 let _ = daemon_event_tx.send(DaemonEvent::DhtError {

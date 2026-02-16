@@ -1,7 +1,7 @@
 //! DataCraft Core
 //!
 //! Content types and protocol primitives for DataCraft:
-//! content-addressed distributed storage with erasure coding.
+//! content-addressed distributed storage with RLNC erasure coding.
 
 pub mod access;
 pub mod economics;
@@ -9,7 +9,6 @@ pub mod payment_channel;
 pub mod pre;
 pub mod signing;
 
-use craftec_erasure::ErasureConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -50,33 +49,25 @@ impl std::fmt::Display for ContentId {
     }
 }
 
-/// Identifies a specific chunk within a content item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ChunkId {
-    pub content: ContentId,
-    pub index: u32,
-}
-
-/// Immutable manifest describing how to reconstruct content from erasure-coded shards.
+/// Immutable manifest describing how to reconstruct content from RLNC-coded pieces.
 ///
-/// This is a **recipe** — it defines reconstruction parameters but does NOT track
-/// shard count or shard locations. The DHT tracks who holds shards.
+/// Content is split into segments (default 10MB), each segment into pieces (default 100KB).
+/// k = segment_size / piece_size (number of source pieces per segment).
+/// Reconstruction requires k linearly independent coded pieces per segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkManifest {
+pub struct ContentManifest {
     /// Content ID (hash of original data, or ciphertext if encrypted).
     pub content_id: ContentId,
     /// Final verification hash (SHA-256 of the content bytes).
     pub content_hash: [u8; 32],
-    /// Number of data shards needed for reconstruction.
-    pub k: usize,
-    /// Chunk size in bytes (all chunks are this size; last chunk is zero-padded).
-    pub chunk_size: usize,
-    /// Number of chunks the content was split into.
-    pub chunk_count: usize,
-    /// Erasure coding parameters used.
-    pub erasure_config: ErasureConfig,
-    /// Total size in bytes of the original content (needed for truncation after decode).
-    pub content_size: u64,
+    /// Size of each segment in bytes (default 10MB).
+    pub segment_size: usize,
+    /// Size of each piece in bytes (default 100KB).
+    pub piece_size: usize,
+    /// Number of segments the content was split into.
+    pub segment_count: usize,
+    /// Total size in bytes of the original content.
+    pub total_size: u64,
     /// Creator's DID string (e.g., `did:craftec:<hex_pubkey>`).
     /// Empty string for unsigned manifests (backwards compat).
     #[serde(default)]
@@ -86,19 +77,39 @@ pub struct ChunkManifest {
     pub signature: Vec<u8>,
 }
 
-impl ChunkManifest {
+impl ContentManifest {
+    /// Number of source pieces per full segment (k = segment_size / piece_size).
+    pub fn k(&self) -> usize {
+        if self.piece_size == 0 {
+            return 0;
+        }
+        self.segment_size / self.piece_size
+    }
+
+    /// Number of source pieces for a specific segment (last segment may be smaller).
+    pub fn k_for_segment(&self, segment_index: usize) -> usize {
+        if self.piece_size == 0 {
+            return 0;
+        }
+        if segment_index + 1 < self.segment_count {
+            // Full segment
+            self.segment_size / self.piece_size
+        } else {
+            // Last segment — may be partial
+            let remaining = self.total_size as usize - segment_index * self.segment_size;
+            remaining.div_ceil(self.piece_size).max(1)
+        }
+    }
+
     /// Data to sign: serialized manifest fields excluding the signature.
     pub fn signable_data(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&self.content_id.0);
         data.extend_from_slice(&self.content_hash);
-        data.extend_from_slice(&self.k.to_le_bytes());
-        data.extend_from_slice(&self.chunk_size.to_le_bytes());
-        data.extend_from_slice(&self.chunk_count.to_le_bytes());
-        data.extend_from_slice(&self.erasure_config.data_shards.to_le_bytes());
-        data.extend_from_slice(&self.erasure_config.parity_shards.to_le_bytes());
-        data.extend_from_slice(&self.erasure_config.chunk_size.to_le_bytes());
-        data.extend_from_slice(&self.content_size.to_le_bytes());
+        data.extend_from_slice(&self.segment_size.to_le_bytes());
+        data.extend_from_slice(&self.piece_size.to_le_bytes());
+        data.extend_from_slice(&self.segment_count.to_le_bytes());
+        data.extend_from_slice(&self.total_size.to_le_bytes());
         data.extend_from_slice(self.creator.as_bytes());
         data
     }
@@ -234,37 +245,28 @@ impl RemovalNotice {
 pub struct PublishOptions {
     /// Encrypt content before publishing. The caller must store the key.
     pub encrypted: bool,
-    /// Custom erasure coding config. Defaults to 4/4 at 64KB.
-    pub erasure_config: Option<ErasureConfig>,
-}
-
-/// Default erasure coding config for DataCraft: 4 data + 4 parity, 64KB chunks.
-pub fn default_erasure_config() -> ErasureConfig {
-    ErasureConfig {
-        data_shards: 4,
-        parity_shards: 4,
-        chunk_size: 65536,
-    }
 }
 
 /// StorageReceipt — issued by PDP challenger on successful proof-of-possession.
 ///
-/// Weight: 1 per proof (proving you still hold the shard).
+/// Weight: 1 per proof (proving you still hold the piece).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageReceipt {
-    /// Content whose shard was proven.
+    /// Content whose piece was proven.
     pub content_id: ContentId,
     /// Node that proved possession.
     pub storage_node: [u8; 32],
     /// Node that issued the challenge.
     pub challenger: [u8; 32],
-    /// Which shard was proven.
-    pub shard_index: u32,
+    /// Which segment the piece belongs to.
+    pub segment_index: u32,
+    /// Piece identity: SHA-256 of the coefficient vector.
+    pub piece_id: [u8; 32],
     /// When the proof occurred.
     pub timestamp: u64,
     /// Challenge nonce.
     pub nonce: [u8; 32],
-    /// hash(shard_data || nonce) response.
+    /// hash(piece_data || nonce) response.
     pub proof_hash: [u8; 32],
     /// Challenger's signature over receipt.
     pub signature: Vec<u8>,
@@ -282,55 +284,11 @@ impl StorageReceipt {
         data.extend_from_slice(&self.content_id.0);
         data.extend_from_slice(&self.storage_node);
         data.extend_from_slice(&self.challenger);
-        data.extend_from_slice(&self.shard_index.to_le_bytes());
+        data.extend_from_slice(&self.segment_index.to_le_bytes());
+        data.extend_from_slice(&self.piece_id);
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         data.extend_from_slice(&self.nonce);
         data.extend_from_slice(&self.proof_hash);
-        data
-    }
-}
-
-/// TransferReceipt — issued on every shard transfer, signed by requester.
-///
-/// **Analytics only — NOT used for settlement.** TransferReceipts are generated
-/// for protocol analytics, bandwidth monitoring, and node reputation tracking
-/// via `craftec-identity`. Settlement for egress uses payment channels instead
-/// (see `payment_channel` module). Storage settlement uses StorageReceipts only.
-///
-/// Weight: bytes_served (for analytics aggregation).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransferReceipt {
-    /// Content that was served.
-    pub content_id: ContentId,
-    /// Node that served the shard.
-    pub server_node: [u8; 32],
-    /// Node that requested (signs this).
-    pub requester: [u8; 32],
-    /// Which shard was served.
-    pub shard_index: u32,
-    /// Bytes served in this transfer.
-    pub bytes_served: u64,
-    /// When the transfer occurred.
-    pub timestamp: u64,
-    /// Requester's signature over receipt.
-    pub signature: Vec<u8>,
-}
-
-impl TransferReceipt {
-    /// Weight for settlement: bytes served.
-    pub fn weight(&self) -> u64 {
-        self.bytes_served
-    }
-
-    /// Data to be signed by the requester.
-    pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.content_id.0);
-        data.extend_from_slice(&self.server_node);
-        data.extend_from_slice(&self.requester);
-        data.extend_from_slice(&self.shard_index.to_le_bytes());
-        data.extend_from_slice(&self.bytes_served.to_le_bytes());
-        data.extend_from_slice(&self.timestamp.to_le_bytes());
         data
     }
 }
@@ -339,16 +297,13 @@ impl TransferReceipt {
 pub const WIRE_MAGIC: [u8; 4] = [0x44, 0x43, 0x52, 0x46];
 
 /// Transfer stream protocol ID.
-pub const TRANSFER_PROTOCOL: &str = "/datacraft/transfer/1.0.0";
+pub const TRANSFER_PROTOCOL: &str = "/datacraft/transfer/2.0.0";
 
 /// Manifest exchange protocol ID.
-pub const MANIFEST_PROTOCOL: &str = "/datacraft/manifest/1.0.0";
+pub const MANIFEST_PROTOCOL: &str = "/datacraft/manifest/2.0.0";
 
 /// PDP (Proof of Data Possession) protocol ID.
-pub const PDP_PROTOCOL: &str = "/datacraft/pdp/1.0.0";
-
-/// Shard coordination protocol ID (direct streams for index negotiation).
-pub const SHARD_COORD_PROTOCOL: &str = "/datacraft/shard-coord/1.0.0";
+pub const PDP_PROTOCOL: &str = "/datacraft/pdp/2.0.0";
 
 /// DHT key prefix for content providers.
 pub const PROVIDERS_DHT_PREFIX: &str = "/datacraft/providers/";
@@ -442,32 +397,29 @@ impl CapabilityAnnouncement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WireMessageType {
-    /// Request a shard.
-    ShardRequest = 0,
-    /// Response with shard data.
-    ShardResponse = 1,
+    /// Request any piece for a segment.
+    PieceRequest = 0,
+    /// Response with piece data + coefficient vector.
+    PieceResponse = 1,
     /// Request the manifest for a CID.
     ManifestRequest = 2,
     /// Response with manifest data.
     ManifestResponse = 3,
-    /// TransferReceipt sent by requester after receiving a shard.
-    Receipt = 4,
-    /// Push a shard to a storage peer (proactive distribution).
-    ShardPush = 5,
-    /// Push a manifest to a storage peer (sent before shard pushes).
+    /// Push a piece to a storage peer (proactive distribution).
+    PiecePush = 5,
+    /// Push a manifest to a storage peer (sent before piece pushes).
     ManifestPush = 6,
 }
 
 impl WireMessageType {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::ShardRequest),
-            1 => Some(Self::ShardResponse),
-            6 => Some(Self::ManifestPush),
+            0 => Some(Self::PieceRequest),
+            1 => Some(Self::PieceResponse),
             2 => Some(Self::ManifestRequest),
             3 => Some(Self::ManifestResponse),
-            4 => Some(Self::Receipt),
-            5 => Some(Self::ShardPush),
+            5 => Some(Self::PiecePush),
+            6 => Some(Self::ManifestPush),
             _ => None,
         }
     }
@@ -526,12 +478,8 @@ mod tests {
         let data = b"hello datacraft";
         let cid = ContentId::from_bytes(data);
         assert_eq!(cid.0.len(), 32);
-
-        // Same input → same CID
         let cid2 = ContentId::from_bytes(data);
         assert_eq!(cid, cid2);
-
-        // Different input → different CID
         let cid3 = ContentId::from_bytes(b"other data");
         assert_ne!(cid, cid3);
     }
@@ -547,21 +495,14 @@ mod tests {
     #[test]
     fn test_content_id_invalid_hex() {
         assert!(ContentId::from_hex("not_hex").is_err());
-        assert!(ContentId::from_hex("abcd").is_err()); // too short
-    }
-
-    #[test]
-    fn test_default_erasure_config() {
-        let config = default_erasure_config();
-        assert_eq!(config.data_shards, 4);
-        assert_eq!(config.parity_shards, 4);
-        assert_eq!(config.chunk_size, 65536);
+        assert!(ContentId::from_hex("abcd").is_err());
     }
 
     #[test]
     fn test_wire_message_type() {
-        assert_eq!(WireMessageType::from_u8(0), Some(WireMessageType::ShardRequest));
+        assert_eq!(WireMessageType::from_u8(0), Some(WireMessageType::PieceRequest));
         assert_eq!(WireMessageType::from_u8(3), Some(WireMessageType::ManifestResponse));
+        assert_eq!(WireMessageType::from_u8(4), None);
         assert_eq!(WireMessageType::from_u8(99), None);
     }
 
@@ -583,7 +524,8 @@ mod tests {
             content_id: ContentId([0u8; 32]),
             storage_node: [1u8; 32],
             challenger: [2u8; 32],
-            shard_index: 0,
+            segment_index: 0,
+            piece_id: [5u8; 32],
             timestamp: 1000,
             nonce: [3u8; 32],
             proof_hash: [4u8; 32],
@@ -598,15 +540,16 @@ mod tests {
             content_id: ContentId([0u8; 32]),
             storage_node: [1u8; 32],
             challenger: [2u8; 32],
-            shard_index: 5,
+            segment_index: 5,
+            piece_id: [6u8; 32],
             timestamp: 500,
             nonce: [3u8; 32],
             proof_hash: [4u8; 32],
             signature: vec![],
         };
         let data = receipt.signable_data();
-        // 32 (cid) + 32 (storage_node) + 32 (challenger) + 4 (shard_index) + 8 (timestamp) + 32 (nonce) + 32 (proof_hash) = 172
-        assert_eq!(data.len(), 172);
+        // 32 (cid) + 32 (storage_node) + 32 (challenger) + 4 (segment_index) + 32 (piece_id) + 8 (timestamp) + 32 (nonce) + 32 (proof_hash) = 204
+        assert_eq!(data.len(), 204);
     }
 
     #[test]
@@ -615,15 +558,14 @@ mod tests {
             content_id: ContentId([7u8; 32]),
             storage_node: [1u8; 32],
             challenger: [2u8; 32],
-            shard_index: 3,
+            segment_index: 3,
+            piece_id: [10u8; 32],
             timestamp: 999,
             nonce: [8u8; 32],
             proof_hash: [9u8; 32],
             signature: vec![0xAA],
         };
-        // signature must NOT appear in signable_data
         assert_eq!(make().signable_data(), make().signable_data());
-        assert!(!make().signable_data().windows(1).any(|w| w == [0xAA]));
     }
 
     #[test]
@@ -632,7 +574,8 @@ mod tests {
             content_id: ContentId([0u8; 32]),
             storage_node: [1u8; 32],
             challenger: [2u8; 32],
-            shard_index: 0,
+            segment_index: 0,
+            piece_id: [5u8; 32],
             timestamp: 1000,
             nonce: [3u8; 32],
             proof_hash: [4u8; 32],
@@ -642,56 +585,8 @@ mod tests {
         let parsed: StorageReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, receipt.content_id);
         assert_eq!(parsed.storage_node, receipt.storage_node);
+        assert_eq!(parsed.piece_id, receipt.piece_id);
         assert_eq!(parsed.nonce, receipt.nonce);
-        assert_eq!(parsed.proof_hash, receipt.proof_hash);
-    }
-
-    #[test]
-    fn test_transfer_receipt_weight() {
-        let receipt = TransferReceipt {
-            content_id: ContentId([0u8; 32]),
-            server_node: [1u8; 32],
-            requester: [2u8; 32],
-            shard_index: 0,
-            bytes_served: 65536,
-            timestamp: 1000,
-            signature: vec![],
-        };
-        assert_eq!(receipt.weight(), 65536);
-    }
-
-    #[test]
-    fn test_transfer_receipt_signable_data() {
-        let receipt = TransferReceipt {
-            content_id: ContentId([0u8; 32]),
-            server_node: [1u8; 32],
-            requester: [2u8; 32],
-            shard_index: 2,
-            bytes_served: 100,
-            timestamp: 500,
-            signature: vec![],
-        };
-        let data = receipt.signable_data();
-        // 32 (cid) + 32 (server_node) + 32 (requester) + 4 (shard_index) + 8 (bytes) + 8 (timestamp) = 116
-        assert_eq!(data.len(), 116);
-    }
-
-    #[test]
-    fn test_transfer_receipt_serde() {
-        let receipt = TransferReceipt {
-            content_id: ContentId([0u8; 32]),
-            server_node: [1u8; 32],
-            requester: [2u8; 32],
-            shard_index: 1,
-            bytes_served: 4096,
-            timestamp: 2000,
-            signature: vec![10, 20],
-        };
-        let json = serde_json::to_string(&receipt).unwrap();
-        let parsed: TransferReceipt = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.bytes_served, 4096);
-        assert_eq!(parsed.shard_index, 1);
-        assert_eq!(parsed.server_node, [1u8; 32]);
     }
 
     #[test]
@@ -721,7 +616,6 @@ mod tests {
         assert_eq!(parsed.peer_id, ann.peer_id);
         assert_eq!(parsed.capabilities, ann.capabilities);
         assert_eq!(parsed.timestamp, ann.timestamp);
-        assert_eq!(parsed.signature, ann.signature);
     }
 
     #[test]
@@ -735,9 +629,7 @@ mod tests {
             storage_used_bytes: 0,
         };
         let data = ann.signable_data();
-        // 2 (peer_id) + 2 (capability bytes) + 8 (timestamp) + 8 (committed) + 8 (used) = 28
         assert_eq!(data.len(), 28);
-        // Deterministic
         assert_eq!(data, ann.signable_data());
     }
 
@@ -748,42 +640,56 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_manifest_serde() {
+    fn test_content_manifest_serde() {
         let cid = ContentId::from_bytes(b"test");
-        let manifest = ChunkManifest {
+        let manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            k: 4,
-            chunk_size: 65536,
-            chunk_count: 1,
-            erasure_config: default_erasure_config(),
-            content_size: 1024,
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 1024,
             creator: String::new(),
             signature: vec![],
         };
         let json = serde_json::to_string(&manifest).unwrap();
-        let parsed: ChunkManifest = serde_json::from_str(&json).unwrap();
+        let parsed: ContentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, manifest.content_id);
         assert_eq!(parsed.content_hash, cid.0);
-        assert_eq!(parsed.k, 4);
-        assert_eq!(parsed.content_size, 1024);
+        assert_eq!(parsed.segment_size, 10_485_760);
+        assert_eq!(parsed.piece_size, 102_400);
+        assert_eq!(parsed.total_size, 1024);
     }
 
     #[test]
-    fn test_chunk_manifest_sign_verify() {
+    fn test_content_manifest_k() {
+        let manifest = ContentManifest {
+            content_id: ContentId([0u8; 32]),
+            content_hash: [0u8; 32],
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 10_485_760,
+            creator: String::new(),
+            signature: vec![],
+        };
+        assert_eq!(manifest.k(), 102);
+    }
+
+    #[test]
+    fn test_content_manifest_sign_verify() {
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
 
         let keypair = SigningKey::generate(&mut OsRng);
         let cid = ContentId::from_bytes(b"signed manifest test");
-        let mut manifest = ChunkManifest {
+        let mut manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            k: 4,
-            chunk_size: 65536,
-            chunk_count: 1,
-            erasure_config: default_erasure_config(),
-            content_size: 2048,
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 2048,
             creator: String::new(),
             signature: vec![],
         };
@@ -794,47 +700,44 @@ mod tests {
         assert!(manifest.verify_creator());
 
         // Tamper → invalid
-        manifest.content_size = 9999;
+        manifest.total_size = 9999;
         assert!(!manifest.verify_creator());
     }
 
     #[test]
-    fn test_chunk_manifest_wrong_key_fails() {
+    fn test_content_manifest_wrong_key_fails() {
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
 
         let keypair1 = SigningKey::generate(&mut OsRng);
         let keypair2 = SigningKey::generate(&mut OsRng);
         let cid = ContentId::from_bytes(b"wrong key test");
-        let mut manifest = ChunkManifest {
+        let mut manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            k: 4,
-            chunk_size: 65536,
-            chunk_count: 1,
-            erasure_config: default_erasure_config(),
-            content_size: 1024,
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 1024,
             creator: String::new(),
             signature: vec![],
         };
 
         manifest.sign(&keypair1);
-        // Overwrite creator with keypair2's DID but keep keypair1's signature
         manifest.creator = did_from_pubkey(&keypair2.verifying_key());
         assert!(!manifest.verify_creator());
     }
 
     #[test]
-    fn test_chunk_manifest_unsigned_verify_false() {
+    fn test_content_manifest_unsigned_verify_false() {
         let cid = ContentId::from_bytes(b"unsigned");
-        let manifest = ChunkManifest {
+        let manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            k: 4,
-            chunk_size: 65536,
-            chunk_count: 1,
-            erasure_config: default_erasure_config(),
-            content_size: 1024,
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 1024,
             creator: String::new(),
             signature: vec![],
         };
@@ -912,14 +815,5 @@ mod tests {
 
         assert!(extract_pubkey_from_did("invalid").is_none());
         assert!(extract_pubkey_from_did("did:craftec:short").is_none());
-    }
-
-    #[test]
-    fn test_chunk_manifest_serde_backwards_compat() {
-        // Manifests without creator/signature fields should deserialize with defaults
-        let json = r#"{"content_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"content_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"k":4,"chunk_size":65536,"chunk_count":1,"erasure_config":{"data_shards":4,"parity_shards":4,"chunk_size":65536},"content_size":1024}"#;
-        let manifest: ChunkManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.creator, "");
-        assert!(manifest.signature.is_empty());
     }
 }

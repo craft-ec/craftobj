@@ -45,6 +45,8 @@ pub struct DataCraftHandler {
     daemon_config: Option<Arc<Mutex<DaemonConfig>>>,
     data_dir: Option<std::path::PathBuf>,
     event_sender: Option<EventSender>,
+    /// Node signing key for manifest signing on publish.
+    node_signing_key: Option<ed25519_dalek::SigningKey>,
 }
 
 impl DataCraftHandler {
@@ -69,7 +71,12 @@ impl DataCraftHandler {
             daemon_config: None,
             data_dir: None,
             event_sender: None,
+            node_signing_key: None,
         }
+    }
+
+    pub fn set_node_signing_key(&mut self, key: ed25519_dalek::SigningKey) {
+        self.node_signing_key = Some(key);
     }
 
     /// Set the event sender for broadcasting daemon events to WS clients.
@@ -113,6 +120,7 @@ impl DataCraftHandler {
             daemon_config: None,
             data_dir: None,
             event_sender: None,
+            node_signing_key: None,
         }
     }
 
@@ -141,11 +149,18 @@ impl DataCraftHandler {
         // on a dedicated thread to avoid freezing the tokio runtime / WebSocket.
         let client = self.client.clone();
         let path_buf = PathBuf::from(path);
+        let signing_key = self.node_signing_key.clone();
         let (result, manifest) = tokio::task::spawn_blocking(move || {
             let mut client = client.blocking_lock();
-            let result = client
-                .publish(&path_buf, &options)
-                .map_err(|e| e.to_string())?;
+            let result = if let Some(ref key) = signing_key {
+                client
+                    .publish_signed(&path_buf, &options, key)
+                    .map_err(|e| e.to_string())?
+            } else {
+                client
+                    .publish(&path_buf, &options)
+                    .map_err(|e| e.to_string())?
+            };
             let manifest = client
                 .store()
                 .get_manifest(&result.content_id)
@@ -369,11 +384,19 @@ impl DataCraftHandler {
             let t = tracker.lock().await;
             let mut result = Vec::new();
             for item in &items {
+                // Get creator from manifest
+                let creator = {
+                    let c = self.client.lock().await;
+                    c.store().get_manifest(&item.content_id)
+                        .map(|m| m.creator.clone())
+                        .unwrap_or_default()
+                };
                 let mut obj = serde_json::json!({
                     "content_id": item.content_id.to_hex(),
                     "total_size": item.total_size,
                     "chunk_count": item.chunk_count,
                     "pinned": item.pinned,
+                    "creator": creator,
                 });
                 if let Some(state) = t.get(&item.content_id) {
                     obj["name"] = serde_json::json!(state.name);
@@ -384,6 +407,10 @@ impl DataCraftHandler {
                     obj["remote_shards"] = serde_json::json!(state.remote_shards);
                     obj["provider_count"] = serde_json::json!(state.provider_count);
                     obj["last_announced"] = serde_json::json!(state.last_announced);
+                    obj["role"] = serde_json::json!(match state.role {
+                        crate::content_tracker::ContentRole::Publisher => "publisher",
+                        crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
+                    });
                 }
                 result.push(obj);
             }
