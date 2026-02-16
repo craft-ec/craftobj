@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use craftec_ipc::server::IpcHandler;
 use datacraft_client::DataCraftClient;
@@ -51,6 +52,8 @@ pub struct DataCraftHandler {
     eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
     /// Storage Merkle tree for incremental updates on store operations.
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    /// Start time for uptime calculation.
+    start_time: Instant,
 }
 
 impl DataCraftHandler {
@@ -78,6 +81,7 @@ impl DataCraftHandler {
             node_signing_key: None,
             eviction_manager: None,
             merkle_tree: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -137,6 +141,7 @@ impl DataCraftHandler {
             node_signing_key: None,
             eviction_manager: None,
             merkle_tree: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -1359,6 +1364,332 @@ impl DataCraftHandler {
         info!("Config updated and saved");
         serde_json::to_value(&*config).map_err(|e| e.to_string())
     }
+
+    // -----------------------------------------------------------------------
+    // Health & Statistics RPC methods
+    // -----------------------------------------------------------------------
+
+    /// Shared helper: compute health info for a single CID.
+    async fn compute_cid_health(&self, cid: &datacraft_core::ContentId) -> Result<(usize, f64, u64), String> {
+        let client = self.client.lock().await;
+        let store = client.store();
+
+        let segments = store.list_segments(cid).unwrap_or_default();
+        let mut min_rank: Option<usize> = None;
+        for &seg in &segments {
+            // Rank = local piece count. This is a local approximation — true network rank
+            // requires PDP coefficient vector collection from remote providers.
+            let pieces = store.list_pieces(cid, seg).unwrap_or_default();
+            let rank = pieces.len();
+            min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+        }
+        let min_rank = min_rank.unwrap_or(0);
+        let disk_usage = store.cid_disk_usage(cid);
+        drop(client);
+
+        let k = if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            t.get(cid).map(|s| s.k).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let health_ratio = if k > 0 { min_rank as f64 / k as f64 } else { 0.0 };
+        Ok((min_rank, health_ratio, disk_usage))
+    }
+
+    /// `content.health` — Per-CID health info.
+    async fn handle_content_health(&self, params: Option<Value>) -> Result<Value, String> {
+        let cid = extract_cid(params)?;
+        let client = self.client.lock().await;
+        let store = client.store();
+
+        let manifest = store.get_manifest(&cid).map_err(|e| e.to_string())?;
+        let pinned = client.is_pinned(&cid);
+
+        let segments_list = store.list_segments(&cid).unwrap_or_default();
+        let mut segments_json = Vec::new();
+        let mut min_rank: Option<usize> = None;
+
+        for &seg in &segments_list {
+            // Rank = local piece count (local approximation — true network rank requires
+            // PDP coefficient vector collection from all providers).
+            let pieces = store.list_pieces(&cid, seg).unwrap_or_default();
+            let rank = pieces.len();
+            min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+            segments_json.push(serde_json::json!({
+                "index": seg,
+                "local_pieces": rank,
+                "rank": rank,
+            }));
+        }
+        let min_rank_val = min_rank.unwrap_or(0);
+        let disk_usage = store.cid_disk_usage(&cid);
+        drop(client);
+
+        // Get tracker state
+        let (name, k, stage, role, provider_count) = if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            if let Some(state) = t.get(&cid) {
+                (
+                    state.name.clone(),
+                    state.k,
+                    state.stage.to_string(),
+                    match state.role {
+                        crate::content_tracker::ContentRole::Publisher => "publisher",
+                        crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
+                    }.to_string(),
+                    state.provider_count,
+                )
+            } else {
+                (String::new(), 0, String::new(), String::new(), 0)
+            }
+        } else {
+            (String::new(), 0, String::new(), String::new(), 0)
+        };
+
+        let health_ratio = if k > 0 { min_rank_val as f64 / k as f64 } else { 0.0 };
+
+        // Build provider list with peer scorer info
+        let mut providers_json = Vec::new();
+        if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            let providers = t.get_providers(&cid);
+            drop(t);
+            if let Some(ref scorer) = self.peer_scorer {
+                let ps = scorer.lock().await;
+                for peer in providers {
+                    let region = ps.get_region(&peer).unwrap_or("unknown").to_string();
+                    let score = ps.score(&peer);
+                    let latency = ps.iter().find(|(p, _)| *p == &peer)
+                        .map(|(_, s)| s.avg_latency_ms)
+                        .unwrap_or(0.0);
+                    providers_json.push(serde_json::json!({
+                        "peer_id": peer.to_string(),
+                        "region": region,
+                        "score": score,
+                        "latency_ms": latency,
+                    }));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "content_id": cid.to_hex(),
+            "name": name,
+            "original_size": manifest.total_size,
+            "segment_count": manifest.segment_count,
+            "k": k,
+            "segments": segments_json,
+            "min_rank": min_rank_val,
+            "health_ratio": health_ratio,
+            "provider_count": provider_count,
+            "providers": providers_json,
+            "pinned": pinned,
+            "role": role,
+            "stage": stage,
+            "local_disk_usage": disk_usage,
+        }))
+    }
+
+    /// `content.list_detailed` — Enhanced list with health info per CID.
+    async fn handle_content_list_detailed(&self) -> Result<Value, String> {
+        let client = self.client.lock().await;
+        let items = client.list().map_err(|e| e.to_string())?;
+        drop(client);
+
+        let mut result = Vec::new();
+        for item in &items {
+            let (min_rank, health_ratio, disk_usage) = self.compute_cid_health(&item.content_id).await?;
+
+            let mut obj = serde_json::json!({
+                "content_id": item.content_id.to_hex(),
+                "total_size": item.total_size,
+                "segment_count": item.segment_count,
+                "pinned": item.pinned,
+                "min_rank": min_rank,
+                "health_ratio": health_ratio,
+                "local_disk_usage": disk_usage,
+            });
+
+            if let Some(ref tracker) = self.content_tracker {
+                let t = tracker.lock().await;
+                if let Some(state) = t.get(&item.content_id) {
+                    obj["name"] = serde_json::json!(state.name);
+                    obj["encrypted"] = serde_json::json!(state.encrypted);
+                    obj["stage"] = serde_json::json!(state.stage.to_string());
+                    obj["local_pieces"] = serde_json::json!(state.local_pieces);
+                    obj["provider_count"] = serde_json::json!(state.provider_count);
+                    obj["role"] = serde_json::json!(match state.role {
+                        crate::content_tracker::ContentRole::Publisher => "publisher",
+                        crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
+                    });
+                    // Hot heuristic: provider_count > segment_count * 2
+                    obj["hot"] = serde_json::json!(state.provider_count > state.segment_count * 2);
+                }
+            }
+
+            result.push(obj);
+        }
+
+        Ok(serde_json::json!(result))
+    }
+
+    /// `network.health` — Network-wide health statistics.
+    async fn handle_network_health(&self) -> Result<Value, String> {
+        // Network storage from peer scorer
+        let (storage_summary, storage_node_count, unique_providers) = if let Some(ref scorer) = self.peer_scorer {
+            let ps = scorer.lock().await;
+            let summary = ps.network_storage_summary();
+            let node_count = summary.storage_node_count;
+            let unique = ps.iter().count();
+            (Some(summary), node_count, unique)
+        } else {
+            (None, 0, 0)
+        };
+
+        let mut total_content = 0usize;
+        let mut total_stored_bytes = 0u64;
+        let mut healthy = 0usize;
+        let mut degraded = 0usize;
+        let mut health_sum = 0.0f64;
+
+        if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            let states = t.list();
+            total_content = states.len();
+            for state in &states {
+                let (min_rank, health_ratio, disk_usage) = self.compute_cid_health(&state.content_id).await?;
+                total_stored_bytes += disk_usage;
+                health_sum += health_ratio;
+                // Degraded if min_rank < k (cannot reconstruct from local pieces alone)
+                if state.k > 0 && min_rank < state.k {
+                    degraded += 1;
+                } else {
+                    healthy += 1;
+                }
+            }
+        }
+
+        let avg_health = if total_content > 0 { health_sum / total_content as f64 } else { 0.0 };
+
+        let receipts_count = if let Some(ref rs) = self.receipt_store {
+            let store = rs.lock().await;
+            store.storage_receipt_count()
+        } else {
+            0
+        };
+
+        Ok(serde_json::json!({
+            "total_content_count": total_content,
+            "total_stored_bytes": total_stored_bytes,
+            "total_network_storage_committed": storage_summary.as_ref().map(|s| s.total_committed).unwrap_or(0),
+            "total_network_storage_used": storage_summary.as_ref().map(|s| s.total_used).unwrap_or(0),
+            "storage_node_count": storage_node_count,
+            "healthy_content_count": healthy,
+            "degraded_content_count": degraded,
+            "average_health_ratio": avg_health,
+            "total_providers_unique": unique_providers,
+            "receipts_this_epoch": receipts_count,
+        }))
+    }
+
+    /// `node.stats` — This node's own statistics.
+    async fn handle_node_stats(&self) -> Result<Value, String> {
+        let mut content_count = 0usize;
+        let mut published_count = 0usize;
+        let mut stored_count = 0usize;
+        let mut total_local_pieces = 0usize;
+
+        if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            for state in t.list() {
+                content_count += 1;
+                total_local_pieces += state.local_pieces;
+                match state.role {
+                    crate::content_tracker::ContentRole::Publisher => published_count += 1,
+                    crate::content_tracker::ContentRole::StorageProvider => stored_count += 1,
+                }
+            }
+        }
+
+        let total_disk_usage = {
+            let client = self.client.lock().await;
+            client.store().disk_usage().unwrap_or(0)
+        };
+
+        let storage_root = if let Some(ref tree) = self.merkle_tree {
+            let t = tree.lock().await;
+            hex::encode(t.root())
+        } else {
+            String::new()
+        };
+
+        let cap_strings: Vec<String> = self.own_capabilities.iter().map(|c| c.to_string()).collect();
+
+        let region = if let Some(ref cfg) = self.daemon_config {
+            let c = cfg.lock().await;
+            c.region.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let receipts_generated = if let Some(ref rs) = self.receipt_store {
+            let store = rs.lock().await;
+            store.storage_receipt_count()
+        } else {
+            0
+        };
+
+        let uptime_secs = self.start_time.elapsed().as_secs();
+
+        Ok(serde_json::json!({
+            "content_count": content_count,
+            "published_count": published_count,
+            "stored_count": stored_count,
+            "total_local_pieces": total_local_pieces,
+            "total_disk_usage": total_disk_usage,
+            "storage_root": storage_root,
+            "capabilities": cap_strings,
+            "region": region,
+            "receipts_generated": receipts_generated,
+            "uptime_secs": uptime_secs,
+        }))
+    }
+
+    /// `content.segments` — Detailed per-segment breakdown.
+    async fn handle_content_segments(&self, params: Option<Value>) -> Result<Value, String> {
+        let cid = extract_cid(params)?;
+        let client = self.client.lock().await;
+        let store = client.store();
+
+        let k = if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            t.get(&cid).map(|s| s.k).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let segments_list = store.list_segments(&cid).unwrap_or_default();
+        let mut segments_json = Vec::new();
+        for &seg in &segments_list {
+            let pieces = store.list_pieces(&cid, seg).unwrap_or_default();
+            let piece_ids: Vec<String> = pieces.iter().map(|p| hex::encode(p)).collect();
+            let local_count = pieces.len();
+            segments_json.push(serde_json::json!({
+                "index": seg,
+                "k": k,
+                "local_pieces": local_count,
+                "piece_ids": piece_ids,
+                "reconstructable": local_count >= k && k > 0,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "content_id": cid.to_hex(),
+            "segments": segments_json,
+        }))
+    }
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
@@ -1411,6 +1742,11 @@ impl IpcHandler for DataCraftHandler {
                 "settlement.close_channel" => self.handle_settlement_close_channel(params).await,
                 "get-config" => self.handle_get_config().await,
                 "set-config" => self.handle_set_config(params).await,
+                "content.health" => self.handle_content_health(params).await,
+                "content.list_detailed" => self.handle_content_list_detailed().await,
+                "content.segments" => self.handle_content_segments(params).await,
+                "network.health" => self.handle_network_health().await,
+                "node.stats" => self.handle_node_stats().await,
                 _ => Err(format!("unknown method: {}", method)),
             }
         })
