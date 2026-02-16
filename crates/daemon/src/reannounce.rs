@@ -67,6 +67,7 @@ pub async fn run_maintenance_cycle(
     }
 
     distribute_content(tracker, command_tx, client, peer_scorer, event_tx).await;
+    equalize_pressure(tracker, command_tx, client, peer_scorer, event_tx).await;
 
     let needs_dist = {
         let t = tracker.lock().await;
@@ -259,52 +260,73 @@ async fn distribute_content(
             }
         }
 
-        // Push pieces round-robin
-        let mut pushed_count = 0usize;
-        let mut peer_idx = 0usize;
-
+        // Push pieces round-robin, max 2 pieces per peer per CID.
+        // Collect all pieces first, then distribute.
+        let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
         for seg_idx in 0..manifest.segment_count as u32 {
             let piece_ids = {
                 let c = client.lock().await;
                 c.store().list_pieces(&content_id, seg_idx).unwrap_or_default()
             };
+            for pid in piece_ids {
+                all_pieces.push((seg_idx, pid));
+            }
+        }
 
-            for piece_id in piece_ids {
-                let (piece_data, coefficients) = {
-                    let c = client.lock().await;
-                    match c.store().get_piece(&content_id, seg_idx, &piece_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    }
-                };
+        let mut pushed_count = 0usize;
+        let mut peer_idx = 0usize;
+        let max_per_peer: usize = 2;
+        let mut pieces_per_peer: std::collections::HashMap<libp2p::PeerId, usize> =
+            std::collections::HashMap::new();
 
-                let peer = ranked_peers[peer_idx % ranked_peers.len()];
+        for (seg_idx, piece_id) in &all_pieces {
+            // Find next peer that hasn't hit the per-peer cap
+            let mut attempts = 0;
+            let peer = loop {
+                let candidate = ranked_peers[peer_idx % ranked_peers.len()];
                 peer_idx += 1;
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let cmd = DataCraftCommand::PushPiece {
-                    peer_id: peer,
-                    content_id,
-                    segment_index: seg_idx,
-                    piece_id,
-                    coefficients,
-                    piece_data,
-                    reply_tx,
-                };
-
-                if command_tx.send(cmd).is_err() {
-                    continue;
+                let count = pieces_per_peer.entry(candidate).or_insert(0);
+                if *count < max_per_peer {
+                    break candidate;
                 }
-
-                match reply_rx.await {
-                    Ok(Ok(())) => {
-                        pushed_count += 1;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Push piece to {} failed: {}", peer, e);
-                    }
-                    Err(_) => {}
+                attempts += 1;
+                if attempts >= ranked_peers.len() {
+                    break candidate; // all peers at cap, push anyway
                 }
+            };
+
+            let (piece_data, coefficients) = {
+                let c = client.lock().await;
+                match c.store().get_piece(&content_id, *seg_idx, piece_id) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            };
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = DataCraftCommand::PushPiece {
+                peer_id: peer,
+                content_id,
+                segment_index: *seg_idx,
+                piece_id: *piece_id,
+                coefficients,
+                piece_data,
+                reply_tx,
+            };
+
+            if command_tx.send(cmd).is_err() {
+                continue;
+            }
+
+            match reply_rx.await {
+                Ok(Ok(())) => {
+                    pushed_count += 1;
+                    *pieces_per_peer.entry(peer).or_insert(0) += 1;
+                }
+                Ok(Err(e)) => {
+                    warn!("Push piece to {} failed: {}", peer, e);
+                }
+                Err(_) => {}
             }
         }
 
@@ -330,6 +352,116 @@ async fn distribute_content(
                     provider_count: state.provider_count,
                     summary,
                 });
+            }
+        }
+    }
+}
+
+/// Pressure equalization: if a node holds >2 pieces for any CID, push 1 excess
+/// piece per CID per cycle to a random storage peer.
+async fn equalize_pressure(
+    tracker: &Arc<Mutex<ContentTracker>>,
+    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
+    client: &Arc<Mutex<DataCraftClient>>,
+    peer_scorer: &Arc<Mutex<PeerScorer>>,
+    event_tx: &EventSender,
+) {
+    let excess_threshold: usize = 2;
+
+    let storage_peers: Vec<libp2p::PeerId> = {
+        let scorer = peer_scorer.lock().await;
+        scorer
+            .iter()
+            .filter(|(_, score)| score.capabilities.contains(&DataCraftCapability::Storage))
+            .map(|(peer_id, _)| *peer_id)
+            .collect()
+    };
+
+    if storage_peers.is_empty() {
+        return;
+    }
+
+    let all_cids = {
+        let t = tracker.lock().await;
+        t.needs_distribution()
+    };
+
+    for content_id in all_cids {
+        // Count total local pieces
+        let manifest = {
+            let c = client.lock().await;
+            match c.store().get_manifest(&content_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            }
+        };
+
+        let mut total_local = 0usize;
+        for seg in 0..manifest.segment_count as u32 {
+            let c = client.lock().await;
+            total_local += c.store().list_pieces(&content_id, seg).unwrap_or_default().len();
+        }
+
+        if total_local <= excess_threshold {
+            continue;
+        }
+
+        // Pick a random peer and push 1 piece
+        let peer_idx = (content_id.0[0] as usize) % storage_peers.len();
+        let peer = storage_peers[peer_idx];
+
+        // Find the first piece to push
+        'outer: for seg in 0..manifest.segment_count as u32 {
+            let pieces = {
+                let c = client.lock().await;
+                c.store().list_pieces(&content_id, seg).unwrap_or_default()
+            };
+
+            for pid in pieces {
+                let (piece_data, coefficients) = {
+                    let c = client.lock().await;
+                    match c.store().get_piece(&content_id, seg, &pid) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    }
+                };
+
+                // Push manifest first
+                let manifest_json = match serde_json::to_vec(&manifest) {
+                    Ok(j) => j,
+                    Err(_) => break 'outer,
+                };
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                let _ = command_tx.send(DataCraftCommand::PushManifest {
+                    peer_id: peer,
+                    content_id,
+                    manifest_json,
+                    reply_tx,
+                });
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let cmd = DataCraftCommand::PushPiece {
+                    peer_id: peer,
+                    content_id,
+                    segment_index: seg,
+                    piece_id: pid,
+                    coefficients,
+                    piece_data,
+                    reply_tx,
+                };
+
+                if command_tx.send(cmd).is_ok() {
+                    if let Ok(Ok(())) = reply_rx.await {
+                        debug!("Pressure equalization: pushed 1 piece for {} to {}", content_id, peer);
+                        let _ = event_tx.send(DaemonEvent::ContentDistributed {
+                            content_id: content_id.to_hex(),
+                            pieces_pushed: 1,
+                            total_pieces: total_local,
+                            target_peers: 1,
+                        });
+                    }
+                }
+                break 'outer; // 1 piece per CID per cycle
             }
         }
     }

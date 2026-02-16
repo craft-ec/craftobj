@@ -159,6 +159,7 @@ pub async fn run_daemon_with_config(
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<DataCraftCommand>();
     let command_tx_for_caps = command_tx.clone();
     let command_tx_for_maintenance = command_tx.clone();
+    let command_tx_for_events = command_tx.clone();
     
     // Create pending requests tracker for DHT operations
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
@@ -362,7 +363,7 @@ pub async fn run_daemon_with_config(
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
             info!("Incoming streams handler ended");
         }
-        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone()) => {
+        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events) => {
             info!("Protocol events handler ended");
         }
         _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes) => {
@@ -942,6 +943,7 @@ async fn handle_protocol_events(
     pending_requests: PendingRequests,
     daemon_event_tx: EventSender,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
 ) {
     info!("Starting protocol events handler");
     
@@ -994,6 +996,22 @@ async fn handle_protocol_events(
                 info!("Received manifest push for {} — tracking as storage provider", content_id);
                 let mut t = content_tracker.lock().await;
                 t.track_stored(content_id, &manifest);
+                drop(t);
+
+                // Announce as provider in DHT so other nodes can discover us
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cmd = DataCraftCommand::AnnounceProvider {
+                    content_id,
+                    manifest: manifest.clone(),
+                    reply_tx,
+                };
+                if command_tx.send(cmd).is_ok() {
+                    match reply_rx.await {
+                        Ok(Ok(())) => info!("Announced as provider for {} after receiving push", content_id),
+                        Ok(Err(e)) => warn!("Failed to announce as provider for {}: {}", content_id, e),
+                        Err(_) => {}
+                    }
+                }
             }
             DataCraftEvent::DhtError { content_id, error } => {
                 warn!("DHT error for {}: {}", content_id, error);
