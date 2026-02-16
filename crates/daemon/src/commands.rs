@@ -95,6 +95,12 @@ pub enum DataCraftCommand {
         manifest_json: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Request inventory (segments + coefficient vectors) from a remote peer.
+    RequestInventory {
+        peer_id: PeerId,
+        content_id: ContentId,
+        reply_tx: oneshot::Sender<Result<datacraft_core::InventoryResponse, String>>,
+    },
     /// Push a piece to a remote storage peer (proactive distribution).
     PushPiece {
         peer_id: PeerId,

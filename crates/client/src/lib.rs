@@ -8,6 +8,8 @@
 //! - `reconstruct(cid)` → manifest → decode segments → verify hash → decrypt? → write
 //! - `pin(cid)` / `unpin(cid)` / `list()` / `status()`
 
+pub mod fetch;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

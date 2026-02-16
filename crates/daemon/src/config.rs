@@ -52,6 +52,11 @@ pub struct DaemonConfig {
     /// Maximum storage in bytes (0 = unlimited).
     pub max_storage_bytes: u64,
 
+    // ── Geographic ──────────────────────────────────────────
+    /// Geographic region of this node (e.g. "us-east", "eu-west").
+    /// Included in capability announcements for geographic-aware routing.
+    pub region: Option<String>,
+
     /// Unknown fields — preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -71,6 +76,7 @@ impl Default for DaemonConfig {
             challenger_interval_secs: None,
             aggregation_epoch_secs: None,
             max_storage_bytes: 0,
+            region: None,
             extra: serde_json::Map::new(),
         }
     }

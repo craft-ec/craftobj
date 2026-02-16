@@ -452,6 +452,10 @@ pub struct CapabilityAnnouncement {
     /// Storage currently used. 0 if not a storage node.
     #[serde(default)]
     pub storage_used_bytes: u64,
+    /// Geographic region of this node (e.g. "us-east", "eu-west").
+    /// Auto-detected or manually configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 impl CapabilityAnnouncement {
@@ -465,6 +469,9 @@ impl CapabilityAnnouncement {
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         data.extend_from_slice(&self.storage_committed_bytes.to_le_bytes());
         data.extend_from_slice(&self.storage_used_bytes.to_le_bytes());
+        if let Some(ref region) = self.region {
+            data.extend_from_slice(region.as_bytes());
+        }
         data
     }
 }
@@ -485,6 +492,10 @@ pub enum WireMessageType {
     PiecePush = 5,
     /// Push a manifest to a storage peer (sent before piece pushes).
     ManifestPush = 6,
+    /// Request inventory (segments + coefficient vectors) for a CID.
+    InventoryRequest = 7,
+    /// Response with inventory data.
+    InventoryResponse = 8,
 }
 
 impl WireMessageType {
@@ -496,6 +507,8 @@ impl WireMessageType {
             3 => Some(Self::ManifestResponse),
             5 => Some(Self::PiecePush),
             6 => Some(Self::ManifestPush),
+            7 => Some(Self::InventoryRequest),
+            8 => Some(Self::InventoryResponse),
             _ => None,
         }
     }
@@ -519,6 +532,21 @@ impl WireStatus {
             _ => None,
         }
     }
+}
+
+/// Inventory entry for a single segment: list of coefficient vectors (piece identities).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentInventory {
+    pub segment_index: u32,
+    /// Coefficient vectors for each piece held in this segment.
+    pub coefficient_vectors: Vec<Vec<u8>>,
+}
+
+/// Response to an inventory request: all segments and their coefficient vectors for a CID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryResponse {
+    pub content_id: ContentId,
+    pub segments: Vec<SegmentInventory>,
 }
 
 #[derive(Error, Debug)]
@@ -713,6 +741,7 @@ mod tests {
             signature: vec![0xAA, 0xBB],
             storage_committed_bytes: 10_000_000_000,
             storage_used_bytes: 5_000_000_000,
+            region: Some("us-east".to_string()),
         };
         let json = serde_json::to_string(&ann).unwrap();
         let parsed: CapabilityAnnouncement = serde_json::from_str(&json).unwrap();
@@ -730,6 +759,7 @@ mod tests {
             signature: vec![],
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
+            region: None,
         };
         let data = ann.signable_data();
         assert_eq!(data.len(), 28);

@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+pub mod merkle;
+
 /// Compute piece_id from a coefficient vector: SHA-256(coefficients).
 pub fn piece_id_from_coefficients(coefficients: &[u8]) -> [u8; 32] {
     let hash = Sha256::digest(coefficients);
@@ -193,6 +195,30 @@ impl FsStore {
             .join("manifests")
             .join(format!("{}.json", content_id.to_hex()))
             .exists()
+    }
+
+    /// List all segment indices for a content ID.
+    pub fn list_segments(&self, content_id: &ContentId) -> Result<Vec<u32>> {
+        let dir = self.data_dir.join("pieces").join(content_id.to_hex());
+        let mut result = Vec::new();
+        if !dir.exists() {
+            return Ok(result);
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if let Ok(idx) = name.parse::<u32>() {
+                                result.push(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result.sort();
+        Ok(result)
     }
 
     /// List all content IDs that have manifests stored.

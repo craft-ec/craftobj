@@ -303,6 +303,59 @@ where
     }
 }
 
+/// Inventory request header size: magic(4) + type(1) + content_id(32) = 37
+pub const INVENTORY_REQUEST_SIZE: usize = 37;
+
+/// Encode an inventory request.
+/// Wire format: `[magic:4][type:1(InventoryRequest=7)][content_id:32]`
+pub fn encode_inventory_request(content_id: &ContentId) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(INVENTORY_REQUEST_SIZE);
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::InventoryRequest as u8);
+    buf.extend_from_slice(&content_id.0);
+    buf
+}
+
+/// Decode an inventory request. Returns content_id.
+pub fn decode_inventory_request(buf: &[u8]) -> Result<ContentId> {
+    if buf.len() < INVENTORY_REQUEST_SIZE {
+        return Err(DataCraftError::TransferError(
+            "inventory request too short".into(),
+        ));
+    }
+    if buf[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic".into()));
+    }
+    if buf[4] != WireMessageType::InventoryRequest as u8 {
+        return Err(DataCraftError::TransferError(format!(
+            "expected InventoryRequest type (7), got {}",
+            buf[4]
+        )));
+    }
+    let mut cid_bytes = [0u8; 32];
+    cid_bytes.copy_from_slice(&buf[5..37]);
+    Ok(ContentId(cid_bytes))
+}
+
+/// Encode an inventory response.
+/// Wire format: `[status:1][payload_len:4 BE][bincode InventoryResponse]`
+pub fn encode_inventory_response(response: &datacraft_core::InventoryResponse) -> Vec<u8> {
+    let payload = bincode::serialize(response).unwrap_or_default();
+    let mut buf = Vec::with_capacity(5 + payload.len());
+    buf.push(WireStatus::Ok as u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// Encode an inventory response error.
+pub fn encode_inventory_response_error(status: WireStatus) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.push(status as u8);
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

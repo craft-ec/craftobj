@@ -98,6 +98,20 @@ pub fn compute_network_rank(results: &[ProviderPdpResult]) -> std::collections::
     }).collect()
 }
 
+/// Compute rank per segment from a full inventory of coefficient vectors.
+/// This uses ALL vectors from all providers (not just PDP challenge results).
+pub fn compute_rank_from_inventory(
+    inventory: &std::collections::HashMap<u32, Vec<Vec<u8>>>,
+) -> std::collections::HashMap<u32, usize> {
+    inventory
+        .iter()
+        .map(|(&seg, vecs)| {
+            let rank = craftec_erasure::check_independence(vecs);
+            (seg, rank)
+        })
+        .collect()
+}
+
 /// Return the minimum rank across all segments (health is only as good as the weakest).
 /// If no segments have data, returns 0.
 pub fn min_rank_across_segments(rank_map: &std::collections::HashMap<u32, usize>) -> usize {

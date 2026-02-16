@@ -191,7 +191,38 @@ impl ChallengerManager {
             .copied()
             .collect();
 
-        // Challenge each provider for each sampled segment, collecting coefficient vectors
+        // Step 1: Query full inventory from all providers to get ALL coefficient vectors
+        // for accurate network rank computation.
+        let mut all_inventory_vectors: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+        for &peer in &other_providers {
+            match self.request_inventory(peer, cid).await {
+                Ok(inventory) => {
+                    for seg_inv in &inventory.segments {
+                        let vectors = all_inventory_vectors.entry(seg_inv.segment_index).or_default();
+                        for cv in &seg_inv.coefficient_vectors {
+                            vectors.push(cv.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Inventory request to {} failed: {} — will use PDP vectors only", peer, e);
+                }
+            }
+        }
+
+        // Also include our own local pieces in the inventory
+        for &seg_idx in &segments_to_check {
+            if let Ok(piece_ids) = store.list_pieces(&cid, seg_idx) {
+                let vectors = all_inventory_vectors.entry(seg_idx).or_default();
+                for pid in &piece_ids {
+                    if let Ok((_data, coeff)) = store.get_piece(&cid, seg_idx, pid) {
+                        vectors.push(coeff);
+                    }
+                }
+            }
+        }
+
+        // Step 2: Challenge each provider for each sampled segment (PDP verification)
         let mut pdp_results = Vec::new();
 
         for &segment_index in &segments_to_check {
@@ -249,8 +280,9 @@ impl ChallengerManager {
             results: pdp_results,
         };
 
-        // Compute true rank per segment from coefficient vectors
-        let rank_map = health::compute_network_rank(&round_result.results);
+        // Compute true network rank per segment using FULL inventory vectors
+        // (not just the single piece per provider from PDP challenges).
+        let rank_map = health::compute_rank_from_inventory(&all_inventory_vectors);
         let min_rank = health::min_rank_across_segments(&rank_map);
 
         let k = manifest.k();
@@ -349,6 +381,22 @@ impl ChallengerManager {
         self.command_tx
             .send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
             .map_err(|e| format!("Failed to send resolve command: {}", e))?;
+        rx.await.map_err(|e| format!("Channel closed: {}", e))?
+    }
+
+    async fn request_inventory(
+        &self,
+        peer: PeerId,
+        cid: ContentId,
+    ) -> Result<datacraft_core::InventoryResponse, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(DataCraftCommand::RequestInventory {
+                peer_id: peer,
+                content_id: cid,
+                reply_tx: tx,
+            })
+            .map_err(|e| format!("Failed to send inventory request: {}", e))?;
         rx.await.map_err(|e| format!("Channel closed: {}", e))?
     }
 

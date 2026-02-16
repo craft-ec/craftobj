@@ -536,6 +536,11 @@ impl DataCraftProtocol {
             return;
         }
 
+        if msg_type == datacraft_core::WireMessageType::InventoryRequest as u8 {
+            self.handle_incoming_inventory_request(stream, &type_header).await;
+            return;
+        }
+
         error!("Unknown message type: {}", msg_type);
     }
 
@@ -760,6 +765,125 @@ impl DataCraftProtocol {
             Err(e) => {
                 error!("Failed to parse pushed manifest for {}: {}", content_id, e);
                 let _ = stream.write_all(&[datacraft_core::WireStatus::Error as u8]).await;
+            }
+        }
+    }
+
+    /// Handle an incoming inventory request.
+    async fn handle_incoming_inventory_request(&self, mut stream: libp2p::Stream, type_header: &[u8; 5]) {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        // InventoryRequest: [magic:4][type:1][content_id:32] — we already read 5, need 32 more
+        let mut cid_bytes = [0u8; 32];
+        if let Err(e) = stream.read_exact(&mut cid_bytes).await {
+            error!("Failed to read inventory request body: {}", e);
+            return;
+        }
+        let content_id = ContentId(cid_bytes);
+
+        // Check removal cache
+        if let Some(ref cache) = self.removal_cache {
+            let cache = cache.lock().await;
+            if cache.is_removed(&content_id) {
+                let response = datacraft_transfer::encode_inventory_response_error(datacraft_core::WireStatus::NotFound);
+                let _ = stream.write_all(&response).await;
+                return;
+            }
+        }
+
+        let store = self.store.lock().await;
+        let manifest = match store.get_manifest(&content_id) {
+            Ok(m) => m,
+            Err(_) => {
+                let response = datacraft_transfer::encode_inventory_response_error(datacraft_core::WireStatus::NotFound);
+                let _ = stream.write_all(&response).await;
+                return;
+            }
+        };
+
+        let mut segments = Vec::new();
+        for seg_idx in 0..manifest.segment_count as u32 {
+            let piece_ids = match store.list_pieces(&content_id, seg_idx) {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+            let mut coefficient_vectors = Vec::new();
+            for pid in &piece_ids {
+                if let Ok((_data, coeff)) = store.get_piece(&content_id, seg_idx, pid) {
+                    coefficient_vectors.push(coeff);
+                }
+            }
+            if !coefficient_vectors.is_empty() {
+                segments.push(datacraft_core::SegmentInventory {
+                    segment_index: seg_idx,
+                    coefficient_vectors,
+                });
+            }
+        }
+
+        let response = datacraft_core::InventoryResponse {
+            content_id,
+            segments,
+        };
+        let encoded = datacraft_transfer::encode_inventory_response(&response);
+        if let Err(e) = stream.write_all(&encoded).await {
+            error!("Failed to write inventory response: {}", e);
+        }
+    }
+
+    /// Request inventory from a remote peer.
+    pub async fn request_inventory_from_peer(
+        &self,
+        behaviour: &mut CraftBehaviour,
+        peer_id: libp2p::PeerId,
+        content_id: &ContentId,
+    ) -> Result<datacraft_core::InventoryResponse, String> {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        debug!("Requesting inventory for {} from peer {}", content_id, peer_id);
+
+        let mut control = behaviour.stream_control();
+        let mut stream = control
+            .open_stream(peer_id, libp2p::StreamProtocol::new(datacraft_core::TRANSFER_PROTOCOL))
+            .await
+            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
+
+        let request = datacraft_transfer::encode_inventory_request(content_id);
+        stream.write_all(&request).await.map_err(|e| {
+            format!("Failed to send inventory request to {}: {}", peer_id, e)
+        })?;
+
+        // Read response: [status:1][payload_len:4 BE][bincode InventoryResponse]
+        let mut status_byte = [0u8; 1];
+        stream.read_exact(&mut status_byte).await.map_err(|e| {
+            format!("Failed to read inventory status from {}: {}", peer_id, e)
+        })?;
+
+        let status = datacraft_core::WireStatus::from_u8(status_byte[0]).ok_or_else(|| {
+            format!("Invalid inventory status byte from {}: {}", peer_id, status_byte[0])
+        })?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.map_err(|e| {
+            format!("Failed to read inventory payload_len from {}: {}", peer_id, e)
+        })?;
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+
+        match status {
+            datacraft_core::WireStatus::Ok => {
+                let mut payload = vec![0u8; payload_len];
+                stream.read_exact(&mut payload).await.map_err(|e| {
+                    format!("Failed to read inventory payload from {}: {}", peer_id, e)
+                })?;
+                let response: datacraft_core::InventoryResponse = bincode::deserialize(&payload)
+                    .map_err(|e| format!("Failed to deserialize inventory from {}: {}", peer_id, e))?;
+                Ok(response)
+            }
+            datacraft_core::WireStatus::NotFound => {
+                Err(format!("Inventory not found on peer {}", peer_id))
+            }
+            datacraft_core::WireStatus::Error => {
+                Err(format!("Inventory error from peer {}", peer_id))
             }
         }
     }
