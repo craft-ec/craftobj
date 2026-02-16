@@ -5,18 +5,30 @@
 //! Layout:
 //! ```text
 //! <data_dir>/
-//!   chunks/<cid_hex>/<chunk_index>/<shard_index>
+//!   pieces/<cid_hex>/<segment_idx>/<piece_id_hex>.data
+//!   pieces/<cid_hex>/<segment_idx>/<piece_id_hex>.coeff
 //!   manifests/<cid_hex>.json
 //!   pins.json
 //! ```
+//!
+//! Piece identity: `piece_id = SHA-256(coefficient_vector)`.
 
 use std::path::{Path, PathBuf};
 
-use datacraft_core::{ChunkManifest, ContentId, DataCraftError, Result};
+use datacraft_core::{ContentId, ContentManifest, DataCraftError, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-/// Content-addressed filesystem store.
+/// Compute piece_id from a coefficient vector: SHA-256(coefficients).
+pub fn piece_id_from_coefficients(coefficients: &[u8]) -> [u8; 32] {
+    let hash = Sha256::digest(coefficients);
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&hash);
+    id
+}
+
+/// Content-addressed filesystem store using RLNC piece model.
 pub struct FsStore {
     data_dir: PathBuf,
 }
@@ -26,76 +38,127 @@ impl FsStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
-        std::fs::create_dir_all(data_dir.join("chunks"))?;
+        std::fs::create_dir_all(data_dir.join("pieces"))?;
         std::fs::create_dir_all(data_dir.join("manifests"))?;
         Ok(Self { data_dir })
     }
 
-    /// Store an erasure-coded shard on disk.
-    pub fn put_shard(
+    /// Store a coded piece (data + coefficient vector) on disk.
+    ///
+    /// `piece_id` is SHA-256 of the coefficient vector.
+    pub fn store_piece(
         &self,
         content_id: &ContentId,
-        chunk_index: u32,
-        shard_index: u8,
+        segment_index: u32,
+        piece_id: &[u8; 32],
         data: &[u8],
+        coefficients: &[u8],
     ) -> Result<()> {
-        let dir = self
-            .data_dir
-            .join("chunks")
-            .join(content_id.to_hex())
-            .join(chunk_index.to_string());
+        let dir = self.piece_dir(content_id, segment_index);
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(shard_index.to_string());
-        std::fs::write(&path, data)?;
+        let id_hex = hex::encode(piece_id);
+        std::fs::write(dir.join(format!("{id_hex}.data")), data)?;
+        std::fs::write(dir.join(format!("{id_hex}.coeff")), coefficients)?;
         debug!(
-            "Stored shard {}/{}/{} ({} bytes)",
+            "Stored piece {}/{}/{} ({} bytes data, {} bytes coeff)",
             content_id,
-            chunk_index,
-            shard_index,
-            data.len()
+            segment_index,
+            &id_hex[..8],
+            data.len(),
+            coefficients.len()
         );
         Ok(())
     }
 
-    /// Read a shard from disk.
-    pub fn get_shard(
+    /// Read a piece (data + coefficient vector) from disk.
+    pub fn get_piece(
         &self,
         content_id: &ContentId,
-        chunk_index: u32,
-        shard_index: u8,
-    ) -> Result<Vec<u8>> {
-        let path = self
-            .data_dir
-            .join("chunks")
-            .join(content_id.to_hex())
-            .join(chunk_index.to_string())
-            .join(shard_index.to_string());
-        if !path.exists() {
+        segment_index: u32,
+        piece_id: &[u8; 32],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let dir = self.piece_dir(content_id, segment_index);
+        let id_hex = hex::encode(piece_id);
+        let data_path = dir.join(format!("{id_hex}.data"));
+        let coeff_path = dir.join(format!("{id_hex}.coeff"));
+        if !data_path.exists() {
             return Err(DataCraftError::ContentNotFound(format!(
-                "shard {}/{}/{}",
-                content_id, chunk_index, shard_index
+                "piece {}/{}/{}",
+                content_id, segment_index, &id_hex[..8]
             )));
         }
-        Ok(std::fs::read(&path)?)
+        let data = std::fs::read(&data_path)?;
+        let coefficients = std::fs::read(&coeff_path)?;
+        Ok((data, coefficients))
     }
 
-    /// Check if a shard exists.
-    pub fn has_shard(
+    /// Check if a piece exists.
+    pub fn has_piece(
         &self,
         content_id: &ContentId,
-        chunk_index: u32,
-        shard_index: u8,
+        segment_index: u32,
+        piece_id: &[u8; 32],
     ) -> bool {
-        self.data_dir
-            .join("chunks")
-            .join(content_id.to_hex())
-            .join(chunk_index.to_string())
-            .join(shard_index.to_string())
-            .exists()
+        let dir = self.piece_dir(content_id, segment_index);
+        let id_hex = hex::encode(piece_id);
+        dir.join(format!("{id_hex}.data")).exists()
     }
 
-    /// Store a chunk manifest.
-    pub fn put_manifest(&self, manifest: &ChunkManifest) -> Result<()> {
+    /// Get a random piece for a segment (for "give me any piece" requests).
+    ///
+    /// Returns `(piece_id, data, coefficients)` or `None` if no pieces stored.
+    #[allow(clippy::type_complexity)]
+    pub fn get_random_piece(
+        &self,
+        content_id: &ContentId,
+        segment_index: u32,
+    ) -> Result<Option<([u8; 32], Vec<u8>, Vec<u8>)>> {
+        let pieces = self.list_pieces(content_id, segment_index)?;
+        if pieces.is_empty() {
+            return Ok(None);
+        }
+        // Pick a pseudo-random piece based on current time
+        let idx = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as usize
+            % pieces.len();
+        let piece_id = pieces[idx];
+        let (data, coefficients) = self.get_piece(content_id, segment_index, &piece_id)?;
+        Ok(Some((piece_id, data, coefficients)))
+    }
+
+    /// List all piece IDs stored for a given content/segment.
+    pub fn list_pieces(
+        &self,
+        content_id: &ContentId,
+        segment_index: u32,
+    ) -> Result<Vec<[u8; 32]>> {
+        let dir = self.piece_dir(content_id, segment_index);
+        let mut result = Vec::new();
+        if !dir.exists() {
+            return Ok(result);
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(hex_str) = name.strip_suffix(".data") {
+                    if let Ok(bytes) = hex::decode(hex_str) {
+                        if bytes.len() == 32 {
+                            let mut id = [0u8; 32];
+                            id.copy_from_slice(&bytes);
+                            result.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Store a content manifest.
+    pub fn store_manifest(&self, manifest: &ContentManifest) -> Result<()> {
         let path = self
             .data_dir
             .join("manifests")
@@ -107,8 +170,8 @@ impl FsStore {
         Ok(())
     }
 
-    /// Retrieve a chunk manifest.
-    pub fn get_manifest(&self, content_id: &ContentId) -> Result<ChunkManifest> {
+    /// Retrieve a content manifest.
+    pub fn get_manifest(&self, content_id: &ContentId) -> Result<ContentManifest> {
         let path = self
             .data_dir
             .join("manifests")
@@ -140,8 +203,8 @@ impl FsStore {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if let Some(hex) = name.strip_suffix(".json") {
-                    if let Ok(cid) = ContentId::from_hex(hex) {
+                if let Some(hex_str) = name.strip_suffix(".json") {
+                    if let Ok(cid) = ContentId::from_hex(hex_str) {
                         result.push(cid);
                     }
                 }
@@ -150,11 +213,11 @@ impl FsStore {
         Ok(result)
     }
 
-    /// Delete all data (chunks + manifest) for a content ID.
+    /// Delete all data (pieces + manifest) for a content ID.
     pub fn delete_content(&self, content_id: &ContentId) -> Result<()> {
-        let chunk_dir = self.data_dir.join("chunks").join(content_id.to_hex());
-        if chunk_dir.exists() {
-            std::fs::remove_dir_all(&chunk_dir)?;
+        let piece_dir = self.data_dir.join("pieces").join(content_id.to_hex());
+        if piece_dir.exists() {
+            std::fs::remove_dir_all(&piece_dir)?;
         }
         let manifest_path = self
             .data_dir
@@ -172,12 +235,12 @@ impl FsStore {
         &self.data_dir
     }
 
-    /// Calculate total disk usage of all stored shards and manifests in bytes.
+    /// Calculate total disk usage of all stored pieces and manifests in bytes.
     pub fn disk_usage(&self) -> Result<u64> {
         let mut total = 0u64;
-        let chunks_dir = self.data_dir.join("chunks");
-        if chunks_dir.exists() {
-            total += dir_size(&chunks_dir)?;
+        let pieces_dir = self.data_dir.join("pieces");
+        if pieces_dir.exists() {
+            total += dir_size(&pieces_dir)?;
         }
         let manifests_dir = self.data_dir.join("manifests");
         if manifests_dir.exists() {
@@ -189,9 +252,9 @@ impl FsStore {
     /// Calculate disk usage for a specific content ID.
     pub fn cid_disk_usage(&self, content_id: &ContentId) -> u64 {
         let mut total = 0u64;
-        let chunk_dir = self.data_dir.join("chunks").join(content_id.to_hex());
-        if chunk_dir.exists() {
-            total += dir_size(&chunk_dir).unwrap_or(0);
+        let piece_dir = self.data_dir.join("pieces").join(content_id.to_hex());
+        if piece_dir.exists() {
+            total += dir_size(&piece_dir).unwrap_or(0);
         }
         let manifest_path = self.data_dir.join("manifests").join(format!("{}.json", content_id.to_hex()));
         if manifest_path.exists() {
@@ -200,46 +263,12 @@ impl FsStore {
         total
     }
 
-    /// Return the maximum shard index stored locally for a given content/chunk pair.
-    /// Returns `None` if no shards are stored for this chunk.
-    pub fn max_shard_index(&self, content_id: &ContentId, chunk_index: u32) -> Option<u8> {
-        let chunk_dir = self
-            .data_dir
-            .join("chunks")
+    /// Helper: path to a segment's piece directory.
+    fn piece_dir(&self, content_id: &ContentId, segment_index: u32) -> PathBuf {
+        self.data_dir
+            .join("pieces")
             .join(content_id.to_hex())
-            .join(chunk_index.to_string());
-        if !chunk_dir.exists() {
-            return None;
-        }
-        let mut max: Option<u8> = None;
-        if let Ok(entries) = std::fs::read_dir(&chunk_dir) {
-            for entry in entries.flatten() {
-                if let Ok(idx) = entry.file_name().to_string_lossy().parse::<u8>() {
-                    max = Some(max.map_or(idx, |m: u8| m.max(idx)));
-                }
-            }
-        }
-        max
-    }
-
-    /// Return the maximum shard index across all chunks for a content ID.
-    /// Returns `None` if no shards exist.
-    pub fn max_shard_index_for_content(&self, content_id: &ContentId) -> Option<u8> {
-        let cid_dir = self.data_dir.join("chunks").join(content_id.to_hex());
-        if !cid_dir.exists() {
-            return None;
-        }
-        let mut global_max: Option<u8> = None;
-        if let Ok(entries) = std::fs::read_dir(&cid_dir) {
-            for entry in entries.flatten() {
-                if let Ok(chunk_idx) = entry.file_name().to_string_lossy().parse::<u32>() {
-                    if let Some(m) = self.max_shard_index(content_id, chunk_idx) {
-                        global_max = Some(global_max.map_or(m, |g: u8| g.max(m)));
-                    }
-                }
-            }
-        }
-        global_max
+            .join(segment_index.to_string())
     }
 }
 
@@ -324,14 +353,13 @@ impl GarbageCollector {
         let all_content = store.list_content()?;
         let mut removed = 0;
 
-        // Calculate current usage (rough estimate from manifest content_size)
         let mut total: u64 = 0;
         let mut candidates: Vec<(ContentId, u64)> = Vec::new();
         for cid in &all_content {
             if let Ok(manifest) = store.get_manifest(cid) {
-                total += manifest.content_size;
+                total += manifest.total_size;
                 if !pin_manager.is_pinned(cid) {
-                    candidates.push((*cid, manifest.content_size));
+                    candidates.push((*cid, manifest.total_size));
                 }
             }
         }
@@ -340,7 +368,6 @@ impl GarbageCollector {
             return Ok(0);
         }
 
-        // Remove unpinned content until under threshold
         for (cid, size) in candidates {
             if total <= max_bytes {
                 break;
@@ -355,10 +382,24 @@ impl GarbageCollector {
     }
 }
 
+/// Recursively calculate the size of a directory.
+fn dir_size(path: &std::path::Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datacraft_core::default_erasure_config;
 
     fn test_dir() -> PathBuf {
         let dir = std::env::temp_dir()
@@ -376,18 +417,87 @@ mod tests {
         format!("{}-{}", t.as_secs(), t.subsec_nanos())
     }
 
+    fn make_manifest(cid: ContentId) -> ContentManifest {
+        ContentManifest {
+            content_id: cid,
+            content_hash: cid.0,
+            segment_size: 10_485_760,
+            piece_size: 102_400,
+            segment_count: 1,
+            total_size: 1000,
+            creator: String::new(),
+            signature: vec![],
+        }
+    }
+
     #[test]
-    fn test_shard_roundtrip() {
+    fn test_piece_roundtrip() {
         let dir = test_dir();
         let store = FsStore::new(&dir).unwrap();
         let cid = ContentId::from_bytes(b"hello");
 
-        store.put_shard(&cid, 0, 0, b"shard data").unwrap();
-        assert!(store.has_shard(&cid, 0, 0));
-        assert!(!store.has_shard(&cid, 0, 1));
+        let coefficients = vec![1u8, 0, 0, 0];
+        let piece_id = piece_id_from_coefficients(&coefficients);
+        let data = b"piece data";
 
-        let data = store.get_shard(&cid, 0, 0).unwrap();
-        assert_eq!(data, b"shard data");
+        store.store_piece(&cid, 0, &piece_id, data, &coefficients).unwrap();
+        assert!(store.has_piece(&cid, 0, &piece_id));
+
+        let (got_data, got_coeff) = store.get_piece(&cid, 0, &piece_id).unwrap();
+        assert_eq!(got_data, data);
+        assert_eq!(got_coeff, coefficients);
+
+        // Non-existent piece
+        let fake_id = [0u8; 32];
+        assert!(!store.has_piece(&cid, 0, &fake_id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_list_pieces() {
+        let dir = test_dir();
+        let store = FsStore::new(&dir).unwrap();
+        let cid = ContentId::from_bytes(b"list test");
+
+        let coeff1 = vec![1u8, 0, 0];
+        let coeff2 = vec![0u8, 1, 0];
+        let id1 = piece_id_from_coefficients(&coeff1);
+        let id2 = piece_id_from_coefficients(&coeff2);
+
+        store.store_piece(&cid, 0, &id1, b"d1", &coeff1).unwrap();
+        store.store_piece(&cid, 0, &id2, b"d2", &coeff2).unwrap();
+
+        let pieces = store.list_pieces(&cid, 0).unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces.contains(&id1));
+        assert!(pieces.contains(&id2));
+
+        // Empty segment
+        let empty = store.list_pieces(&cid, 1).unwrap();
+        assert!(empty.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_get_random_piece() {
+        let dir = test_dir();
+        let store = FsStore::new(&dir).unwrap();
+        let cid = ContentId::from_bytes(b"random test");
+
+        // Empty → None
+        let none = store.get_random_piece(&cid, 0).unwrap();
+        assert!(none.is_none());
+
+        let coeff = vec![42u8, 7, 3];
+        let id = piece_id_from_coefficients(&coeff);
+        store.store_piece(&cid, 0, &id, b"data", &coeff).unwrap();
+
+        let (got_id, got_data, got_coeff) = store.get_random_piece(&cid, 0).unwrap().unwrap();
+        assert_eq!(got_id, id);
+        assert_eq!(got_data, b"data");
+        assert_eq!(got_coeff, coeff);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -397,25 +507,14 @@ mod tests {
         let dir = test_dir();
         let store = FsStore::new(&dir).unwrap();
         let cid = ContentId::from_bytes(b"test content");
+        let manifest = make_manifest(cid);
 
-        let manifest = ChunkManifest {
-            content_id: cid,
-            content_hash: cid.0,
-            k: 4,
-            chunk_size: 65536,
-            chunk_count: 1,
-            erasure_config: default_erasure_config(),
-            content_size: 1000,
-            creator: String::new(),
-            signature: vec![],
-        };
-
-        store.put_manifest(&manifest).unwrap();
+        store.store_manifest(&manifest).unwrap();
         assert!(store.has_manifest(&cid));
 
         let loaded = store.get_manifest(&cid).unwrap();
         assert_eq!(loaded.content_id, cid);
-        assert_eq!(loaded.content_size, 1000);
+        assert_eq!(loaded.total_size, 1000);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -429,19 +528,10 @@ mod tests {
         let cid2 = ContentId::from_bytes(b"file2");
 
         for cid in [&cid1, &cid2] {
-            let manifest = ChunkManifest {
-                content_id: *cid,
-                content_hash: cid.0,
-                k: 4,
-                chunk_size: 65536,
-                chunk_count: 1,
-                erasure_config: default_erasure_config(),
-                content_size: 100,
-            creator: String::new(),
-            signature: vec![],
-            };
-            store.put_manifest(&manifest).unwrap();
-            store.put_shard(cid, 0, 0, b"data").unwrap();
+            store.store_manifest(&make_manifest(*cid)).unwrap();
+            let coeff = vec![1u8, 2, 3];
+            let id = piece_id_from_coefficients(&coeff);
+            store.store_piece(cid, 0, &id, b"data", &coeff).unwrap();
         }
 
         let content = store.list_content().unwrap();
@@ -483,7 +573,6 @@ mod tests {
             pm.pin(&cid).unwrap();
         }
 
-        // Reload
         let pm = PinManager::new(&dir).unwrap();
         assert!(pm.is_pinned(&cid));
 
@@ -500,24 +589,14 @@ mod tests {
         let cid2 = ContentId::from_bytes(b"gc2");
         let cid3 = ContentId::from_bytes(b"gc3");
 
-        // Create 3 items, pin one
         for cid in [&cid1, &cid2, &cid3] {
-            let manifest = ChunkManifest {
-                content_id: *cid,
-                content_hash: cid.0,
-                k: 4,
-                chunk_size: 65536,
-                chunk_count: 1,
-                erasure_config: default_erasure_config(),
-                content_size: 100,
-            creator: String::new(),
-            signature: vec![],
-            };
-            store.put_manifest(&manifest).unwrap();
+            let mut manifest = make_manifest(*cid);
+            manifest.total_size = 100;
+            store.store_manifest(&manifest).unwrap();
         }
         pm.pin(&cid1).unwrap();
 
-        // GC with 150 byte threshold: 300 total, need to remove 2 unpinned to get to 100
+        // 300 total, threshold 150: remove 2 unpinned
         let removed = GarbageCollector::sweep(&store, &pm, 150).unwrap();
         assert_eq!(removed, 2);
 
@@ -526,19 +605,15 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
-}
 
-/// Recursively calculate the size of a directory.
-fn dir_size(path: &std::path::Path) -> Result<u64> {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            total += dir_size(&entry.path())?;
-        } else {
-            total += meta.len();
-        }
+    #[test]
+    fn test_piece_id_from_coefficients() {
+        let coeff = vec![1, 2, 3, 4];
+        let id = piece_id_from_coefficients(&coeff);
+        assert_eq!(id.len(), 32);
+        // Deterministic
+        assert_eq!(id, piece_id_from_coefficients(&coeff));
+        // Different input → different ID
+        assert_ne!(id, piece_id_from_coefficients(&[5, 6, 7, 8]));
     }
-    Ok(total)
 }
