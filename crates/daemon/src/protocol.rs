@@ -72,6 +72,8 @@ pub struct DataCraftProtocol {
     demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
     /// Eviction manager — records access for LRU tracking.
     eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
+    /// Storage Merkle tree — updated on piece store/delete.
+    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
 }
 
 /// Tracks what we're waiting for from a DHT query.
@@ -96,6 +98,7 @@ impl DataCraftProtocol {
             removal_cache: None,
             demand_tracker: None,
             eviction_manager: None,
+            merkle_tree: None,
         }
     }
 
@@ -115,6 +118,10 @@ impl DataCraftProtocol {
 
     pub fn set_eviction_manager(&mut self, mgr: Arc<Mutex<crate::eviction::EvictionManager>>) {
         self.eviction_manager = Some(mgr);
+    }
+
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+        self.merkle_tree = Some(tree);
     }
 
     /// Register this protocol with the shared libp2p swarm.
@@ -695,6 +702,10 @@ impl DataCraftProtocol {
                         "Stored pushed piece {}/{}/{} ({} bytes)",
                         content_id, segment_index, &hex::encode(&piece_id[..4]), data.len()
                     );
+                    // Update storage Merkle tree
+                    if let Some(ref mt) = self.merkle_tree {
+                        mt.lock().await.insert(&content_id, segment_index, &piece_id);
+                    }
                     let _ = self.event_tx.send(DataCraftEvent::PiecePushReceived { content_id });
                     let _ = stream.write_all(&[datacraft_core::WireStatus::Ok as u8]).await;
                 }

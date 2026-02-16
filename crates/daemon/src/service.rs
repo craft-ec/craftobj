@@ -256,6 +256,7 @@ pub async fn run_daemon_with_config(
     };
     let eviction_manager = Arc::new(Mutex::new(crate::eviction::EvictionManager::new(&eviction_config)));
     protocol.set_eviction_manager(eviction_manager.clone());
+    protocol.set_merkle_tree(merkle_tree.clone());
 
     let protocol = Arc::new(protocol);
 
@@ -447,7 +448,7 @@ pub async fn run_daemon_with_config(
         _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone()) => {
             info!("Scaling maintenance loop ended");
         }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone()) => {
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone()) => {
             info!("Eviction maintenance loop ended");
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
@@ -508,6 +509,7 @@ async fn eviction_maintenance_loop(
     store: Arc<Mutex<datacraft_store::FsStore>>,
     event_tx: EventSender,
     pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>>,
+    merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
 ) {
     use std::time::Duration;
     // Initial delay
@@ -546,6 +548,14 @@ async fn eviction_maintenance_loop(
                 content_id: cid.to_hex(),
                 reason: reason.to_string(),
             });
+        }
+
+        // Rebuild merkle tree after eviction/retirement
+        if !result.evicted.is_empty() || !result.retired.is_empty() {
+            if let Ok(new_tree) = datacraft_store::merkle::StorageMerkleTree::build_from_store(&store_guard) {
+                *merkle_tree.lock().await = new_tree;
+                debug!("Rebuilt storage Merkle tree after eviction");
+            }
         }
     }
 }
