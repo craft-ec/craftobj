@@ -381,7 +381,7 @@ mod tests {
         ContentManifest {
             content_id,
             content_hash: content_id.0,
-            segment_size: 10_485_760,
+            segment_size: 10_240_000,
             piece_size: 102_400,
             segment_count: 1,
             total_size: 100_000,

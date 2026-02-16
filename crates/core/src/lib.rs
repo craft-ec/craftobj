@@ -784,7 +784,7 @@ mod tests {
         let manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            segment_size: 10_485_760,
+            segment_size: 10_240_000,
             piece_size: 102_400,
             segment_count: 1,
             total_size: 1024,
@@ -795,7 +795,7 @@ mod tests {
         let parsed: ContentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, manifest.content_id);
         assert_eq!(parsed.content_hash, cid.0);
-        assert_eq!(parsed.segment_size, 10_485_760);
+        assert_eq!(parsed.segment_size, 10_240_000);
         assert_eq!(parsed.piece_size, 102_400);
         assert_eq!(parsed.total_size, 1024);
     }
@@ -805,14 +805,14 @@ mod tests {
         let manifest = ContentManifest {
             content_id: ContentId([0u8; 32]),
             content_hash: [0u8; 32],
-            segment_size: 10_485_760,
+            segment_size: 10_240_000,
             piece_size: 102_400,
             segment_count: 1,
-            total_size: 10_485_760,
+            total_size: 10_240_000,
             creator: String::new(),
             signature: vec![],
         };
-        assert_eq!(manifest.k(), 102);
+        assert_eq!(manifest.k(), 100);
     }
 
     #[test]
@@ -825,7 +825,7 @@ mod tests {
         let mut manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            segment_size: 10_485_760,
+            segment_size: 10_240_000,
             piece_size: 102_400,
             segment_count: 1,
             total_size: 2048,
@@ -854,7 +854,7 @@ mod tests {
         let mut manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            segment_size: 10_485_760,
+            segment_size: 10_240_000,
             piece_size: 102_400,
             segment_count: 1,
             total_size: 1024,
@@ -873,7 +873,7 @@ mod tests {
         let manifest = ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            segment_size: 10_485_760,
+            segment_size: 10_240_000,
             piece_size: 102_400,
             segment_count: 1,
             total_size: 1024,
