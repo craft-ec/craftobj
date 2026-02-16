@@ -1494,13 +1494,41 @@ impl DataCraftHandler {
 
     /// `content.list_detailed` — Enhanced list with health info per CID.
     async fn handle_content_list_detailed(&self) -> Result<Value, String> {
+        // Single lock on client for all CIDs — avoids re-locking per CID.
         let client = self.client.lock().await;
         let items = client.list().map_err(|e| e.to_string())?;
+
+        // Compute health inline while we hold the client lock.
+        let mut cid_health: Vec<(datacraft_core::ContentId, usize, u64)> = Vec::new();
+        for item in &items {
+            let segments = client.store().list_segments(&item.content_id).unwrap_or_default();
+            let mut min_rank: Option<usize> = None;
+            for &seg in &segments {
+                let pieces = client.store().list_pieces(&item.content_id, seg).unwrap_or_default();
+                let rank = pieces.len();
+                min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+            }
+            let disk_usage = client.store().cid_disk_usage(&item.content_id);
+            cid_health.push((item.content_id, min_rank.unwrap_or(0), disk_usage));
+        }
         drop(client);
 
+        // Now build the JSON response with tracker data.
+        let tracker_data: Option<Vec<_>> = if let Some(ref tracker) = self.content_tracker {
+            let t = tracker.lock().await;
+            Some(items.iter().map(|item| t.get(&item.content_id).cloned()).collect())
+        } else {
+            None
+        };
+
         let mut result = Vec::new();
-        for item in &items {
-            let (min_rank, health_ratio, disk_usage) = self.compute_cid_health(&item.content_id).await?;
+        for (i, item) in items.iter().enumerate() {
+            let (_, min_rank, disk_usage) = &cid_health[i];
+            let k = tracker_data.as_ref()
+                .and_then(|td| td[i].as_ref())
+                .map(|s| s.k)
+                .unwrap_or(0);
+            let health_ratio = if k > 0 { *min_rank as f64 / k as f64 } else { 0.0 };
 
             let mut obj = serde_json::json!({
                 "content_id": item.content_id.to_hex(),
@@ -1512,9 +1540,8 @@ impl DataCraftHandler {
                 "local_disk_usage": disk_usage,
             });
 
-            if let Some(ref tracker) = self.content_tracker {
-                let t = tracker.lock().await;
-                if let Some(state) = t.get(&item.content_id) {
+            if let Some(ref td) = tracker_data {
+                if let Some(ref state) = td[i] {
                     obj["name"] = serde_json::json!(state.name);
                     obj["encrypted"] = serde_json::json!(state.encrypted);
                     obj["stage"] = serde_json::json!(state.stage.to_string());
@@ -1524,7 +1551,6 @@ impl DataCraftHandler {
                         crate::content_tracker::ContentRole::Publisher => "publisher",
                         crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
                     });
-                    // Hot heuristic: provider_count > segment_count * 2
                     obj["hot"] = serde_json::json!(state.provider_count > state.segment_count * 2);
                 }
             }
@@ -1554,16 +1580,32 @@ impl DataCraftHandler {
         let mut degraded = 0usize;
         let mut health_sum = 0.0f64;
 
-        if let Some(ref tracker) = self.content_tracker {
+        // Collect tracker states first (release lock before accessing client).
+        let states = if let Some(ref tracker) = self.content_tracker {
             let t = tracker.lock().await;
-            let states = t.list();
+            t.list()
+        } else {
+            Vec::new()
+        };
+
+        if !states.is_empty() {
+            // Single client lock for all CID health computations.
+            let client = self.client.lock().await;
             total_content = states.len();
             for state in &states {
-                let (min_rank, health_ratio, disk_usage) = self.compute_cid_health(&state.content_id).await?;
+                let segments = client.store().list_segments(&state.content_id).unwrap_or_default();
+                let mut min_rank: Option<usize> = None;
+                for &seg in &segments {
+                    let pieces = client.store().list_pieces(&state.content_id, seg).unwrap_or_default();
+                    let rank = pieces.len();
+                    min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
+                }
+                let min_rank_val = min_rank.unwrap_or(0);
+                let disk_usage = client.store().cid_disk_usage(&state.content_id);
                 total_stored_bytes += disk_usage;
+                let health_ratio = if state.k > 0 { min_rank_val as f64 / state.k as f64 } else { 0.0 };
                 health_sum += health_ratio;
-                // Degraded if min_rank < k (cannot reconstruct from local pieces alone)
-                if state.k > 0 && min_rank < state.k {
+                if state.k > 0 && min_rank_val < state.k {
                     degraded += 1;
                 } else {
                     healthy += 1;
