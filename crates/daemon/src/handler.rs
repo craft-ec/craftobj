@@ -1789,6 +1789,17 @@ impl IpcHandler for DataCraftHandler {
                 "content.segments" => self.handle_content_segments(params).await,
                 "network.health" => self.handle_network_health().await,
                 "node.stats" => self.handle_node_stats().await,
+                "shutdown" => {
+                    info!("Shutdown requested via RPC — exiting");
+                    // Respond first, then exit
+                    let result = Ok(serde_json::json!({"status": "shutting_down"}));
+                    // Schedule exit after response is sent
+                    tokio::spawn(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        std::process::exit(0);
+                    });
+                    result
+                },
                 _ => Err(format!("unknown method: {}", method)),
             }
         })
