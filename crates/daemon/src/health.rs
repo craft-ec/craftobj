@@ -6,9 +6,10 @@
 use datacraft_core::{ContentId, ContentManifest, StorageReceipt};
 use datacraft_store::FsStore;
 use libp2p::PeerId;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::pdp::{PdpResponse, create_storage_receipt};
+#[cfg(test)]
+use crate::pdp::create_storage_receipt;
 
 // ---------------------------------------------------------------------------
 // Tier info

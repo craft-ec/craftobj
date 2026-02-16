@@ -9,7 +9,7 @@ use datacraft_core::{ContentId, ContentManifest, TRANSFER_PROTOCOL};
 use datacraft_routing::ContentRouter;
 use datacraft_store::FsStore;
 use datacraft_transfer::{
-    decode_piece_request, decode_piece_push, decode_manifest_push_header,
+    decode_piece_request, decode_manifest_push_header,
     encode_piece_response, encode_piece_response_error,
     PIECE_REQUEST_SIZE, MANIFEST_PUSH_HEADER_SIZE,
 };
@@ -487,7 +487,7 @@ impl DataCraftProtocol {
 
     /// Handle an incoming transfer stream from a peer.
     pub async fn handle_incoming_stream(&self, mut stream: libp2p::Stream) {
-        use futures::{AsyncReadExt, AsyncWriteExt};
+        use futures::AsyncReadExt;
 
         debug!("Handling incoming transfer stream");
 

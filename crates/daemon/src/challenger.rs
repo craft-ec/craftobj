@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::commands::DataCraftCommand;
-use crate::health::{self, DutyCycleResult, ProviderInfo, TierInfo, CidHealth, PdpRoundResult, ProviderPdpResult, HealingResult};
+use crate::health::{self, DutyCycleResult, TierInfo, PdpRoundResult, ProviderPdpResult};
 use crate::pdp::{
     ChallengerRotation, OnlineTimeTracker,
     compute_proof_hash, create_storage_receipt,
