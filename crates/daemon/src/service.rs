@@ -192,7 +192,12 @@ pub async fn run_daemon_with_config(
                         info!("Dialing boot peer: {}", addr_str);
                     }
                 } else {
-                    warn!("Boot peer missing /p2p/<peer_id>: {}", addr_str);
+                    // No peer ID in multiaddr — dial the address directly.
+                    // Won't add to Kademlia but will establish a connection for gossipsub.
+                    info!("Dialing boot peer (no peer_id): {}", addr_str);
+                    if let Err(e) = swarm.dial(addr) {
+                        warn!("Failed to dial boot peer {}: {:?}", addr_str, e);
+                    }
                 }
             }
             Err(e) => warn!("Invalid boot peer address '{}': {}", addr_str, e),
