@@ -1014,7 +1014,7 @@ async fn handle_incoming_transfer_request(
 ) -> DataCraftResponse {
     match request {
         DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
-            debug!("Handling PieceSync from {} for {}/seg{}", peer, content_id, segment_index);
+            info!("Handling PieceSync from {} for {}/seg{}", peer, content_id, segment_index);
             let store_guard = store.lock().await;
             let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
 
@@ -1043,11 +1043,11 @@ async fn handle_incoming_transfer_request(
                 }
             }
 
-            debug!("Responding with {} pieces for {}/seg{}", pieces.len(), content_id, segment_index);
+            info!("Responding with {} pieces for {}/seg{}", pieces.len(), content_id, segment_index);
             DataCraftResponse::PieceBatch { pieces }
         }
         DataCraftRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
-            debug!("Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
+            info!("Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
             let store_guard = store.lock().await;
 
             // Check if we have the manifest (must receive ManifestPush first)
@@ -1058,7 +1058,7 @@ async fn handle_incoming_transfer_request(
 
             match store_guard.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
                 Ok(()) => {
-                    debug!("Stored pushed piece for {}/seg{}", content_id, segment_index);
+                    info!("Stored pushed piece for {}/seg{}", content_id, segment_index);
                     // Notify protocol of piece push for tracker update
                     if let Err(e) = protocol.event_tx.send(DataCraftEvent::PiecePushReceived { content_id }) {
                         debug!("Failed to send piece push event: {}", e);
@@ -1072,13 +1072,13 @@ async fn handle_incoming_transfer_request(
             }
         }
         DataCraftRequest::ManifestPush { content_id, manifest_json } => {
-            debug!("Handling ManifestPush from {} for {}", peer, content_id);
+            info!("Handling ManifestPush from {} for {}", peer, content_id);
             match serde_json::from_slice::<datacraft_core::ContentManifest>(&manifest_json) {
                 Ok(manifest) => {
                     let store_guard = store.lock().await;
                     match store_guard.store_manifest(&manifest) {
                         Ok(()) => {
-                            debug!("Stored manifest for {}", content_id);
+                            info!("Stored manifest for {}", content_id);
                             if let Err(e) = protocol.event_tx.send(DataCraftEvent::ManifestPushReceived {
                                 content_id,
                                 manifest,
@@ -1216,7 +1216,7 @@ async fn handle_command(
         }
         
         DataCraftCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
-            debug!("Handling PieceSync command: {}/{} from {}", content_id, segment_index, peer_id);
+            info!("Handling PieceSync command: {}/{} from {}", content_id, segment_index, peer_id);
             let request = DataCraftRequest::PieceSync {
                 content_id,
                 segment_index,

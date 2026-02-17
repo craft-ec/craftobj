@@ -323,7 +323,7 @@ impl DataCraftHandler {
             };
 
             if let Some(manifest) = local_manifest {
-                debug!("Found manifest locally for {}", cid);
+                info!("Found manifest locally for {}", cid);
 
                 // Step 2: Get providers from peer scorer (peers that announced having pieces for this CID)
                 let cid_hex_key = cid.to_hex();
@@ -340,25 +340,25 @@ impl DataCraftHandler {
                 }
 
                 if !providers.is_empty() {
-                    debug!("Found {} local providers for {} via peer scorer", providers.len(), cid);
+                    info!("Found {} local providers for {} via peer scorer", providers.len(), cid);
                     // Step 3: Fetch missing pieces from these providers
                     match self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                         Ok(()) => {
-                            debug!("Successfully fetched pieces via local-first P2P path");
+                            info!("Successfully fetched pieces via local-first P2P path");
                             p2p_fetched = true;
                         }
                         Err(e) => {
-                            debug!("Local-first P2P fetch failed: {}, trying DHT fallback", e);
+                            info!("Local-first P2P fetch failed: {}, trying DHT fallback", e);
                         }
                     }
                 } else {
-                    debug!("No local providers found for {} in peer scorer", cid);
+                    info!("No local providers found for {} in peer scorer", cid);
                 }
             }
 
             // DHT fallback: try DHT resolution if local-first path didn't succeed
             if !p2p_fetched {
-                debug!("Attempting DHT resolution for {}", cid);
+                info!("Attempting DHT resolution for {}", cid);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let command = DataCraftCommand::ResolveProviders {
@@ -369,7 +369,7 @@ impl DataCraftHandler {
                 if command_tx.send(command).is_ok() {
                     match reply_rx.await {
                         Ok(Ok(providers)) if !providers.is_empty() => {
-                            debug!("Found {} providers for {} via DHT", providers.len(), cid);
+                            info!("Found {} providers for {} via DHT", providers.len(), cid);
 
                             let (manifest_tx, manifest_rx) = oneshot::channel();
                             let command = DataCraftCommand::GetManifest {
@@ -384,7 +384,7 @@ impl DataCraftHandler {
                                         if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                                             debug!("DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
                                         } else {
-                                            debug!("Successfully fetched pieces via DHT P2P path");
+                                            info!("Successfully fetched pieces via DHT P2P path");
                                         }
                                     }
                                     Ok(Err(e)) => debug!("Failed to get manifest from DHT: {}", e),
@@ -401,7 +401,7 @@ impl DataCraftHandler {
         }
 
         // Fall back to local reconstruction (blocking I/O — run off the runtime)
-        debug!("Using local reconstruction for {}", cid);
+        info!("Using local reconstruction for {}", cid);
         let client = self.client.clone();
         let output_clone = output.clone();
         tokio::task::spawn_blocking(move || {
@@ -684,7 +684,7 @@ impl DataCraftHandler {
 
         const MAX_CONCURRENT: usize = 20;
 
-        debug!("Fetching pieces for {} from {} providers", content_id, providers.len());
+        info!("Fetching pieces for {} from {} providers", content_id, providers.len());
 
         let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
             let mut s = scorer.lock().await;
@@ -721,7 +721,7 @@ impl DataCraftHandler {
             }
 
             let needed = k - current_rank;
-            debug!("Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
+            info!("Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
 
             // Spawn parallel piece requests using JoinSet
             let concurrency = needed.min(ranked_providers.len()).min(MAX_CONCURRENT);

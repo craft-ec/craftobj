@@ -17,7 +17,7 @@ use datacraft_transfer::{DataCraftRequest, DataCraftResponse};
 use libp2p::PeerId;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Cooldown after a failed outbound open before retrying (seconds).
 const OPEN_RETRY_COOLDOWN_SECS: u64 = 1;
@@ -165,7 +165,7 @@ impl StreamManager {
 
         self.open_cooldown.remove(&peer);
         self.register_inbound(peer, stream);
-        debug!("Accepted inbound from peer {}", peer);
+        info!("Accepted inbound from peer {}", peer);
         self.ensure_opening(peer);
     }
 
@@ -227,7 +227,7 @@ impl StreamManager {
                         continue;
                     }
                     self.register_outbound(peer, stream);
-                    debug!("Opened outbound to peer {}", peer);
+                    info!("Opened outbound to peer {}", peer);
                     opened += 1;
                 }
                 Err(e) => {
