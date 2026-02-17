@@ -311,62 +311,89 @@ impl DataCraftHandler {
         let cid =
             datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
-        // Milestones 2 & 3 & 4: Full P2P fetch pipeline
-        // 1. Resolve providers from DHT
-        // 2. Get manifest from DHT  
-        // 3. Request missing shards from providers via P2P
-        // 4. Continue to local reconstruction (erasure decode, verify CID, write file)
+        // Try local-first fetch path: use locally cached manifest + peer scorer providers
+        // This works even with few nodes where DHT routing tables are sparse
+        let mut p2p_fetched = false;
         if let Some(ref command_tx) = self.command_tx {
-            debug!("Attempting DHT resolution for {}", cid);
-            
-            // First, try to get providers for this content
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let command = DataCraftCommand::ResolveProviders {
-                content_id: cid,
-                reply_tx,
+            // Step 1: Try to get manifest locally (storage nodes have it from manifest push)
+            let local_manifest = {
+                let client = self.client.lock().await;
+                client.store().get_manifest(&cid).ok()
             };
-            
-            if command_tx.send(command).is_ok() {
-                match reply_rx.await {
-                    Ok(Ok(providers)) if !providers.is_empty() => {
-                        debug!("Found {} providers for {}", providers.len(), cid);
-                        
-                        // Try to get the manifest from DHT
-                        let (manifest_tx, manifest_rx) = oneshot::channel();
-                        let command = DataCraftCommand::GetManifest {
-                            content_id: cid,
-            reply_tx: manifest_tx,
-                        };
-                        
-                        if command_tx.send(command).is_ok() {
-                            match manifest_rx.await {
-                                Ok(Ok(manifest)) => {
-                                    debug!("Retrieved manifest for {} from DHT", cid);
-                                    
-                                    // Try to fetch missing pieces from providers for full P2P pipeline
-                                    if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
-                                        debug!("P2P piece transfer failed: {}, falling back to local reconstruction", e);
-                                    } else {
-                                        debug!("Successfully fetched pieces via P2P, proceeding to reconstruction");
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    debug!("Failed to get manifest from DHT: {}", e);
-                                }
-                                Err(e) => {
-                                    debug!("Manifest request channel error: {}", e);
-                                }
+
+            if let Some(manifest) = local_manifest {
+                debug!("Found manifest locally for {}", cid);
+
+                // Step 2: Get providers from peer scorer (peers that announced having pieces for this CID)
+                let cid_hex_key = cid.to_hex();
+                let mut providers = Vec::new();
+                if let Some(ref scorer) = self.peer_scorer {
+                    let s = scorer.lock().await;
+                    for (peer_id, score) in s.iter() {
+                        if let Some(&count) = score.piece_counts.get(&cid_hex_key) {
+                            if count > 0 {
+                                providers.push(*peer_id);
                             }
                         }
                     }
-                    Ok(Ok(_)) => {
-                        debug!("No providers found for {}", cid);
+                }
+
+                if !providers.is_empty() {
+                    debug!("Found {} local providers for {} via peer scorer", providers.len(), cid);
+                    // Step 3: Fetch missing pieces from these providers
+                    match self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
+                        Ok(()) => {
+                            debug!("Successfully fetched pieces via local-first P2P path");
+                            p2p_fetched = true;
+                        }
+                        Err(e) => {
+                            debug!("Local-first P2P fetch failed: {}, trying DHT fallback", e);
+                        }
                     }
-                    Ok(Err(e)) => {
-                        debug!("Provider resolution failed: {}", e);
-                    }
-                    Err(e) => {
-                        debug!("Provider resolution channel error: {}", e);
+                } else {
+                    debug!("No local providers found for {} in peer scorer", cid);
+                }
+            }
+
+            // DHT fallback: try DHT resolution if local-first path didn't succeed
+            if !p2p_fetched {
+                debug!("Attempting DHT resolution for {}", cid);
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let command = DataCraftCommand::ResolveProviders {
+                    content_id: cid,
+                    reply_tx,
+                };
+
+                if command_tx.send(command).is_ok() {
+                    match reply_rx.await {
+                        Ok(Ok(providers)) if !providers.is_empty() => {
+                            debug!("Found {} providers for {} via DHT", providers.len(), cid);
+
+                            let (manifest_tx, manifest_rx) = oneshot::channel();
+                            let command = DataCraftCommand::GetManifest {
+                                content_id: cid,
+                                reply_tx: manifest_tx,
+                            };
+
+                            if command_tx.send(command).is_ok() {
+                                match manifest_rx.await {
+                                    Ok(Ok(manifest)) => {
+                                        debug!("Retrieved manifest for {} from DHT", cid);
+                                        if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
+                                            debug!("DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
+                                        } else {
+                                            debug!("Successfully fetched pieces via DHT P2P path");
+                                        }
+                                    }
+                                    Ok(Err(e)) => debug!("Failed to get manifest from DHT: {}", e),
+                                    Err(e) => debug!("Manifest request channel error: {}", e),
+                                }
+                            }
+                        }
+                        Ok(Ok(_)) => debug!("No providers found for {} via DHT", cid),
+                        Ok(Err(e)) => debug!("Provider resolution failed: {}", e),
+                        Err(e) => debug!("Provider resolution channel error: {}", e),
                     }
                 }
             }
