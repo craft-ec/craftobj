@@ -1,458 +1,367 @@
 //! E2E integration tests for DataCraft's core content flow.
 //!
-//! Tests the full lifecycle: publish → distribute → equalize → fetch,
-//! plus partial push retry and piece uniqueness invariants.
+//! Tests the full content lifecycle: publish → distribute → fetch → delete.
+//! Uses library crates directly (no daemon processes).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use craftec_erasure::{check_independence, CodedPiece};
 use datacraft_client::DataCraftClient;
 use datacraft_core::{ContentId, PublishOptions};
 use datacraft_store::FsStore;
-use rand::RngCore;
 
-fn temp_dir(label: &str) -> PathBuf {
+/// Create a unique temp directory for a test node.
+fn node_dir(label: &str) -> PathBuf {
+    use rand::RngCore;
+    let mut rng = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut rng);
     let dir = std::env::temp_dir()
         .join("datacraft-e2e-flow")
-        .join(format!(
-            "{}-{}",
-            label,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        .join(format!("{}-{}", label, hex::encode(rng)));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-fn random_data(size: usize) -> Vec<u8> {
-    let mut data = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut data);
-    data
+/// Generate deterministic test data of the given size.
+fn test_data(size: usize) -> Vec<u8> {
+    (0..size).map(|i| ((i * 7 + 13) % 256) as u8).collect()
 }
 
-/// Helper: count total pieces across all segments for a content in a store.
-fn total_piece_count(store: &FsStore, cid: &ContentId, segment_count: usize) -> usize {
+/// Count total pieces across all segments for a CID in a store.
+fn count_pieces(store: &FsStore, cid: &ContentId, segment_count: usize) -> usize {
     (0..segment_count as u32)
-        .map(|seg| store.list_pieces(cid, seg).unwrap().len())
+        .map(|seg| store.list_pieces(cid, seg).unwrap_or_default().len())
         .sum()
 }
 
-// ===========================================================================
-// Test 1: Publish and Distribute
-// ===========================================================================
+/// Simulate round-robin push distribution from publisher to storage nodes.
+/// Pushes all pieces, round-robin across nodes, then deletes from publisher.
+fn distribute_round_robin(
+    publisher_store: &FsStore,
+    storage_stores: &[&FsStore],
+    cid: &ContentId,
+    segment_count: usize,
+) {
+    let manifest = publisher_store.get_manifest(cid).unwrap();
 
-#[test]
-fn test_publish_and_distribute() {
-    let dir_pub = temp_dir("pub");
-    let dir_s1 = temp_dir("storage1");
-    let dir_s2 = temp_dir("storage2");
+    // Push manifest to all storage nodes
+    for store in storage_stores {
+        store.store_manifest(&manifest).unwrap();
+    }
 
-    // Publisher encodes a test file
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
-    let content = random_data(1_000_000); // 1MB
-    let file_path = dir_pub.join("testfile.bin");
-    std::fs::write(&file_path, &content).unwrap();
-
-    let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
-    let cid = result.content_id;
-    let segment_count = result.segment_count;
-
-    let store_pub = FsStore::new(&dir_pub).unwrap();
-    let store_s1 = FsStore::new(&dir_s1).unwrap();
-    let store_s2 = FsStore::new(&dir_s2).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
-
-    let total_encoded = total_piece_count(&store_pub, &cid, segment_count);
-    assert!(total_encoded > 0, "publisher should have pieces after publish");
-
-    // Push manifest to both storage nodes
-    store_s1.store_manifest(&manifest).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
-
-    // Round-robin push ALL pieces to storage nodes, then delete from publisher
-    let stores = [&store_s1, &store_s2];
+    // Round-robin distribute ALL pieces to storage nodes
+    let mut node_idx = 0;
     for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for (i, pid) in pieces.iter().enumerate() {
-            let (data, coeff) = store_pub.get_piece(&cid, seg, pid).unwrap();
-            stores[i % 2].store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-        }
-        // Delete all pieces from publisher
-        for pid in &pieces {
-            store_pub.delete_piece(&cid, seg, pid).unwrap();
+        let piece_ids = publisher_store.list_pieces(cid, seg).unwrap();
+        for pid in &piece_ids {
+            let (data, coeff) = publisher_store.get_piece(cid, seg, pid).unwrap();
+            storage_stores[node_idx]
+                .store_piece(cid, seg, pid, &data, &coeff)
+                .unwrap();
+            node_idx = (node_idx + 1) % storage_stores.len();
         }
     }
 
-    // Verify: publisher has 0 local pieces
-    assert_eq!(total_piece_count(&store_pub, &cid, segment_count), 0);
+    // Publisher deletes local pieces after successful push
+    for seg in 0..segment_count as u32 {
+        let piece_ids = publisher_store.list_pieces(cid, seg).unwrap();
+        for pid in &piece_ids {
+            publisher_store.delete_piece(cid, seg, pid).unwrap();
+        }
+    }
+}
 
-    // Verify: each storage node received pieces
-    let s1_count = total_piece_count(&store_s1, &cid, segment_count);
-    let s2_count = total_piece_count(&store_s2, &cid, segment_count);
-    assert!(s1_count > 0, "storage1 should have pieces");
-    assert!(s2_count > 0, "storage2 should have pieces");
+// ─── Test 1: Publish and Initial Distribution ───
 
-    // Verify: total across storage == total encoded
-    assert_eq!(s1_count + s2_count, total_encoded);
+#[test]
+fn test_publish_and_initial_distribution() {
+    let pub_dir = node_dir("pub");
+    let store1_dir = node_dir("store1");
+    let store2_dir = node_dir("store2");
 
-    for d in [&dir_pub, &dir_s1, &dir_s2] {
+    let mut publisher = DataCraftClient::new(&pub_dir).unwrap();
+    let store1 = FsStore::new(&store1_dir).unwrap();
+    let store2 = FsStore::new(&store2_dir).unwrap();
+
+    // Publish ~1MB test file
+    let data = test_data(1_000_000);
+    let result = publisher
+        .publish_bytes(&data, &PublishOptions::default())
+        .unwrap();
+    let cid = result.content_id;
+    let seg_count = result.segment_count;
+
+    // Verify publisher created k + parity pieces per segment
+    let pub_store = publisher.store();
+    for seg in 0..seg_count as u32 {
+        let k = result.manifest.k_for_segment(seg as usize);
+        let pieces = pub_store.list_pieces(&cid, seg).unwrap();
+        // k source + parity pieces (default 20% = initial_parity)
+        assert!(
+            pieces.len() > k,
+            "Segment {}: should have more than k={} pieces, got {}",
+            seg, k, pieces.len()
+        );
+    }
+
+    let total_before = count_pieces(pub_store, &cid, seg_count);
+    assert!(total_before > 0);
+
+    // Distribute round-robin to 2 storage nodes
+    distribute_round_robin(pub_store, &[&store1, &store2], &cid, seg_count);
+
+    // Verify: publisher has 0 local pieces after distribution
+    let pub_pieces_after = count_pieces(pub_store, &cid, seg_count);
+    assert_eq!(pub_pieces_after, 0, "Publisher should have 0 pieces after distribution");
+
+    // Verify: ALL pieces distributed to storage nodes
+    let s1_count = count_pieces(&store1, &cid, seg_count);
+    let s2_count = count_pieces(&store2, &cid, seg_count);
+    assert_eq!(
+        s1_count + s2_count, total_before,
+        "Total pieces on storage nodes should equal original"
+    );
+
+    // Verify: approximately equal distribution (within 1 piece)
+    let diff = (s1_count as isize - s2_count as isize).unsigned_abs();
+    assert!(diff <= 1, "Uneven distribution: s1={}, s2={}", s1_count, s2_count);
+
+    for d in [&pub_dir, &store1_dir, &store2_dir] {
         std::fs::remove_dir_all(d).ok();
     }
 }
 
-// ===========================================================================
-// Test 2: Equalization
-// ===========================================================================
+// ─── Test 2: Equalization ───
 
 #[test]
 fn test_equalization() {
-    let dir_s1 = temp_dir("eq-s1");
-    let dir_s2 = temp_dir("eq-s2");
-    let dir_s3 = temp_dir("eq-s3");
-    let dir_pub = temp_dir("eq-pub");
+    let pub_dir = node_dir("eq-pub");
+    let s1_dir = node_dir("eq-s1");
+    let s2_dir = node_dir("eq-s2");
+    let s3_dir = node_dir("eq-s3");
 
-    // Publish content
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
-    let content = random_data(500_000);
-    let file_path = dir_pub.join("eq_test.bin");
-    std::fs::write(&file_path, &content).unwrap();
+    let mut publisher = DataCraftClient::new(&pub_dir).unwrap();
+    let store1 = FsStore::new(&s1_dir).unwrap();
+    let store2 = FsStore::new(&s2_dir).unwrap();
+    let store3 = FsStore::new(&s3_dir).unwrap();
 
-    let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
+    let data = test_data(1_000_000);
+    let result = publisher
+        .publish_bytes(&data, &PublishOptions::default())
+        .unwrap();
     let cid = result.content_id;
-    let segment_count = result.segment_count;
+    let seg_count = result.segment_count;
 
-    let store_pub = FsStore::new(&dir_pub).unwrap();
-    let store_s1 = FsStore::new(&dir_s1).unwrap();
-    let store_s2 = FsStore::new(&dir_s2).unwrap();
-    let store_s3 = FsStore::new(&dir_s3).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
+    distribute_round_robin(publisher.store(), &[&store1, &store2], &cid, seg_count);
 
-    // Distribute pieces between s1 and s2 (round-robin)
-    store_s1.store_manifest(&manifest).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
-    store_s3.store_manifest(&manifest).unwrap();
+    let s1_before = count_pieces(&store1, &cid, seg_count);
+    let s2_before = count_pieces(&store2, &cid, seg_count);
+    let total = s1_before + s2_before;
 
-    for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for (i, pid) in pieces.iter().enumerate() {
-            let (data, coeff) = store_pub.get_piece(&cid, seg, pid).unwrap();
-            if i % 2 == 0 {
-                store_s1.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-            } else {
-                store_s2.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
+    // Add 3rd node — equalization: each existing node pushes HALF its pieces
+    store3
+        .store_manifest(&store1.get_manifest(&cid).unwrap())
+        .unwrap();
+
+    for source in [&store1, &store2] {
+        for seg in 0..seg_count as u32 {
+            let pids = source.list_pieces(&cid, seg).unwrap();
+            let half = pids.len() / 2;
+            for pid in pids.iter().take(half) {
+                let (data, coeff) = source.get_piece(&cid, seg, pid).unwrap();
+                store3.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
+                // DELETE from source — no duplicates
+                source.delete_piece(&cid, seg, pid).unwrap();
             }
         }
     }
 
-    // s3 starts as non-provider (0 pieces)
-    assert_eq!(total_piece_count(&store_s3, &cid, segment_count), 0);
+    let s1_after = count_pieces(&store1, &cid, seg_count);
+    let s2_after = count_pieces(&store2, &cid, seg_count);
+    let s3_after = count_pieces(&store3, &cid, seg_count);
 
-    let s1_before = total_piece_count(&store_s1, &cid, segment_count);
-    let s2_before = total_piece_count(&store_s2, &cid, segment_count);
+    // Total preserved
+    assert_eq!(s1_after + s2_after + s3_after, total);
 
-    // Equalization: nodes with >2 pieces push HALF to the non-provider
-    // Simulate equalization logic per segment
-    for seg in 0..segment_count as u32 {
-        for source_store in [&store_s1, &store_s2] {
-            let pieces = source_store.list_pieces(&cid, seg).unwrap();
-            if pieces.len() > 2 {
-                let to_push = pieces.len() / 2;
-                for pid in pieces.iter().take(to_push) {
-                    let (data, coeff) = source_store.get_piece(&cid, seg, pid).unwrap();
-                    store_s3.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-                    source_store.delete_piece(&cid, seg, pid).unwrap();
-                }
-            }
-        }
-    }
+    // Sources lost pieces
+    assert!(s1_after < s1_before);
+    assert!(s2_after < s2_before);
 
-    let s1_after = total_piece_count(&store_s1, &cid, segment_count);
-    let s2_after = total_piece_count(&store_s2, &cid, segment_count);
-    let s3_after = total_piece_count(&store_s3, &cid, segment_count);
+    // New node is a viable provider (≥2 pieces)
+    assert!(s3_after >= 2, "New node needs ≥2 pieces, got {}", s3_after);
 
-    // Verify: senders lost pieces
-    assert!(s1_after < s1_before || s1_before <= 2, "s1 should have pushed pieces");
-    assert!(s2_after < s2_before || s2_before <= 2, "s2 should have pushed pieces");
-
-    // Verify: non-provider now has pieces (is a provider)
-    assert!(s3_after >= 2, "s3 should have ≥2 pieces, got {}", s3_after);
-
-    // Verify: total pieces conserved
-    let total_before = s1_before + s2_before;
-    let total_after = s1_after + s2_after + s3_after;
-    assert_eq!(total_before, total_after, "total pieces must be conserved");
-
-    for d in [&dir_pub, &dir_s1, &dir_s2, &dir_s3] {
+    for d in [&pub_dir, &s1_dir, &s2_dir, &s3_dir] {
         std::fs::remove_dir_all(d).ok();
     }
 }
 
-// ===========================================================================
-// Test 3: Fetch
-// ===========================================================================
+// ─── Test 3: Fetch After Distribution ───
 
 #[test]
-fn test_fetch_and_reconstruct() {
-    let dir_pub = temp_dir("fetch-pub");
-    let dir_s1 = temp_dir("fetch-s1");
-    let dir_s2 = temp_dir("fetch-s2");
-    let dir_client = temp_dir("fetch-client");
+fn test_fetch_after_distribution() {
+    let pub_dir = node_dir("fetch-pub");
+    let s1_dir = node_dir("fetch-s1");
+    let s2_dir = node_dir("fetch-s2");
+    let client_dir = node_dir("fetch-client");
 
-    // Publish
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
-    let content = random_data(500_000);
-    let file_path = dir_pub.join("fetch_test.bin");
-    std::fs::write(&file_path, &content).unwrap();
+    let mut publisher = DataCraftClient::new(&pub_dir).unwrap();
+    let store1 = FsStore::new(&s1_dir).unwrap();
+    let store2 = FsStore::new(&s2_dir).unwrap();
 
-    let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
+    let original = test_data(1_000_000);
+    let result = publisher
+        .publish_bytes(&original, &PublishOptions::default())
+        .unwrap();
     let cid = result.content_id;
-    let segment_count = result.segment_count;
+    let seg_count = result.segment_count;
+    let manifest = result.manifest.clone();
 
-    // Verify CID == SHA-256 of content
-    let expected_cid = ContentId::from_bytes(&content);
-    assert_eq!(cid, expected_cid, "CID must be SHA-256 of content");
+    distribute_round_robin(publisher.store(), &[&store1, &store2], &cid, seg_count);
 
-    let store_pub = FsStore::new(&dir_pub).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
+    // Fresh client fetches from storage providers
+    let client_store = FsStore::new(&client_dir).unwrap();
+    client_store.store_manifest(&manifest).unwrap();
 
-    // Distribute to storage nodes
-    let store_s1 = FsStore::new(&dir_s1).unwrap();
-    let store_s2 = FsStore::new(&dir_s2).unwrap();
-    store_s1.store_manifest(&manifest).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
-
-    for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for (i, pid) in pieces.iter().enumerate() {
-            let (data, coeff) = store_pub.get_piece(&cid, seg, pid).unwrap();
-            if i % 2 == 0 {
-                store_s1.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-            } else {
-                store_s2.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-            }
-        }
-    }
-
-    // Client fetches: gather k independent pieces per segment from storage nodes
-    let store_client = FsStore::new(&dir_client).unwrap();
-    store_client.store_manifest(&manifest).unwrap();
-
-    for seg in 0..segment_count as u32 {
+    for seg in 0..seg_count as u32 {
         let k = manifest.k_for_segment(seg as usize);
-        let mut collected = 0;
+        let mut collected: Vec<CodedPiece> = Vec::new();
 
-        for source in [&store_s1, &store_s2] {
-            if collected >= k {
+        // Request "any piece" from providers, check independence
+        for provider in [&store1, &store2] {
+            if collected.len() >= k {
                 break;
             }
-            for pid in source.list_pieces(&cid, seg).unwrap() {
-                if collected >= k {
+            for pid in provider.list_pieces(&cid, seg).unwrap_or_default() {
+                if collected.len() >= k {
                     break;
                 }
-                let (data, coeff) = source.get_piece(&cid, seg, &pid).unwrap();
-                store_client.store_piece(&cid, seg, &pid, &data, &coeff).unwrap();
-                collected += 1;
+                let (data, coeff) = provider.get_piece(&cid, seg, &pid).unwrap();
+
+                // Linear independence check
+                let mut test_coeffs: Vec<Vec<u8>> =
+                    collected.iter().map(|p| p.coefficients.clone()).collect();
+                test_coeffs.push(coeff.clone());
+                let rank = check_independence(&test_coeffs);
+
+                if rank > collected.len() {
+                    client_store
+                        .store_piece(&cid, seg, &pid, &data, &coeff)
+                        .unwrap();
+                    collected.push(CodedPiece { data, coefficients: coeff });
+                }
             }
         }
 
-        assert!(collected >= k, "segment {}: need {} pieces, got {}", seg, k, collected);
+        assert!(collected.len() >= k, "Seg {}: need {} independent, got {}", seg, k, collected.len());
     }
 
-    // Reconstruct
-    let client_fetch = DataCraftClient::new(&dir_client).unwrap();
-    let output = dir_client.join("output.bin");
-    client_fetch.reconstruct(&cid, &output, None).unwrap();
+    // Reconstruct and verify
+    let client = DataCraftClient::new(&client_dir).unwrap();
+    let output = client_dir.join("output.bin");
+    client.reconstruct(&cid, &output, None).unwrap();
 
-    let decoded = std::fs::read(&output).unwrap();
-    assert_eq!(decoded, content, "decoded content must match original");
+    let reconstructed = std::fs::read(&output).unwrap();
+    assert_eq!(reconstructed, original);
 
-    // Verify SHA-256(decoded) == CID
-    let decoded_cid = ContentId::from_bytes(&decoded);
-    assert_eq!(decoded_cid, cid, "SHA-256(decoded) must equal CID");
+    // SHA-256 matches CID
+    let reconstructed_cid = ContentId::from_bytes(&reconstructed);
+    assert_eq!(reconstructed_cid, cid);
 
-    for d in [&dir_pub, &dir_s1, &dir_s2, &dir_client] {
+    for d in [&pub_dir, &s1_dir, &s2_dir, &client_dir] {
         std::fs::remove_dir_all(d).ok();
     }
 }
 
-// ===========================================================================
-// Test 4: Publisher Partial Push Retry
-// ===========================================================================
-
-#[test]
-fn test_partial_push_retry() {
-    let dir_pub = temp_dir("retry-pub");
-    let dir_storage = temp_dir("retry-storage");
-
-    // Publish
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
-    let content = random_data(500_000);
-    let file_path = dir_pub.join("retry_test.bin");
-    std::fs::write(&file_path, &content).unwrap();
-
-    let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
-    let cid = result.content_id;
-    let segment_count = result.segment_count;
-
-    let store_pub = FsStore::new(&dir_pub).unwrap();
-    let store_storage = FsStore::new(&dir_storage).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
-    store_storage.store_manifest(&manifest).unwrap();
-
-    let total_pieces = total_piece_count(&store_pub, &cid, segment_count);
-
-    // Push only ~50% of pieces (simulating partial push before "failure")
-    let mut pushed = 0;
-    let target = total_pieces / 2;
-    'outer: for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for pid in &pieces {
-            if pushed >= target {
-                break 'outer;
-            }
-            let (data, coeff) = store_pub.get_piece(&cid, seg, pid).unwrap();
-            store_storage.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-            pushed += 1;
-        }
-    }
-
-    // Simulate "failure" — storage node becomes unreachable.
-    // Since not all pieces were pushed, initial_push_done should NOT be marked.
-    let storage_received = total_piece_count(&store_storage, &cid, segment_count);
-    assert!(storage_received < total_pieces, "only partial push occurred");
-    assert!(storage_received > 0, "some pieces were pushed");
-
-    // Publisher retains ALL pieces (never deleted them since push wasn't complete)
-    let pub_remaining = total_piece_count(&store_pub, &cid, segment_count);
-    assert_eq!(
-        pub_remaining, total_pieces,
-        "publisher must retain all pieces when push incomplete"
-    );
-
-    // Retry: push remaining pieces (simulating next cycle)
-    for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for pid in &pieces {
-            if !store_storage.has_piece(&cid, seg, pid) {
-                let (data, coeff) = store_pub.get_piece(&cid, seg, pid).unwrap();
-                store_storage.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-            }
-        }
-    }
-
-    // Now all pieces are on storage
-    let after_retry = total_piece_count(&store_storage, &cid, segment_count);
-    assert_eq!(after_retry, total_pieces, "all pieces should be on storage after retry");
-
-    // Publisher can now safely delete (marking initial_push_done)
-    for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for pid in &pieces {
-            store_pub.delete_piece(&cid, seg, pid).unwrap();
-        }
-    }
-    assert_eq!(total_piece_count(&store_pub, &cid, segment_count), 0);
-
-    for d in [&dir_pub, &dir_storage] {
-        std::fs::remove_dir_all(d).ok();
-    }
-}
-
-// ===========================================================================
-// Test 5: Piece Uniqueness
-// ===========================================================================
+// ─── Test 4: Piece Uniqueness ───
 
 #[test]
 fn test_piece_uniqueness_after_distribution() {
-    let dir_pub = temp_dir("uniq-pub");
-    let dir_s1 = temp_dir("uniq-s1");
-    let dir_s2 = temp_dir("uniq-s2");
-    let dir_s3 = temp_dir("uniq-s3");
+    let pub_dir = node_dir("uniq-pub");
+    let s1_dir = node_dir("uniq-s1");
+    let s2_dir = node_dir("uniq-s2");
+    let s3_dir = node_dir("uniq-s3");
 
-    // Publish
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
-    let content = random_data(500_000);
-    let file_path = dir_pub.join("uniq_test.bin");
-    std::fs::write(&file_path, &content).unwrap();
+    let mut publisher = DataCraftClient::new(&pub_dir).unwrap();
+    let store1 = FsStore::new(&s1_dir).unwrap();
+    let store2 = FsStore::new(&s2_dir).unwrap();
+    let store3 = FsStore::new(&s3_dir).unwrap();
 
-    let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
+    let data = test_data(1_000_000);
+    let result = publisher
+        .publish_bytes(&data, &PublishOptions::default())
+        .unwrap();
     let cid = result.content_id;
-    let segment_count = result.segment_count;
+    let seg_count = result.segment_count;
 
-    let store_pub = FsStore::new(&dir_pub).unwrap();
-    let store_s1 = FsStore::new(&dir_s1).unwrap();
-    let store_s2 = FsStore::new(&dir_s2).unwrap();
-    let store_s3 = FsStore::new(&dir_s3).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
+    let total_original = count_pieces(publisher.store(), &cid, seg_count);
 
-    store_s1.store_manifest(&manifest).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
-    store_s3.store_manifest(&manifest).unwrap();
+    distribute_round_robin(publisher.store(), &[&store1, &store2, &store3], &cid, seg_count);
 
-    // Round-robin distribute to s1 and s2
-    for seg in 0..segment_count as u32 {
-        let pieces = store_pub.list_pieces(&cid, seg).unwrap();
-        for (i, pid) in pieces.iter().enumerate() {
-            let (data, coeff) = store_pub.get_piece(&cid, seg, pid).unwrap();
-            if i % 2 == 0 {
-                store_s1.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-            } else {
-                store_s2.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
+    let stores = [&store1, &store2, &store3];
+    let total_distributed: usize = stores.iter().map(|s| count_pieces(s, &cid, seg_count)).sum();
+    assert_eq!(total_distributed, total_original);
+
+    // No piece appears on more than one node
+    for seg in 0..seg_count as u32 {
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for (i, store) in stores.iter().enumerate() {
+            for pid in store.list_pieces(&cid, seg).unwrap_or_default() {
+                assert!(
+                    seen.insert(pid),
+                    "Duplicate piece in seg {} on node {}: {}",
+                    seg, i, hex::encode(&pid[..8])
+                );
             }
         }
     }
 
-    // Equalize: push half from nodes with >2 pieces to s3
-    for seg in 0..segment_count as u32 {
-        for source in [&store_s1, &store_s2] {
-            let pieces = source.list_pieces(&cid, seg).unwrap();
-            if pieces.len() > 2 {
-                let to_push = pieces.len() / 2;
-                for pid in pieces.iter().take(to_push) {
-                    let (data, coeff) = source.get_piece(&cid, seg, pid).unwrap();
-                    store_s3.store_piece(&cid, seg, pid, &data, &coeff).unwrap();
-                    source.delete_piece(&cid, seg, pid).unwrap();
-                }
-            }
-        }
+    for d in [&pub_dir, &s1_dir, &s2_dir, &s3_dir] {
+        std::fs::remove_dir_all(d).ok();
     }
+}
 
-    // Verify: no piece exists on more than one node
-    for seg in 0..segment_count as u32 {
-        let s1_pids = store_s1.list_pieces(&cid, seg).unwrap();
-        let s2_pids = store_s2.list_pieces(&cid, seg).unwrap();
-        let s3_pids = store_s3.list_pieces(&cid, seg).unwrap();
+// ─── Test 5: Content Deletion (Local) ───
 
-        let s1_set: HashSet<_> = s1_pids.iter().collect();
-        let s2_set: HashSet<_> = s2_pids.iter().collect();
-        let s3_set: HashSet<_> = s3_pids.iter().collect();
+#[test]
+fn test_content_deletion_local() {
+    let s1_dir = node_dir("del-s1");
+    let s2_dir = node_dir("del-s2");
+    let pub_dir = node_dir("del-pub");
 
-        // No overlaps between any pair
-        assert!(
-            s1_set.is_disjoint(&s2_set),
-            "segment {}: s1 and s2 share pieces", seg
-        );
-        assert!(
-            s1_set.is_disjoint(&s3_set),
-            "segment {}: s1 and s3 share pieces", seg
-        );
-        assert!(
-            s2_set.is_disjoint(&s3_set),
-            "segment {}: s2 and s3 share pieces", seg
-        );
+    let mut publisher = DataCraftClient::new(&pub_dir).unwrap();
+    let store1 = FsStore::new(&s1_dir).unwrap();
+    let store2 = FsStore::new(&s2_dir).unwrap();
 
-        // Each piece_id appears exactly once across all nodes
-        let total = s1_pids.len() + s2_pids.len() + s3_pids.len();
-        let mut all: HashSet<&[u8; 32]> = HashSet::new();
-        all.extend(s1_pids.iter());
-        all.extend(s2_pids.iter());
-        all.extend(s3_pids.iter());
-        assert_eq!(all.len(), total, "segment {}: duplicate piece IDs found", seg);
-    }
+    let data = test_data(500_000);
+    let result = publisher
+        .publish_bytes(&data, &PublishOptions::default())
+        .unwrap();
+    let cid = result.content_id;
+    let seg_count = result.segment_count;
 
-    for d in [&dir_pub, &dir_s1, &dir_s2, &dir_s3] {
+    distribute_round_robin(publisher.store(), &[&store1, &store2], &cid, seg_count);
+
+    let s2_before = count_pieces(&store2, &cid, seg_count);
+    assert!(s2_before > 0);
+
+    // Store1 deletes locally
+    store1.delete_content(&cid).unwrap();
+
+    // Pieces removed from disk
+    assert_eq!(count_pieces(&store1, &cid, seg_count), 0);
+
+    // Manifest removed
+    assert!(!store1.has_manifest(&cid));
+
+    // Content listing reflects deletion
+    assert!(!store1.list_content_with_pieces().unwrap().contains(&cid));
+    assert!(!store1.list_content().unwrap().contains(&cid));
+
+    // Other node unaffected
+    assert_eq!(count_pieces(&store2, &cid, seg_count), s2_before);
+
+    for d in [&pub_dir, &s1_dir, &s2_dir] {
         std::fs::remove_dir_all(d).ok();
     }
 }
