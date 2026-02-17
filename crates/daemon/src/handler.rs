@@ -329,6 +329,8 @@ impl DataCraftHandler {
             // Step 1: Try to get manifest locally (storage nodes have it from manifest push)
             let local_manifest = {
                 let client = self.client.lock().await;
+                let manifest_path = client.store().data_dir().join("manifests").join(format!("{}.json", cid.to_hex()));
+                info!("[handler.rs] Checking manifest at {:?} (exists={})", manifest_path, manifest_path.exists());
                 client.store().get_manifest(&cid).ok()
             };
 
@@ -380,8 +382,29 @@ impl DataCraftHandler {
                     info!("[handler.rs] Fetching {} from {} total providers", cid, providers.len());
                     match self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                         Ok(()) => {
-                            info!("[handler.rs] Successfully fetched pieces via P2P");
-                            p2p_fetched = true;
+                            // Verify we actually have enough pieces for all segments
+                            let all_segments_complete = {
+                                let client = self.client.lock().await;
+                                (0..manifest.segment_count as u32).all(|seg_idx| {
+                                    let k = manifest.k_for_segment(seg_idx as usize);
+                                    let piece_ids = client.store().list_pieces(&cid, seg_idx).unwrap_or_default();
+                                    let coeffs: Vec<Vec<u8>> = piece_ids.iter()
+                                        .filter_map(|pid| client.store().get_piece(&cid, seg_idx, pid).ok())
+                                        .map(|(_data, coeff)| coeff)
+                                        .collect();
+                                    let rank = if coeffs.is_empty() { 0 } else { craftec_erasure::check_independence(&coeffs) };
+                                    if rank < k {
+                                        info!("[handler.rs] Post-fetch check: segment {} still needs pieces (rank {}/{})", seg_idx, rank, k);
+                                    }
+                                    rank >= k
+                                })
+                            };
+                            if all_segments_complete {
+                                info!("[handler.rs] Successfully fetched all pieces via P2P");
+                                p2p_fetched = true;
+                            } else {
+                                info!("[handler.rs] P2P fetch returned Ok but not all segments complete, falling through to DHT");
+                            }
                         }
                         Err(e) => {
                             info!("[handler.rs] P2P fetch failed: {}", e);
@@ -416,9 +439,17 @@ impl DataCraftHandler {
                             if command_tx.send(command).is_ok() {
                                 match manifest_rx.await {
                                     Ok(Ok(manifest)) => {
-                                        debug!("Retrieved manifest for {} from DHT", cid);
+                                        info!("[handler.rs] Retrieved manifest for {} from DHT", cid);
+                                        // Bug 2 fix: store manifest locally so reconstruct() can find it
+                                        {
+                                            let client = self.client.lock().await;
+                                            match client.store().store_manifest(&manifest) {
+                                                Ok(()) => info!("[handler.rs] Stored DHT manifest locally for {}", cid),
+                                                Err(e) => warn!("[handler.rs] Failed to store DHT manifest locally: {}", e),
+                                            }
+                                        }
                                         if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
-                                            debug!("DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
+                                            info!("[handler.rs] DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
                                         } else {
                                             info!("[handler.rs] Successfully fetched pieces via DHT P2P path");
                                         }
@@ -729,17 +760,26 @@ impl DataCraftHandler {
             providers.to_vec()
         };
 
-        // For each segment, collect existing coefficient vectors and fetch missing pieces in parallel
+        // Fetch all segments in parallel (Bug 3 fix: was sequential, seg0 consumed all time)
+        let mut segment_join_set: JoinSet<Result<(), String>> = JoinSet::new();
+
         for seg_idx in 0..manifest.segment_count as u32 {
             let k = manifest.k_for_segment(seg_idx as usize);
+            let client = self.client.clone();
+            let peer_scorer = self.peer_scorer.clone();
+            let merkle_tree = self.merkle_tree.clone();
+            let command_tx = command_tx.clone();
+            let cid = *content_id;
+            let ranked_providers = ranked_providers.clone();
 
+            segment_join_set.spawn(async move {
             // Load existing pieces' piece IDs and coefficient vectors for independence checking
             let (local_piece_ids, mut coeff_matrix) = {
-                let client = self.client.lock().await;
-                let piece_ids = client.store().list_pieces(content_id, seg_idx).unwrap_or_default();
+                let client = client.lock().await;
+                let piece_ids = client.store().list_pieces(&cid, seg_idx).unwrap_or_default();
                 let mut coeffs = Vec::with_capacity(piece_ids.len());
                 for pid in &piece_ids {
-                    if let Ok((_data, coeff)) = client.store().get_piece(content_id, seg_idx, pid) {
+                    if let Ok((_data, coeff)) = client.store().get_piece(&cid, seg_idx, pid) {
                         coeffs.push(coeff);
                     }
                 }
@@ -754,7 +794,7 @@ impl DataCraftHandler {
             };
 
             if current_rank >= k {
-                continue; // Already have k independent pieces
+                return Ok(()); // Already have k independent pieces
             }
 
             let needed = k - current_rank;
@@ -781,7 +821,6 @@ impl DataCraftHandler {
             for _ in 0..concurrency {
                 let provider = provider_iter.next().unwrap();
                 let cmd_tx = command_tx.clone();
-                let cid = *content_id;
                 let have_piece_ids = have_piece_ids.clone();
                 info!("[handler.rs] Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
                 join_set.spawn(async move {
@@ -827,7 +866,7 @@ impl DataCraftHandler {
 
                 match piece_result {
                     Ok(batch) => {
-                        info!("[handler.rs] Got {} pieces from {}", batch.len(), provider);
+                        info!("[handler.rs] Got {} pieces from {} for seg{}", batch.len(), provider, seg_idx);
                         let mut any_stored = false;
                         for (coefficients, piece_data) in batch {
                             // Check linear independence before storing
@@ -840,20 +879,20 @@ impl DataCraftHandler {
                                 let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
 
                                 let stored = {
-                                    let client = self.client.lock().await;
-                                    client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients)
+                                    let client_guard = client.lock().await;
+                                    client_guard.store().store_piece(&cid, seg_idx, &piece_id, &piece_data, &coefficients)
                                 };
 
                                 match stored {
                                     Ok(()) => {
-                                        if let Some(ref mt) = self.merkle_tree {
-                                            mt.lock().await.insert(content_id, seg_idx, &piece_id);
+                                        if let Some(ref mt) = merkle_tree {
+                                            mt.lock().await.insert(&cid, seg_idx, &piece_id);
                                         }
                                         coeff_matrix.push(coefficients);
                                         current_rank = new_rank;
                                         total_fetched += 1;
                                         any_stored = true;
-                                        info!("[handler.rs] Stored piece from {}: rank now {}/{}", provider, current_rank, k);
+                                        info!("[handler.rs] Stored piece from {} for seg{}: rank now {}/{}", provider, seg_idx, current_rank, k);
 
                                         if current_rank >= k {
                                             info!("[handler.rs] Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
@@ -861,13 +900,13 @@ impl DataCraftHandler {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("[handler.rs] Failed to store piece: {}", e);
+                                        warn!("[handler.rs] Failed to store piece for seg{}: {}", seg_idx, e);
                                     }
                                 }
                             }
                         }
                         if any_stored {
-                            if let Some(ref scorer) = self.peer_scorer {
+                            if let Some(ref scorer) = peer_scorer {
                                 scorer.lock().await.record_success(&provider, latency);
                             }
                         }
@@ -876,10 +915,10 @@ impl DataCraftHandler {
                         }
                     }
                     Err(ref e) => {
-                        info!("[handler.rs] Failed to get piece from {}: {}", provider, e);
+                        info!("[handler.rs] Failed to get piece from {} for seg{}: {}", provider, seg_idx, e);
                         let failures = provider_failures.entry(provider).or_insert(0);
                         *failures += 1;
-                        if let Some(ref scorer) = self.peer_scorer {
+                        if let Some(ref scorer) = peer_scorer {
                             scorer.lock().await.record_failure(&provider);
                         }
                     }
@@ -894,7 +933,6 @@ impl DataCraftHandler {
                         let fail_count = provider_failures.get(&next_provider).copied().unwrap_or(0);
                         if fail_count < 3 {
                             let cmd_tx = command_tx.clone();
-                            let cid = *content_id;
                             join_set.spawn(async move {
                                 let start = std::time::Instant::now();
                                 let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
@@ -936,14 +974,31 @@ impl DataCraftHandler {
 
             if current_rank < k {
                 warn!(
-                    "Segment {} incomplete: got {}/{} independent pieces after {} requests",
+                    "[handler.rs] Segment {} incomplete: got {}/{} independent pieces after {} requests",
                     seg_idx, current_rank, k, requests_launched
                 );
                 return Err(format!("Segment {} incomplete: {}/{}", seg_idx, current_rank, k));
             }
+            let _ = total_fetched;
+            Ok(())
+            }); // end segment_join_set.spawn
         }
 
-        Ok(())
+        // Collect results from all segments
+        let mut errors = Vec::new();
+        while let Some(result) = segment_join_set.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => errors.push(e),
+                Err(e) => errors.push(format!("segment task panicked: {}", e)),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     // -- Access control IPC handlers --
