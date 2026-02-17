@@ -459,10 +459,11 @@ pub struct CapabilityAnnouncement {
     /// Root hash of the node's storage Merkle tree (all held pieces).
     #[serde(default)]
     pub storage_root: [u8; 32],
-    /// Per-CID piece counts (CID hex → number of pieces held).
-    /// Peers with ≥2 pieces for a CID are real providers.
+    /// Per-CID per-segment piece counts (CID hex → vec of piece counts per segment).
+    /// Index = segment index, value = number of pieces held for that segment.
+    /// Peers with ≥2 total pieces for a CID are real providers.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub piece_counts: std::collections::HashMap<String, usize>,
+    pub piece_counts: std::collections::HashMap<String, Vec<usize>>,
 }
 
 impl CapabilityAnnouncement {
@@ -483,9 +484,11 @@ impl CapabilityAnnouncement {
         // Include piece counts in signature (sorted for determinism)
         let mut sorted_counts: Vec<_> = self.piece_counts.iter().collect();
         sorted_counts.sort_by_key(|(k, _)| k.clone());
-        for (cid_hex, count) in &sorted_counts {
+        for (cid_hex, seg_counts) in &sorted_counts {
             data.extend_from_slice(cid_hex.as_bytes());
-            data.extend_from_slice(&count.to_le_bytes());
+            for count in *seg_counts {
+                data.extend_from_slice(&count.to_le_bytes());
+            }
         }
         data
     }

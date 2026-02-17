@@ -827,10 +827,15 @@ async fn drive_swarm(
                         let sr = merkle_tree.lock().await.root();
                         let pc = {
                             let t = content_tracker.lock().await;
+                            let c = client.lock().await;
                             let mut counts = std::collections::HashMap::new();
                             for state in t.list() {
                                 if state.local_pieces > 0 {
-                                    counts.insert(state.content_id.to_hex(), state.local_pieces);
+                                    let mut seg_counts = Vec::new();
+                                    for seg in 0..state.segment_count as u32 {
+                                        seg_counts.push(c.store().list_pieces(&state.content_id, seg).unwrap_or_default().len());
+                                    }
+                                    counts.insert(state.content_id.to_hex(), seg_counts);
                                 }
                             }
                             counts
@@ -856,10 +861,15 @@ async fn drive_swarm(
                             let sr = delayed_merkle.lock().await.root();
                             let pc = {
                                 let t = delayed_ct.lock().await;
+                                let c = delayed_client.lock().await;
                                 let mut counts = std::collections::HashMap::new();
                                 for state in t.list() {
                                     if state.local_pieces > 0 {
-                                        counts.insert(state.content_id.to_hex(), state.local_pieces);
+                                        let mut seg_counts = Vec::new();
+                                        for seg in 0..state.segment_count as u32 {
+                                            seg_counts.push(c.store().list_pieces(&state.content_id, seg).unwrap_or_default().len());
+                                        }
+                                        counts.insert(state.content_id.to_hex(), seg_counts);
                                     }
                                 }
                                 counts
@@ -1843,12 +1853,18 @@ async fn announce_capabilities_periodically(
         let used = client.lock().await.store().disk_usage().unwrap_or(0);
         let storage_root = merkle_tree.lock().await.root();
         // Build piece counts from content tracker
-        let piece_counts = {
+        let piece_counts: std::collections::HashMap<String, Vec<usize>> = {
             let t = content_tracker.lock().await;
+            let c = client.lock().await;
             let mut counts = std::collections::HashMap::new();
             for state in t.list() {
                 if state.local_pieces > 0 {
-                    counts.insert(state.content_id.to_hex(), state.local_pieces);
+                    let mut seg_counts = Vec::new();
+                    for seg in 0..state.segment_count as u32 {
+                        let n = c.store().list_pieces(&state.content_id, seg).unwrap_or_default().len();
+                        seg_counts.push(n);
+                    }
+                    counts.insert(state.content_id.to_hex(), seg_counts);
                 }
             }
             counts

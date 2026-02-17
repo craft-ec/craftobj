@@ -61,7 +61,7 @@ pub struct PeerScore {
     /// Geographic region from capability announcement (e.g. "us-east", "eu-west").
     pub region: Option<String>,
     /// Per-CID piece counts from capability announcement (CID hex → count).
-    pub piece_counts: std::collections::HashMap<String, usize>,
+    pub piece_counts: std::collections::HashMap<String, Vec<usize>>,
     /// Root hash of the node's storage Merkle tree.
     pub storage_root: [u8; 32],
 
@@ -302,7 +302,7 @@ impl PeerScorer {
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
         region: Option<String>,
-        piece_counts: std::collections::HashMap<String, usize>,
+        piece_counts: std::collections::HashMap<String, Vec<usize>>,
     ) {
         self.update_capabilities_full(peer, capabilities, _timestamp, storage_committed_bytes, storage_used_bytes, region, piece_counts, [0u8; 32]);
     }
@@ -316,7 +316,7 @@ impl PeerScorer {
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
         region: Option<String>,
-        piece_counts: std::collections::HashMap<String, usize>,
+        piece_counts: std::collections::HashMap<String, Vec<usize>>,
         storage_root: [u8; 32],
     ) {
         let now = Instant::now();
