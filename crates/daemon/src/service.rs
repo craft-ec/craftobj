@@ -809,14 +809,7 @@ async fn drive_swarm(
                         // Clear reconnector state on successful connection
                         peer_reconnector.on_reconnected(&peer_id);
                         stream_manager.clear_open_cooldown(&peer_id);
-                        // Duplicate connection: our outbound may be on the connection libp2p
-                        // is about to close. Force re-open to land on the surviving one.
-                        if num_established.get() > 1 {
-                            info!("[service.rs] Duplicate connection to {} (num_established={}), forcing outbound stream re-open", peer_id, num_established);
-                            stream_manager.force_reopen_outbound(&peer_id);
-                        } else {
-                            stream_manager.ensure_opening(peer_id);
-                        }
+                        stream_manager.ensure_opening(peer_id);
                         // Track for heartbeat
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
@@ -879,7 +872,11 @@ async fn drive_swarm(
                         let remaining = swarm.connected_peers().count();
                         info!("[service.rs] ConnectionClosed for {} (num_established={}, {} peers remaining)", peer_id, num_established, remaining);
                         if num_established > 0 {
-                            info!("[service.rs] Still have {} connections to {} — keeping streams alive", num_established, peer_id);
+                            // A connection closed but we still have others. Our outbound stream
+                            // may have been on the closed connection. Force re-open to land on
+                            // a surviving connection.
+                            info!("[service.rs] ConnectionClosed but {} remaining for {} — forcing outbound stream re-open", num_established, peer_id);
+                            stream_manager.force_reopen_outbound(&peer_id);
                             continue;
                         }
                         info!("[service.rs] Fully disconnected from {} — cleaning up", peer_id);
