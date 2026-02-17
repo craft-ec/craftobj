@@ -14,10 +14,14 @@ pub mod content_tracker;
 pub mod events;
 pub mod eviction;
 
+pub mod disk_monitor;
+
 pub mod commands;
+pub mod errors;
 pub mod handler;
 pub mod health;
 pub mod pdp;
+pub mod peer_reconnect;
 pub mod peer_scorer;
 pub mod protocol;
 pub mod reannounce;

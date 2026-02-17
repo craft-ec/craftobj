@@ -80,6 +80,23 @@ pub enum DaemonEvent {
     ContentRetired { content_id: String, reason: String },
     GcCompleted { deleted_count: u64, deleted_bytes: u64 },
 
+    // -- Content Health --
+    ContentDegraded { content_id: String, health: f64, providers: usize },
+    ContentCritical { content_id: String, health: f64, providers: usize },
+
+    // -- Disk Space --
+    DiskSpaceWarning { used_bytes: u64, total_bytes: u64, percent: f64 },
+
+    // -- Peer lifecycle --
+    PeerGoingOffline { peer_id: String },
+    PeerHeartbeatTimeout { peer_id: String },
+
+    // -- Transfer errors --
+    TransferError { content_id: String, peer_id: String, error_type: String, message: String },
+
+    // -- Storage pressure --
+    StoragePressure { available_bytes: u64, threshold_bytes: u64 },
+
     // -- Aggregation --
     AggregationComplete { receipt_count: usize, merkle_root: String },
 }

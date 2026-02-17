@@ -45,6 +45,11 @@ impl FsStore {
         Ok(Self { data_dir })
     }
 
+    /// Return the base data directory path.
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// Store a coded piece (data + coefficient vector) on disk.
     ///
     /// `piece_id` is SHA-256 of the coefficient vector.
@@ -277,6 +282,52 @@ impl FsStore {
         }
         debug!("Deleted content {}", content_id);
         Ok(())
+    }
+
+    /// Verify integrity of all stored pieces.
+    ///
+    /// Scans every piece, recomputes `piece_id = SHA-256(coefficients)`,
+    /// and removes pieces where the stored ID doesn't match.
+    /// Returns the number of corrupted pieces removed.
+    pub fn verify_integrity(&self) -> Result<usize> {
+        let mut removed = 0;
+        let content_ids = self.list_content_with_pieces()?;
+        for cid in &content_ids {
+            let segments = self.list_segments(cid)?;
+            for seg in segments {
+                let pieces = self.list_pieces(cid, seg)?;
+                for pid in pieces {
+                    match self.get_piece(cid, seg, &pid) {
+                        Ok((_data, coefficients)) => {
+                            let expected_id = piece_id_from_coefficients(&coefficients);
+                            if expected_id != pid {
+                                warn!(
+                                    "Corrupted piece {}/{}/{}: expected {}, removing",
+                                    cid, seg, hex::encode(&pid[..8]), hex::encode(&expected_id[..8])
+                                );
+                                let dir = self.piece_dir(cid, seg);
+                                let id_hex = hex::encode(pid);
+                                let _ = std::fs::remove_file(dir.join(format!("{id_hex}.data")));
+                                let _ = std::fs::remove_file(dir.join(format!("{id_hex}.coeff")));
+                                removed += 1;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to read piece {}/{}/{}: {}, removing", cid, seg, hex::encode(&pid[..8]), e);
+                            let dir = self.piece_dir(cid, seg);
+                            let id_hex = hex::encode(pid);
+                            let _ = std::fs::remove_file(dir.join(format!("{id_hex}.data")));
+                            let _ = std::fs::remove_file(dir.join(format!("{id_hex}.coeff")));
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            warn!("Integrity check: removed {} corrupted pieces", removed);
+        }
+        Ok(removed)
     }
 
     /// Returns the base data directory.

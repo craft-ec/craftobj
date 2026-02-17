@@ -186,7 +186,7 @@ pub async fn run_initial_push(
     }
 
     let ranked_peers = {
-        let scorer = peer_scorer.lock().await;
+        let mut scorer = peer_scorer.lock().await;
         scorer.rank_peers(&storage_peers)
     };
 
@@ -334,6 +334,17 @@ pub async fn run_initial_push(
         let mut t = tracker.lock().await;
         t.mark_initial_push_done(content_id);
         t.update_piece_progress(content_id, total_pushed);
+    }
+
+    // Publisher is a client, not a storage node. Delete local pieces after distribution.
+    // The publisher only needs the CID to fetch content back from the network.
+    if total_pushed > 0 {
+        let c = client.lock().await;
+        if let Err(e) = c.store().delete_content(content_id) {
+            warn!("Failed to clean up publisher pieces for {}: {}", content_id, e);
+        } else {
+            info!("Publisher cleanup: deleted local pieces for {} after distributing {} pieces", content_id, total_pushed);
+        }
     }
 }
 
