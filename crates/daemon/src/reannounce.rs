@@ -181,18 +181,26 @@ pub async fn run_initial_push(
     peer_scorer: &Arc<Mutex<PeerScorer>>,
     event_tx: &EventSender,
 ) {
+    info!("[reannounce.rs] run_initial_push: starting for {}", content_id);
     let storage_peers: Vec<libp2p::PeerId> = {
         let scorer = peer_scorer.lock().await;
-        scorer
-            .iter()
+        let all_peers: Vec<_> = scorer.iter().collect();
+        info!("[reannounce.rs] run_initial_push: peer_scorer has {} peers total", all_peers.len());
+        for (pid, score) in &all_peers {
+            info!("[reannounce.rs] run_initial_push: peer {} caps={:?}", pid, score.capabilities);
+        }
+        all_peers
+            .into_iter()
             .filter(|(_, score)| score.capabilities.contains(&DataCraftCapability::Storage))
             .map(|(peer_id, _)| *peer_id)
             .collect()
     };
 
+    info!("[reannounce.rs] run_initial_push: found {} storage peers for {}", storage_peers.len(), content_id);
+
     if storage_peers.is_empty() {
-        info!("[reannounce.rs] Initial push for {}: no storage peers available, will retry next cycle", content_id);
-        return; // Don't mark as done — needs_distribution() will still return it
+        info!("[reannounce.rs] run_initial_push: no storage peers available, will retry next cycle for {}", content_id);
+        return;
     }
 
     let ranked_peers = {

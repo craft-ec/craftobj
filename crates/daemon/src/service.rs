@@ -943,13 +943,17 @@ async fn drive_swarm(
                             let ps = peer_scorer.clone();
                             tokio::spawn(async move {
                                 // Short delay to let gossipsub capability announcements arrive first
+                                info!("[service.rs] TriggerDistribution: sleeping 5s for capability announcements");
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 let needs_push = {
                                     let t = ct.lock().await;
                                     t.needs_distribution()
                                 };
+                                info!("[service.rs] TriggerDistribution: {} CIDs need distribution", needs_push.len());
                                 for cid in needs_push {
+                                    info!("[service.rs] TriggerDistribution: running initial push for {}", cid);
                                     crate::reannounce::run_initial_push(&cid, &ct, &ctx, &cl, &ps, &etx).await;
+                                    info!("[service.rs] TriggerDistribution: initial push done for {}", cid);
                                 }
                             });
                         }
