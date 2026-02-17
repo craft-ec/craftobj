@@ -353,26 +353,46 @@ impl DataCraftHandler {
                     }
                 }
 
+                info!("[handler.rs] Found {} providers for {} via peer scorer", providers.len(), cid);
+
+                // Also resolve DHT providers and merge
+                {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let command = DataCraftCommand::ResolveProviders {
+                        content_id: cid,
+                        reply_tx,
+                    };
+                    if command_tx.send(command).is_ok() {
+                        if let Ok(Ok(dht_providers)) = reply_rx.await {
+                            for p in dht_providers {
+                                if self.local_peer_id.as_ref() != Some(&p) && !providers.contains(&p) {
+                                    info!("[handler.rs] Adding DHT provider {} for {}", p, cid);
+                                    providers.push(p);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if !providers.is_empty() {
-                    info!("[handler.rs] Found {} remote providers for {} via peer scorer", providers.len(), cid);
-                    // Step 3: Fetch missing pieces from these providers
+                    info!("[handler.rs] Fetching {} from {} total providers", cid, providers.len());
                     match self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                         Ok(()) => {
-                            info!("[handler.rs] Successfully fetched pieces via local-first P2P path");
+                            info!("[handler.rs] Successfully fetched pieces via P2P");
                             p2p_fetched = true;
                         }
                         Err(e) => {
-                            info!("[handler.rs] Local-first P2P fetch failed: {}, trying DHT fallback", e);
+                            info!("[handler.rs] P2P fetch failed: {}", e);
                         }
                     }
                 } else {
-                    info!("[handler.rs] No local providers found for {} in peer scorer", cid);
+                    info!("[handler.rs] No providers found for {}", cid);
                 }
             }
 
-            // DHT fallback: try DHT resolution if local-first path didn't succeed
+            // DHT fallback: try DHT resolution if first attempt didn't succeed
             if !p2p_fetched {
-                info!("[handler.rs] Attempting DHT resolution for {}", cid);
+                info!("[handler.rs] Attempting DHT-only resolution for {}", cid);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let command = DataCraftCommand::ResolveProviders {
@@ -917,6 +937,7 @@ impl DataCraftHandler {
                     "Segment {} incomplete: got {}/{} independent pieces after {} requests",
                     seg_idx, current_rank, k, requests_launched
                 );
+                return Err(format!("Segment {} incomplete: {}/{}", seg_idx, current_rank, k));
             }
         }
 
