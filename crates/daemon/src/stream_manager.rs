@@ -425,6 +425,7 @@ impl StreamManager {
             let wf_tx = write_fail_tx.clone();
             let retry_tx = write_retry_tx.clone();
             let reg = registry.clone();
+            let ack_reg = ack_registry.clone();
             tokio::spawn(async move {
                 if poisoned.load(Ordering::Relaxed) { return; }
                 let mut w = writer.lock().await;
@@ -433,8 +434,12 @@ impl StreamManager {
                     poisoned.store(true, Ordering::Relaxed);
                     drop(w);
                     reg.write().unwrap().remove(&peer);
+                    // Recover ack_tx from registry so it can be retried
+                    let recovered_ack = ack_reg.read().unwrap()
+                        .get(&peer)
+                        .and_then(|acks| acks.lock().unwrap().remove(&seq_id));
                     let _ = wf_tx.send(peer);
-                    let _ = retry_tx.send(OutboundMessage { peer, request, ack_tx: None });
+                    let _ = retry_tx.send(OutboundMessage { peer, request, ack_tx: recovered_ack });
                 }
             });
         } else {
@@ -474,6 +479,7 @@ impl StreamManager {
                 let wf_tx = write_fail_tx.clone();
                 let retry_tx = write_retry_tx.clone();
                 let reg = registry.clone();
+                let ack_reg = ack_registry.clone();
                 tokio::spawn(async move {
                     if poisoned.load(Ordering::Relaxed) { return; }
                     let mut w = writer.lock().await;
@@ -482,8 +488,12 @@ impl StreamManager {
                         poisoned.store(true, Ordering::Relaxed);
                         drop(w);
                         reg.write().unwrap().remove(&peer);
+                        // Recover ack_tx from registry so it can be retried
+                        let recovered_ack = ack_reg.read().unwrap()
+                            .get(&peer)
+                            .and_then(|acks| acks.lock().unwrap().remove(&seq_id));
                         let _ = wf_tx.send(peer);
-                        let _ = retry_tx.send(OutboundMessage { peer, request, ack_tx: None });
+                        let _ = retry_tx.send(OutboundMessage { peer, request, ack_tx: recovered_ack });
                     }
                 });
             } else {

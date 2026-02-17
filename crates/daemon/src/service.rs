@@ -1232,9 +1232,10 @@ async fn handle_command(
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                match ack_rx.await {
-                    Ok(response) => { let _ = reply_tx.send(Ok(response)); }
-                    Err(_) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
+                match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await {
+                    Ok(Ok(response)) => { let _ = reply_tx.send(Ok(response)); }
+                    Ok(Err(_)) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("piece sync timed out (15s)".into())); }
                 }
             });
         }
