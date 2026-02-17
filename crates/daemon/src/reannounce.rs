@@ -66,7 +66,17 @@ pub async fn run_maintenance_cycle(
         reannounce_content(content_id, tracker, command_tx, client, event_tx).await;
     }
 
-    // Equalization only (Function 2) — initial push is done at publish time
+    // Retry initial push for content that hasn't been distributed yet
+    let needs_push = {
+        let t = tracker.lock().await;
+        t.needs_distribution()
+    };
+    for cid in &needs_push {
+        info!("Maintenance: retrying initial push for {}", cid);
+        run_initial_push(cid, tracker, command_tx, client, peer_scorer, event_tx).await;
+    }
+
+    // Equalization (Function 2) — for content that has completed initial push
     equalize_pressure(tracker, command_tx, client, peer_scorer, event_tx).await;
 
     // Check providers for announced content

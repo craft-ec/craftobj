@@ -112,6 +112,7 @@ for i in 1 2 3; do
     mkdir -p "$dir"
     sock="$dir/datacraft.sock"
     ws_port=$((9200 + i))
+    listen_port=$((19300 + i))
 
     if [[ $i -eq 1 ]]; then
         caps='["client"]'
@@ -119,11 +120,18 @@ for i in 1 2 3; do
         caps='["client","storage"]'
     fi
 
+    # All nodes know about node-1 as bootstrap; node-1 has empty boot_peers
+    if [[ $i -eq 1 ]]; then
+        boot='[]'
+    else
+        boot='["/ip4/127.0.0.1/tcp/19301"]'
+    fi
+
     cat > "$dir/config.json" <<CONF
 {
   "schema_version": 1,
   "capabilities": $caps,
-  "listen_port": 0,
+  "listen_port": $listen_port,
   "ws_port": $ws_port,
   "capability_announce_interval_secs": 5,
   "reannounce_interval_secs": 10,
@@ -135,7 +143,7 @@ for i in 1 2 3; do
   "piece_timeout_secs": 30,
   "stream_open_timeout_secs": 10,
   "health_check_interval_secs": 60,
-  "boot_peers": []
+  "boot_peers": $boot
 }
 CONF
 
@@ -161,8 +169,8 @@ for i in 1 2 3; do
 done
 
 # ─── Wait for peer discovery ─────────────────────────────────
-info "Waiting for peer discovery (15s)..."
-sleep 15
+info "Waiting for peer discovery (25s)..."
+sleep 25
 
 PEERS_JSON=$(cli 1 peers)
 PEER_COUNT=$(echo "$PEERS_JSON" | jq 'keys | length' 2>/dev/null || echo 0)
