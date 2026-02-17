@@ -711,8 +711,8 @@ impl DataCraftHandler {
         for seg_idx in 0..manifest.segment_count as u32 {
             let k = manifest.k_for_segment(seg_idx as usize);
 
-            // Load existing pieces' coefficient vectors for independence checking
-            let (_local_pieces, mut coeff_matrix) = {
+            // Load existing pieces' piece IDs and coefficient vectors for independence checking
+            let (local_piece_ids, mut coeff_matrix) = {
                 let client = self.client.lock().await;
                 let piece_ids = client.store().list_pieces(content_id, seg_idx).unwrap_or_default();
                 let mut coeffs = Vec::with_capacity(piece_ids.len());
@@ -721,8 +721,9 @@ impl DataCraftHandler {
                         coeffs.push(coeff);
                     }
                 }
-                (piece_ids.len(), coeffs)
+                (piece_ids, coeffs)
             };
+            info!("Segment {}: have {} local pieces, {} coefficients", seg_idx, local_piece_ids.len(), coeff_matrix.len());
 
             let mut current_rank = if coeff_matrix.is_empty() {
                 0
@@ -751,11 +752,16 @@ impl DataCraftHandler {
             // Track per-provider consecutive failures to avoid hammering bad peers
             let mut provider_failures: HashMap<libp2p::PeerId, u32> = HashMap::new();
 
+            // Track which pieces we have (for exclude-list in PieceSync)
+            let have_piece_ids: Vec<[u8; 32]> = local_piece_ids.clone();
+
             // Launch initial batch
             for _ in 0..concurrency {
                 let provider = provider_iter.next().unwrap();
                 let cmd_tx = command_tx.clone();
                 let cid = *content_id;
+                let have_piece_ids = have_piece_ids.clone();
+                info!("Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
                     let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
@@ -764,8 +770,8 @@ impl DataCraftHandler {
                         content_id: cid,
                         segment_index: seg_idx,
                         merkle_root: [0u8; 32],
-                        have_pieces: vec![],
-                        max_pieces: 1,
+                        have_pieces: have_piece_ids.clone(),
+                        max_pieces: needed as u16,
                         reply_tx,
                     };
                     if cmd_tx.send(command).is_err() {

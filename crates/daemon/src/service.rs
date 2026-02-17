@@ -967,9 +967,11 @@ async fn drive_swarm(
 
             // Process inbound messages from peer streams
             Some(msg) = inbound_rx.recv() => {
+                info!("Processing inbound from {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&msg.request));
                 let response = handle_incoming_transfer_request(
                     &msg.peer, msg.request, &store_for_repair, &content_tracker, &protocol,
                 ).await;
+                info!("Sending response to {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&response));
                 stream_manager.send_response(msg.peer, msg.seq_id, response);
             }
 
@@ -1020,9 +1022,10 @@ async fn handle_incoming_transfer_request(
 ) -> DataCraftResponse {
     match request {
         DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
-            info!("Handling PieceSync from {} for {}/seg{}", peer, content_id, segment_index);
+            info!("Handling PieceSync from {} for {}/seg{} (they have {} pieces, want max {})", peer, content_id, segment_index, have_pieces.len(), max_pieces);
             let store_guard = store.lock().await;
             let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
+            info!("We have {} pieces for {}/seg{}", piece_ids.len(), content_id, segment_index);
 
             let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
             let mut pieces = Vec::new();
@@ -1222,7 +1225,7 @@ async fn handle_command(
         }
         
         DataCraftCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
-            info!("Handling PieceSync command: {}/{} from {}", content_id, segment_index, peer_id);
+            info!("Handling PieceSync command: {}/{} to peer {} (sending {} have_pieces, max_pieces={})", content_id, segment_index, peer_id, have_pieces.len(), max_pieces);
             let request = DataCraftRequest::PieceSync {
                 content_id,
                 segment_index,
@@ -1234,14 +1237,30 @@ async fn handle_command(
             let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
+                info!("Sending PieceSync outbound message to {}", peer_id);
                 if tx.send(msg).await.is_err() {
+                    warn!("PieceSync to {}: outbound channel closed", peer_id);
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
+                info!("PieceSync sent to outbound queue for {}, waiting for ack (15s timeout)", peer_id);
                 match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await {
-                    Ok(Ok(response)) => { let _ = reply_tx.send(Ok(response)); }
-                    Ok(Err(_)) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
-                    Err(_) => { let _ = reply_tx.send(Err("piece sync timed out (15s)".into())); }
+                    Ok(Ok(response)) => { 
+                        let desc = match &response {
+                            datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
+                            other => format!("{:?}", other),
+                        };
+                        info!("PieceSync to {}: got response: {}", peer_id, desc);
+                        let _ = reply_tx.send(Ok(response)); 
+                    }
+                    Ok(Err(_)) => { 
+                        warn!("PieceSync to {}: ack channel closed (dropped)", peer_id);
+                        let _ = reply_tx.send(Err("ack channel closed".into())); 
+                    }
+                    Err(_) => { 
+                        warn!("PieceSync to {}: timed out after 15s", peer_id);
+                        let _ = reply_tx.send(Err("piece sync timed out (15s)".into())); 
+                    }
                 }
             });
         }
