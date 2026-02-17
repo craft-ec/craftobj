@@ -2102,12 +2102,20 @@ impl DataCraftHandler {
 
         let uptime_secs = self.start_time.elapsed().as_secs();
 
+        let max_storage_bytes = if let Some(ref cfg) = self.daemon_config {
+            let c = cfg.lock().await;
+            c.max_storage_bytes
+        } else {
+            0
+        };
+
         Ok(serde_json::json!({
             "content_count": content_count,
             "published_count": published_count,
             "stored_count": stored_count,
             "total_local_pieces": total_local_pieces,
             "total_disk_usage": total_disk_usage,
+            "max_storage_bytes": max_storage_bytes,
             "storage_root": storage_root,
             "capabilities": cap_strings,
             "region": region,
