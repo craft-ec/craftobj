@@ -11,9 +11,10 @@ use datacraft_client::DataCraftClient;
 use datacraft_core::{ContentId, ContentManifest, CapabilityAnnouncement, DataCraftCapability, WireStatus};
 use datacraft_transfer::{DataCraftRequest, DataCraftResponse};
 use libp2p::identity::Keypair;
-use libp2p::request_response;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
+
+use crate::stream_manager::{StreamManager, InboundMessage, OutboundMessage, transfer_stream_protocol};
 
 use crate::behaviour::{build_datacraft_swarm, DataCraftBehaviourEvent, DataCraftSwarm};
 use crate::commands::DataCraftCommand;
@@ -160,7 +161,7 @@ pub async fn run_daemon_with_config(
         Arc::new(Mutex::new(tree))
     };
 
-    // Build swarm with DataCraft wrapper behaviour (CraftBehaviour + request_response)
+    // Build swarm with DataCraft wrapper behaviour (CraftBehaviour + libp2p_stream)
     let (mut swarm, local_peer_id) = build_datacraft_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
     info!("DataCraft node started: {}", local_peer_id);
@@ -761,8 +762,12 @@ async fn drive_swarm(
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
 
-    // Pending transfer requests (request_response RequestId → reply channel)
-    let mut pending_transfers: HashMap<request_response::OutboundRequestId, oneshot::Sender<DataCraftResponse>> = HashMap::new();
+    // Stream manager for persistent piece transfer
+    let mut stream_control = swarm.behaviour().stream.new_control();
+    let mut incoming_streams = stream_control
+        .accept(transfer_stream_protocol())
+        .expect("failed to accept transfer streams");
+    let (mut stream_manager, mut inbound_rx, outbound_tx) = StreamManager::new(stream_control);
 
     // Peer reconnector for exponential backoff reconnection
     let mut peer_reconnector = PeerReconnector::new();
@@ -794,6 +799,8 @@ async fn drive_swarm(
                         info!("Connected to {} ({} peers total)", peer_id, total);
                         // Clear reconnector state on successful connection
                         peer_reconnector.on_reconnected(&peer_id);
+                        stream_manager.clear_open_cooldown(&peer_id);
+                        stream_manager.ensure_opening(peer_id);
                         // Track for heartbeat
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
@@ -857,6 +864,7 @@ async fn drive_swarm(
                         info!("Disconnected from {} ({} peers remaining)", peer_id, remaining);
                         peer_scorer.lock().await.remove_peer(&peer_id);
                         peer_last_seen.remove(&peer_id);
+                        stream_manager.on_peer_disconnected(&peer_id);
                         // Track for reconnection with last-known addresses from Kademlia routing table
                         let addrs: Vec<libp2p::Multiaddr> = {
                             let mut result = Vec::new();
@@ -907,40 +915,8 @@ async fn drive_swarm(
                                     protocol.handle_kademlia_event(kad_event).await;
                                 }
                             }
-                            DataCraftBehaviourEvent::Transfer(transfer_event) => {
-                                match transfer_event {
-                                    request_response::Event::Message { peer, message, .. } => {
-                                        match message {
-                                            request_response::Message::Request { request, channel, .. } => {
-                                                // Handle incoming requests from peers
-                                                let response = handle_incoming_transfer_request(
-                                                    &peer, request, &store_for_repair, &content_tracker, &protocol,
-                                                ).await;
-                                                if let Err(_resp) = swarm.behaviour_mut().transfer.send_response(channel, response) {
-                                                    warn!("Failed to send transfer response to {}: response dropped", peer);
-                                                }
-                                            }
-                                            request_response::Message::Response { request_id, response } => {
-                                                // Complete pending transfer request
-                                                if let Some(reply_tx) = pending_transfers.remove(&request_id) {
-                                                    let _ = reply_tx.send(response);
-                                                } else {
-                                                    debug!("Received response for unknown request {:?}", request_id);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    request_response::Event::OutboundFailure { request_id, error, peer, .. } => {
-                                        warn!("Transfer request to {} failed: {:?}", peer, error);
-                                        if let Some(reply_tx) = pending_transfers.remove(&request_id) {
-                                            let _ = reply_tx.send(DataCraftResponse::Ack { status: WireStatus::Error });
-                                        }
-                                    }
-                                    request_response::Event::InboundFailure { peer, error, .. } => {
-                                        debug!("Inbound transfer from {} failed: {:?}", peer, error);
-                                    }
-                                    request_response::Event::ResponseSent { .. } => {}
-                                }
+                            DataCraftBehaviourEvent::Stream(()) => {
+                                // libp2p_stream produces no swarm events
                             }
                         }
                     }
@@ -972,14 +948,29 @@ async fn drive_swarm(
                             });
                         }
                         other => {
-                            handle_command(swarm, &protocol, other, pending_requests.clone(), &mut pending_transfers, &event_tx, &region, &signing_key).await;
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &outbound_tx, &event_tx, &region, &signing_key).await;
                         }
                     }
                 }
             }
-            // (stream pool removed — using request_response)
-            // Peer reconnection with exponential backoff
+            // Accept incoming transfer streams from peers
+            Some((peer, stream)) = incoming_streams.next() => {
+                debug!("Accepted incoming transfer stream from {}", peer);
+                stream_manager.accept_stream(peer, stream);
+            }
+
+            // Process inbound messages from peer streams
+            Some(msg) = inbound_rx.recv() => {
+                let response = handle_incoming_transfer_request(
+                    &msg.peer, msg.request, &store_for_repair, &content_tracker, &protocol,
+                ).await;
+                stream_manager.send_response(msg.peer, msg.seq_id, response);
+            }
+
+            // Peer reconnection + stream manager maintenance
             _ = reconnect_interval.tick() => {
+                stream_manager.poll_open_streams();
+                stream_manager.cleanup_dead_streams();
                 let due = peer_reconnector.peers_due_for_reconnect();
                 for (peer_id, addrs) in due {
                     for addr in &addrs {
@@ -1013,7 +1004,7 @@ async fn drive_swarm(
     }
 }
 
-/// Handle an incoming transfer request from a peer via request_response.
+/// Handle an incoming transfer request from a peer via persistent stream.
 async fn handle_incoming_transfer_request(
     peer: &libp2p::PeerId,
     request: DataCraftRequest,
@@ -1117,7 +1108,7 @@ async fn handle_command(
     protocol: &Arc<DataCraftProtocol>,
     command: DataCraftCommand,
     pending_requests: PendingRequests,
-    pending_transfers: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<DataCraftResponse>>,
+    outbound_tx: &mpsc::Sender<OutboundMessage>,
     event_tx: &EventSender,
     region: &Option<String>,
     signing_key: &Option<ed25519_dalek::SigningKey>,
@@ -1233,14 +1224,17 @@ async fn handle_command(
                 have_pieces,
                 max_pieces,
             };
-            let request_id = swarm.behaviour_mut().transfer.send_request(&peer_id, request);
-            // Store a oneshot that converts DataCraftResponse → Result<DataCraftResponse, String>
-            let (tx, rx) = oneshot::channel();
-            pending_transfers.insert(request_id, tx);
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
             tokio::spawn(async move {
-                match rx.await {
+                if tx.send(msg).await.is_err() {
+                    let _ = reply_tx.send(Err("outbound channel closed".into()));
+                    return;
+                }
+                match ack_rx.await {
                     Ok(response) => { let _ = reply_tx.send(Ok(response)); }
-                    Err(_) => { let _ = reply_tx.send(Err("channel closed".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
                 }
             });
         }
@@ -1338,11 +1332,15 @@ async fn handle_command(
                 coefficients,
                 data: piece_data,
             };
-            let request_id = swarm.behaviour_mut().transfer.send_request(&peer_id, request);
-            let (tx, rx) = oneshot::channel();
-            pending_transfers.insert(request_id, tx);
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
             tokio::spawn(async move {
-                match rx.await {
+                if tx.send(msg).await.is_err() {
+                    let _ = reply_tx.send(Err("outbound channel closed".into()));
+                    return;
+                }
+                match ack_rx.await {
                     Ok(DataCraftResponse::Ack { status }) => {
                         if status == datacraft_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
@@ -1351,7 +1349,7 @@ async fn handle_command(
                         }
                     }
                     Ok(_) => { let _ = reply_tx.send(Err("unexpected response type".into())); }
-                    Err(_) => { let _ = reply_tx.send(Err("channel closed".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
                 }
             });
         }
@@ -1362,11 +1360,15 @@ async fn handle_command(
                 content_id,
                 manifest_json,
             };
-            let request_id = swarm.behaviour_mut().transfer.send_request(&peer_id, request);
-            let (tx, rx) = oneshot::channel();
-            pending_transfers.insert(request_id, tx);
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
             tokio::spawn(async move {
-                match rx.await {
+                if tx.send(msg).await.is_err() {
+                    let _ = reply_tx.send(Err("outbound channel closed".into()));
+                    return;
+                }
+                match ack_rx.await {
                     Ok(DataCraftResponse::Ack { status }) => {
                         if status == datacraft_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
@@ -1375,7 +1377,7 @@ async fn handle_command(
                         }
                     }
                     Ok(_) => { let _ = reply_tx.send(Err("unexpected response type".into())); }
-                    Err(_) => { let _ = reply_tx.send(Err("channel closed".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
                 }
             });
         }
@@ -1766,7 +1768,7 @@ async fn announce_capabilities_periodically(
     }
 }
 
-// Incoming streams handled by request_response in drive_swarm.
+// Incoming streams handled by StreamManager in drive_swarm.
 
 /// Handle protocol events (DHT query results, etc.).
 async fn handle_protocol_events(

@@ -1,14 +1,13 @@
 //! DataCraft wrapper behaviour
 //!
-//! Combines CraftBehaviour (generic networking) with request_response
-//! for DataCraft-specific piece transfer.
+//! Combines CraftBehaviour (generic networking) with libp2p_stream
+//! for DataCraft-specific piece transfer via persistent streams.
 
 use craftec_network::CraftBehaviour;
 use craftec_network::behaviour::CraftBehaviourEvent;
 use craftec_network::NetworkConfig;
-use datacraft_transfer::{DataCraftCodec, DataCraftRequest, DataCraftResponse};
 use libp2p::identity::Keypair;
-use libp2p::{noise, request_response, tcp, yamux, PeerId, StreamProtocol, SwarmBuilder};
+use libp2p::{noise, tcp, yamux, PeerId, SwarmBuilder};
 use libp2p::swarm::NetworkBehaviour;
 use std::time::Duration;
 use tracing::info;
@@ -22,15 +21,17 @@ pub type DataCraftSwarm = libp2p::Swarm<DataCraftBehaviour>;
 pub struct DataCraftBehaviour {
     /// Generic Craftec networking (Kademlia, Gossipsub, mDNS, etc.)
     pub craft: CraftBehaviour,
-    /// DataCraft piece transfer protocol (request-response)
-    pub transfer: request_response::Behaviour<DataCraftCodec>,
+    /// Persistent stream transport for piece transfer
+    pub stream: libp2p_stream::Behaviour,
 }
 
 /// Events emitted by DataCraftBehaviour.
 #[derive(Debug)]
 pub enum DataCraftBehaviourEvent {
     Craft(CraftBehaviourEvent),
-    Transfer(request_response::Event<DataCraftRequest, DataCraftResponse>),
+    // libp2p_stream::Behaviour produces no events (streams are accepted via Control)
+    #[allow(dead_code)]
+    Stream(()),
 }
 
 impl From<CraftBehaviourEvent> for DataCraftBehaviourEvent {
@@ -39,9 +40,9 @@ impl From<CraftBehaviourEvent> for DataCraftBehaviourEvent {
     }
 }
 
-impl From<request_response::Event<DataCraftRequest, DataCraftResponse>> for DataCraftBehaviourEvent {
-    fn from(e: request_response::Event<DataCraftRequest, DataCraftResponse>) -> Self {
-        DataCraftBehaviourEvent::Transfer(e)
+impl From<()> for DataCraftBehaviourEvent {
+    fn from(_: ()) -> Self {
+        DataCraftBehaviourEvent::Stream(())
     }
 }
 
@@ -54,7 +55,7 @@ fn yamux_config() -> yamux::Config {
     cfg
 }
 
-/// Build a DataCraft swarm with CraftBehaviour + request_response transfer.
+/// Build a DataCraft swarm with CraftBehaviour + libp2p_stream.
 pub async fn build_datacraft_swarm(
     keypair: Keypair,
     config: NetworkConfig,
@@ -63,7 +64,6 @@ pub async fn build_datacraft_swarm(
     info!("Local peer ID: {}", local_peer_id);
 
     let protocol_prefix = config.protocol_prefix.clone();
-    let transfer_protocol = StreamProtocol::new(datacraft_core::TRANSFER_PROTOCOL);
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -76,16 +76,9 @@ pub async fn build_datacraft_swarm(
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = PeerId::from(key.public());
             let craft = CraftBehaviour::build(&protocol_prefix, peer_id, key, relay_behaviour)?;
+            let stream = libp2p_stream::Behaviour::new();
 
-            let transfer_cfg = request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30));
-            let transfer = request_response::Behaviour::with_codec(
-                DataCraftCodec,
-                [(transfer_protocol.clone(), request_response::ProtocolSupport::Full)],
-                transfer_cfg,
-            );
-
-            Ok(DataCraftBehaviour { craft, transfer })
+            Ok(DataCraftBehaviour { craft, stream })
         })?
         .with_swarm_config(|c| {
             c.with_idle_connection_timeout(Duration::from_secs(300))

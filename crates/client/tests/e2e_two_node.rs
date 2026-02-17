@@ -1,16 +1,15 @@
 //! E2E integration test: two in-process nodes.
 //!
-//! Node A publishes a file, Node B fetches pieces via the new request_response
-//! codec, then reconstructs and verifies the content matches.
+//! Node A publishes a file, Node B fetches pieces via the wire framing
+//! protocol, then reconstructs and verifies the content matches.
 
 use std::path::PathBuf;
 
 use datacraft_client::DataCraftClient;
 use datacraft_core::{ContentId, PublishOptions, WireStatus};
 use datacraft_store::{piece_id_from_coefficients, FsStore};
-use datacraft_transfer::{DataCraftCodec, DataCraftRequest, DataCraftResponse, PiecePayload};
-use libp2p::request_response::Codec;
-use libp2p::StreamProtocol;
+use datacraft_transfer::{DataCraftRequest, DataCraftResponse, PiecePayload};
+use datacraft_transfer::wire;
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("datacraft-e2e").join(format!(
@@ -25,11 +24,7 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn proto() -> StreamProtocol {
-    StreamProtocol::new("/datacraft/transfer/3.0.0")
-}
-
-/// Simulate a PieceSync request-response over in-memory streams using the codec.
+/// Simulate a PieceSync request-response over in-memory streams using the wire framing.
 async fn simulate_piece_sync(
     store: &FsStore,
     content_id: &ContentId,
@@ -66,22 +61,27 @@ async fn simulate_piece_sync(
         }
     }
 
-    // Verify codec roundtrip
-    let mut codec = DataCraftCodec;
-    let p = proto();
-
+    // Verify wire framing roundtrip
     let mut buf = Vec::new();
-    codec.write_request(&p, &mut futures::io::Cursor::new(&mut buf), request).await.unwrap();
-    let _decoded_req = codec.read_request(&p, &mut futures::io::Cursor::new(&buf)).await.unwrap();
+    wire::write_request_frame(&mut futures::io::Cursor::new(&mut buf), 1, &request)
+        .await
+        .unwrap();
+    let frame = wire::read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
+    match frame {
+        wire::StreamFrame::Request { seq_id, .. } => assert_eq!(seq_id, 1),
+        _ => panic!("expected request frame"),
+    }
 
     let response = DataCraftResponse::PieceBatch { pieces: pieces.clone() };
     let mut resp_buf = Vec::new();
-    codec.write_response(&p, &mut futures::io::Cursor::new(&mut resp_buf), response).await.unwrap();
-    let decoded_resp = codec.read_response(&p, &mut futures::io::Cursor::new(&resp_buf)).await.unwrap();
+    wire::write_response_frame(&mut futures::io::Cursor::new(&mut resp_buf), 1, &response)
+        .await
+        .unwrap();
+    let resp_frame = wire::read_frame(&mut futures::io::Cursor::new(&resp_buf)).await.unwrap();
 
-    match decoded_resp {
-        DataCraftResponse::PieceBatch { pieces } => pieces,
-        _ => panic!("unexpected response"),
+    match resp_frame {
+        wire::StreamFrame::Response { response: DataCraftResponse::PieceBatch { pieces }, .. } => pieces,
+        _ => panic!("unexpected response frame"),
     }
 }
 
@@ -204,7 +204,6 @@ async fn test_two_node_any_piece_request() {
 
     for seg_idx in 0..manifest.segment_count as u32 {
         let k = manifest.k_for_segment(seg_idx as usize);
-        // Fetch all pieces using PieceSync
         let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
         for p in &pieces {
             store_b

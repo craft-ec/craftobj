@@ -50,7 +50,7 @@ pub enum DataCraftEvent {
 /// DataCraft protocol handler — DHT operations only.
 ///
 /// Transfer (piece request/push/manifest push/inventory) is handled by
-/// `request_response::Behaviour<DataCraftCodec>` in the swarm event loop.
+/// `libp2p_stream::Behaviour` + `StreamManager` in the swarm event loop.
 pub struct DataCraftProtocol {
     /// Event sender to the daemon.
     pub(crate) event_tx: mpsc::UnboundedSender<DataCraftEvent>,
