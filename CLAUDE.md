@@ -26,7 +26,8 @@ crates/
 
 ## Current State
 
-- **P2P pipeline working**: Publish → DHT announce → DHT resolve → libp2p-stream transfer → fetch complete
+- **P2P pipeline working**: Publish → DHT announce → DHT resolve → persistent libp2p-stream transfer → fetch complete
+- **StreamManager active**: Two unidirectional persistent streams per peer (Bitswap-style), background writer task, seq_id ack tracking. Replaced request_response.
 - **166 tests passing**, build + clippy clean
 - **⚠️ Erasure coding is Reed-Solomon — needs refactoring to RLNC**: All existing erasure code uses `reed-solomon-erasure` crate with `data_shards`/`parity_shards`/`shard_index` model. The design has moved to RLNC (Random Linear Network Coding) with segments (10MB), pieces (100KB), coefficient vectors, and no shard indices. See "RS → RLNC Refactoring" section below.
 - **Peer scoring active**: `PeerScorer` in daemon tracks per-peer reliability, latency EMA, and capabilities from gossipsub.
