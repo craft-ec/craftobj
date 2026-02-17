@@ -217,9 +217,11 @@ impl DataCraftHandler {
             mgr.register_cid(result.content_id, None);
         }
 
-        // Announce to DHT after successful publish (Milestone 1)
+        // Don't announce publisher as provider — publisher is a client that deletes
+        // all pieces after distribution. Storage nodes announce themselves when they
+        // receive the manifest via PushManifest handler.
         if let Some(ref command_tx) = self.command_tx {
-            debug!("Announcing {} to DHT", result.content_id);
+            debug!("Publishing manifest for {} to DHT (without provider announcement)", result.content_id);
             
             let (reply_tx, reply_rx) = oneshot::channel();
             let command = DataCraftCommand::AnnounceProvider {

@@ -1159,11 +1159,10 @@ async fn handle_command(
             let local_peer_id = *swarm.local_peer_id();
             
             let result = async {
-                // First announce as provider
-                protocol.announce_provider(&mut swarm.behaviour_mut().craft, &content_id).await
-                    .map_err(|e| format!("Failed to announce provider: {}", e))?;
-                
-                // Then publish the manifest
+                // Don't announce publisher as provider here — publishers delete all
+                // pieces after distribution. Storage nodes announce themselves in the
+                // PushManifest handler when they receive the manifest.
+                // We only publish the manifest to DHT so fetchers can find it.
                 protocol.publish_manifest(&mut swarm.behaviour_mut().craft, &manifest, &local_peer_id).await
                     .map_err(|e| format!("Failed to publish manifest: {}", e))?;
                 
