@@ -1,8 +1,10 @@
 //! Daemon command system
 //!
-//! Commands sent from IPC handler to the swarm event loop for DHT operations.
+//! Commands sent from IPC handler to the swarm event loop for DHT operations
+//! and request_response transfers.
 
 use datacraft_core::{ContentId, ContentManifest, DataCraftCapability};
+use datacraft_transfer::DataCraftResponse;
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
@@ -25,15 +27,15 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<ContentManifest, String>>,
     },
-    /// Request a piece from a remote peer.
-    ///
-    /// `piece_id` of all zeros means "any random piece for this segment".
-    RequestPiece {
+    /// Send a PieceSync request to a peer and return the PieceBatch response.
+    PieceSync {
         peer_id: PeerId,
         content_id: ContentId,
         segment_index: u32,
-        piece_id: [u8; 32],
-        reply_tx: oneshot::Sender<Result<(Vec<u8>, Vec<u8>), String>>,
+        merkle_root: [u8; 32],
+        have_pieces: Vec<[u8; 32]>,
+        max_pieces: u16,
+        reply_tx: oneshot::Sender<Result<DataCraftResponse, String>>,
     },
     /// Publish a capability announcement via gossipsub.
     PublishCapabilities {
@@ -90,20 +92,14 @@ pub enum DataCraftCommand {
     },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
-    /// Push a manifest to a remote storage peer.
+    /// Push a manifest to a remote storage peer via request_response.
     PushManifest {
         peer_id: PeerId,
         content_id: ContentId,
         manifest_json: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
-    /// Request inventory (segments + coefficient vectors) from a remote peer.
-    RequestInventory {
-        peer_id: PeerId,
-        content_id: ContentId,
-        reply_tx: oneshot::Sender<Result<datacraft_core::InventoryResponse, String>>,
-    },
-    /// Push a piece to a remote storage peer (proactive distribution).
+    /// Push a piece to a remote storage peer via request_response.
     PushPiece {
         peer_id: PeerId,
         content_id: ContentId,

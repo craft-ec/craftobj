@@ -215,37 +215,37 @@ pub async fn run_daemon_with_config(
 
     // Subscribe to gossipsub topics
     if let Err(e) = swarm
-        .behaviour_mut()
+        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::NODE_STATUS_TOPIC)
     {
         error!("Failed to subscribe to node status: {:?}", e);
     }
     if let Err(e) = swarm
-        .behaviour_mut()
+        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::CAPABILITIES_TOPIC)
     {
         error!("Failed to subscribe to capabilities topic: {:?}", e);
     }
     if let Err(e) = swarm
-        .behaviour_mut()
+        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::REMOVAL_TOPIC)
     {
         error!("Failed to subscribe to removal topic: {:?}", e);
     }
     if let Err(e) = swarm
-        .behaviour_mut()
+        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::STORAGE_RECEIPT_TOPIC)
     {
         error!("Failed to subscribe to storage receipt topic: {:?}", e);
     }
     if let Err(e) = swarm
-        .behaviour_mut()
+        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::REPAIR_TOPIC)
     {
         error!("Failed to subscribe to repair topic: {:?}", e);
     }
     if let Err(e) = swarm
-        .behaviour_mut()
+        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::SCALING_TOPIC)
     {
         error!("Failed to subscribe to scaling topic: {:?}", e);
@@ -736,7 +736,7 @@ async fn gc_loop(
 type SharedRemovalCache = Arc<Mutex<crate::removal_cache::RemovalCache>>;
 
 async fn drive_swarm(
-    swarm: &mut craftec_network::CraftSwarm,
+    swarm: &mut DataCraftSwarm,
     protocol: Arc<DataCraftProtocol>,
     command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
     pending_requests: PendingRequests,
@@ -756,16 +756,13 @@ async fn drive_swarm(
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
-    stream_pool: Arc<Mutex<crate::stream_manager::StreamPool>>,
     max_peer_connections: usize,
-    stream_control: libp2p_stream::Control,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
 
-    // Timer for polling the stream pool
-    let mut pool_poll_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    pool_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Pending transfer requests (request_response RequestId → reply channel)
+    let mut pending_transfers: HashMap<request_response::OutboundRequestId, oneshot::Sender<DataCraftResponse>> = HashMap::new();
 
     // Peer reconnector for exponential backoff reconnection
     let mut peer_reconnector = PeerReconnector::new();
@@ -799,12 +796,6 @@ async fn drive_swarm(
                         peer_reconnector.on_reconnected(&peer_id);
                         // Track for heartbeat
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
-                        // Clear stream pool cooldown and pre-open stream
-                        {
-                            let mut pool = stream_pool.lock().await;
-                            pool.on_peer_connected(&peer_id);
-                            pool.ensure_opening(peer_id);
-                        }
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
                             peer_id: peer_id.to_string(),
                             address: endpoint.get_remote_address().to_string(),
@@ -864,14 +855,12 @@ async fn drive_swarm(
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         let remaining = swarm.connected_peers().count();
                         info!("Disconnected from {} ({} peers remaining)", peer_id, remaining);
-                        // Clean up stream pool and peer scorer for disconnected peer
-                        stream_pool.lock().await.on_peer_disconnected(&peer_id);
                         peer_scorer.lock().await.remove_peer(&peer_id);
                         peer_last_seen.remove(&peer_id);
                         // Track for reconnection with last-known addresses from Kademlia routing table
                         let addrs: Vec<libp2p::Multiaddr> = {
                             let mut result = Vec::new();
-                            for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+                            for bucket in swarm.behaviour_mut().craft.kademlia.kbuckets() {
                                 for entry in bucket.iter() {
                                     if entry.node.key.preimage() == &peer_id {
                                         result.extend(entry.node.value.iter().cloned());
@@ -887,34 +876,73 @@ async fn drive_swarm(
                         });
                     }
                     SwarmEvent::Behaviour(event) => {
-                        debug!("Behaviour event: {:?}", event);
-                        // Update last-seen for gossipsub message sources
-                        if let craftec_network::behaviour::CraftBehaviourEvent::Gossipsub(
-                            libp2p::gossipsub::Event::Message { propagation_source, .. }
-                        ) = &event {
-                            peer_last_seen.insert(*propagation_source, std::time::Instant::now());
+                        match event {
+                            DataCraftBehaviourEvent::Craft(ref craft_event) => {
+                                debug!("Craft behaviour event: {:?}", craft_event);
+                                // Update last-seen for gossipsub message sources
+                                if let craftec_network::behaviour::CraftBehaviourEvent::Gossipsub(
+                                    libp2p::gossipsub::Event::Message { propagation_source, .. }
+                                ) = craft_event {
+                                    peer_last_seen.insert(*propagation_source, std::time::Instant::now());
+                                }
+                                // Handle going-offline messages from peers
+                                handle_gossipsub_going_offline(craft_event, &peer_scorer, &event_tx).await;
+                                // Handle mDNS discovery
+                                handle_mdns_event(swarm, craft_event, &event_tx);
+                                // Try to extract gossipsub capability announcements
+                                let new_storage_peer = handle_gossipsub_capability(craft_event, &peer_scorer, &event_tx).await;
+                                {
+                                    let mut scorer = peer_scorer.lock().await;
+                                    scorer.evict_stale(std::time::Duration::from_secs(900));
+                                }
+                                if new_storage_peer {
+                                    debug!("New storage peer detected — will receive pieces via equalization");
+                                }
+                                handle_gossipsub_removal(craft_event, &removal_cache, &event_tx).await;
+                                handle_gossipsub_storage_receipt(craft_event, &event_tx, &receipt_store).await;
+                                handle_gossipsub_repair(craft_event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
+                                handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker).await;
+                                // Handle Kademlia events for DHT queries
+                                if let craftec_network::behaviour::CraftBehaviourEvent::Kademlia(ref kad_event) = craft_event {
+                                    protocol.handle_kademlia_event(kad_event).await;
+                                }
+                            }
+                            DataCraftBehaviourEvent::Transfer(transfer_event) => {
+                                match transfer_event {
+                                    request_response::Event::Message { peer, message, .. } => {
+                                        match message {
+                                            request_response::Message::Request { request, channel, .. } => {
+                                                // Handle incoming requests from peers
+                                                let response = handle_incoming_transfer_request(
+                                                    &peer, request, &store_for_repair, &content_tracker, &protocol,
+                                                ).await;
+                                                if let Err(resp) = swarm.behaviour_mut().transfer.send_response(channel, response) {
+                                                    warn!("Failed to send transfer response to {}: response dropped", peer);
+                                                }
+                                            }
+                                            request_response::Message::Response { request_id, response } => {
+                                                // Complete pending transfer request
+                                                if let Some(reply_tx) = pending_transfers.remove(&request_id) {
+                                                    let _ = reply_tx.send(response);
+                                                } else {
+                                                    debug!("Received response for unknown request {:?}", request_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    request_response::Event::OutboundFailure { request_id, error, peer, .. } => {
+                                        warn!("Transfer request to {} failed: {:?}", peer, error);
+                                        if let Some(reply_tx) = pending_transfers.remove(&request_id) {
+                                            let _ = reply_tx.send(DataCraftResponse::Ack { status: WireStatus::Error });
+                                        }
+                                    }
+                                    request_response::Event::InboundFailure { peer, error, .. } => {
+                                        debug!("Inbound transfer from {} failed: {:?}", peer, error);
+                                    }
+                                    request_response::Event::ResponseSent { .. } => {}
+                                }
+                            }
                         }
-                        // Handle going-offline messages from peers
-                        handle_gossipsub_going_offline(&event, &peer_scorer, &event_tx).await;
-                        // Handle mDNS discovery: add discovered peers to Kademlia and dial them
-                        handle_mdns_event(swarm, &event, &event_tx);
-                        // Try to extract gossipsub capability announcements before passing through
-                        let new_storage_peer = handle_gossipsub_capability(&event, &peer_scorer, &event_tx).await;
-                        // Evict stale peers after processing announcements
-                        {
-                            let mut scorer = peer_scorer.lock().await;
-                            scorer.evict_stale(std::time::Duration::from_secs(900)); // 15min TTL (3x announce interval)
-                        }
-                        // New storage peers get pieces via equalization (Function 2) naturally.
-                        if new_storage_peer {
-                            debug!("New storage peer detected — will receive pieces via equalization");
-                        }
-                        handle_gossipsub_removal(&event, &removal_cache, &event_tx).await;
-                        handle_gossipsub_storage_receipt(&event, &event_tx, &receipt_store).await;
-                        handle_gossipsub_repair(&event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
-                        handle_gossipsub_scaling(&event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker).await;
-                        // Pass events to our protocol handler
-                        protocol.handle_swarm_event(&SwarmEvent::Behaviour(event)).await;
                     }
                     _ => {}
                 }
@@ -1084,7 +1112,7 @@ async fn handle_command(
             match serde_json::to_vec(&announcement) {
                 Ok(data) => {
                     if let Err(e) = swarm
-                        .behaviour_mut()
+                        .behaviour_mut().craft
                         .publish_to_topic(datacraft_core::CAPABILITIES_TOPIC, data)
                     {
                         debug!("Failed to publish capabilities: {:?}", e);
@@ -1165,7 +1193,7 @@ async fn handle_command(
 
             // Broadcast via gossipsub
             if let Ok(data) = bincode::serialize(&notice) {
-                if let Err(e) = swarm.behaviour_mut()
+                if let Err(e) = swarm.behaviour_mut().craft
                     .publish_to_topic(datacraft_core::REMOVAL_TOPIC, data) {
                     warn!("Failed to broadcast removal notice via gossipsub: {:?}", e);
                 }
@@ -1176,7 +1204,7 @@ async fn handle_command(
 
         DataCraftCommand::BroadcastStorageReceipt { receipt_data } => {
             debug!("Broadcasting StorageReceipt via gossipsub ({} bytes)", receipt_data.len());
-            if let Err(e) = swarm.behaviour_mut()
+            if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::STORAGE_RECEIPT_TOPIC, receipt_data) {
                 warn!("Failed to broadcast StorageReceipt via gossipsub: {:?}", e);
             }
@@ -1184,7 +1212,7 @@ async fn handle_command(
 
         DataCraftCommand::BroadcastRepairMessage { repair_data } => {
             debug!("Broadcasting repair message via gossipsub ({} bytes)", repair_data.len());
-            if let Err(e) = swarm.behaviour_mut()
+            if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::REPAIR_TOPIC, repair_data) {
                 warn!("Failed to broadcast repair message via gossipsub: {:?}", e);
             }
@@ -1192,7 +1220,7 @@ async fn handle_command(
 
         DataCraftCommand::BroadcastDemandSignal { signal_data } => {
             debug!("Broadcasting demand signal via gossipsub ({} bytes)", signal_data.len());
-            if let Err(e) = swarm.behaviour_mut()
+            if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::SCALING_TOPIC, signal_data) {
                 warn!("Failed to broadcast demand signal via gossipsub: {:?}", e);
             }
@@ -1246,7 +1274,7 @@ async fn handle_command(
         }
         DataCraftCommand::BroadcastGoingOffline { data } => {
             debug!("Broadcasting going-offline message ({} bytes)", data.len());
-            if let Err(e) = swarm.behaviour_mut()
+            if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::NODE_STATUS_TOPIC, data) {
                 warn!("Failed to broadcast going-offline message: {:?}", e);
             }
@@ -1275,7 +1303,7 @@ fn handle_mdns_event(
                 peer_id: peer_id.to_string(),
                 address: addr.to_string(),
             });
-            swarm.behaviour_mut().add_address(peer_id, addr.clone());
+            swarm.behaviour_mut().craft.add_address(peer_id, addr.clone());
             // Dial the peer to establish a connection
             if let Err(e) = swarm.dial(addr.clone()) {
                 debug!("Failed to dial mDNS peer {} at {}: {:?}", peer_id, addr, e);
@@ -1283,7 +1311,7 @@ fn handle_mdns_event(
         }
         // Bootstrap Kademlia after discovering new peers so late-joining nodes
         // get integrated into the DHT.
-        if let Err(e) = swarm.behaviour_mut().bootstrap() {
+        if let Err(e) = swarm.behaviour_mut().craft.bootstrap() {
             debug!("Kademlia bootstrap after mDNS: {:?}", e);
         }
     }

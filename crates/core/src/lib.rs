@@ -530,7 +530,7 @@ impl WireMessageType {
 }
 
 /// Wire response status codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum WireStatus {
     Ok = 0,
