@@ -14,10 +14,14 @@ use std::time::Instant;
 
 use datacraft_transfer::wire::{read_frame, write_request_frame, StreamFrame};
 use datacraft_transfer::{DataCraftRequest, DataCraftResponse};
+use futures::AsyncReadExt as _;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+type StreamReadHalf = futures::io::ReadHalf<libp2p::Stream>;
+type StreamWriteHalf = futures::io::WriteHalf<libp2p::Stream>;
 
 /// Cooldown after a failed outbound open before retrying (seconds).
 const OPEN_RETRY_COOLDOWN_SECS: u64 = 1;
@@ -33,12 +37,16 @@ type PendingAcks = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<DataCraftRe
 /// Global registry: peer → pending acks (shared between writer loop + reader loops).
 type PendingAcksRegistry = Arc<std::sync::RwLock<HashMap<PeerId, PendingAcks>>>;
 
+/// Write half of an inbound stream — handler writes response here (same stream the request came from).
+pub type InboundWriter = Arc<Mutex<StreamWriteHalf>>;
+
 /// An inbound message received from a peer stream.
-#[derive(Debug)]
 pub struct InboundMessage {
     pub peer: PeerId,
     pub seq_id: u64,
     pub request: DataCraftRequest,
+    /// Write half of the inbound stream — write response here, not on a separate outbound.
+    pub response_writer: InboundWriter,
 }
 
 /// An outbound message queued for the background writer task.
@@ -51,7 +59,7 @@ pub struct OutboundMessage {
 
 /// Per-peer writer handle for the background writer task.
 struct PeerWriterHandle {
-    writer: Arc<Mutex<libp2p::Stream>>,
+    writer: Arc<Mutex<StreamWriteHalf>>,
     next_seq: Arc<AtomicU64>,
     poisoned: Arc<AtomicBool>,
 }
@@ -65,13 +73,15 @@ struct PeerConnection {
 }
 
 struct OutboundHandle {
-    writer: Arc<Mutex<libp2p::Stream>>,
+    writer: Arc<Mutex<StreamWriteHalf>>,
     #[allow(dead_code)]
     next_seq: Arc<AtomicU64>,
+    _reader_handle: JoinHandle<()>,
 }
 
 struct InboundHandle {
     reader_handle: JoinHandle<()>,
+    writer: InboundWriter,
 }
 
 /// Manages two unidirectional streams per peer for DataCraft transfer.
@@ -87,16 +97,6 @@ pub struct StreamManager {
     pending_acks_registry: PendingAcksRegistry,
     write_fail_rx: mpsc::UnboundedReceiver<PeerId>,
     need_stream_rx: mpsc::UnboundedReceiver<PeerId>,
-    /// Channel for spawned inbound handlers to send responses back
-    response_rx: mpsc::UnboundedReceiver<(PeerId, u64, DataCraftResponse)>,
-    response_tx: mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)>,
-    /// Buffered responses waiting for outbound stream to open
-    pending_responses: VecDeque<(PeerId, u64, DataCraftResponse)>,
-    /// Channel for response write failures to retry
-    response_retry_rx: mpsc::UnboundedReceiver<(PeerId, u64, DataCraftResponse)>,
-    response_retry_tx: mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)>,
-    /// Clone of write_fail_tx for send_response to signal stream death
-    write_fail_tx: mpsc::UnboundedSender<PeerId>,
 }
 
 impl StreamManager {
@@ -114,7 +114,6 @@ impl StreamManager {
         let (open_result_tx, open_result_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(8192);
         let (write_fail_tx, write_fail_rx) = mpsc::unbounded_channel();
-        let write_fail_tx2 = write_fail_tx.clone();
         let (need_stream_tx, need_stream_rx) = mpsc::unbounded_channel();
 
         let writer_registry: WriterRegistry = Arc::new(std::sync::RwLock::new(HashMap::new()));
@@ -128,9 +127,6 @@ impl StreamManager {
             need_stream_tx,
         ));
 
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
-        let (response_retry_tx, response_retry_rx) = mpsc::unbounded_channel();
-
         let mgr = Self {
             control,
             peers: HashMap::new(),
@@ -141,67 +137,18 @@ impl StreamManager {
             open_cooldown: HashMap::new(),
             writer_registry,
             pending_acks_registry,
-            write_fail_rx: write_fail_rx,
-            write_fail_tx: write_fail_tx2,
+            write_fail_rx,
             need_stream_rx,
-            response_rx,
-            response_tx,
-            pending_responses: VecDeque::new(),
-            response_retry_rx,
-            response_retry_tx,
         };
 
         (mgr, inbound_rx, outbound_tx)
     }
 
-    /// Send a response frame to a peer on our outbound stream (fire-and-forget).
     /// Force close and re-open outbound to a peer.
-    /// Used when a duplicate connection is detected — our existing outbound
-    /// may be on the connection that libp2p is about to close.
     pub fn force_reopen_outbound(&mut self, peer: &PeerId) {
         info!("[stream_mgr.rs] force_reopen_outbound: closing outbound to {} and re-opening", peer);
         self.close_outbound(peer);
         self.ensure_opening(*peer);
-    }
-
-    /// Get a sender for spawned tasks to return responses.
-    pub fn get_response_sender(&self) -> mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)> {
-        self.response_tx.clone()
-    }
-
-    /// Drain responses from spawned inbound handlers and write them.
-    pub fn drain_responses(&mut self) {
-        while let Ok((peer, seq_id, response)) = self.response_rx.try_recv() {
-            info!("[stream_mgr.rs] drain_responses: sending response to {} seq={}", peer, seq_id);
-            self.send_response(peer, seq_id, response);
-        }
-    }
-
-    pub fn send_response(&mut self, peer: PeerId, seq_id: u64, response: DataCraftResponse) {
-        let has_outbound = self.peers.get(&peer).map_or(false, |pc| pc.outbound.is_some());
-        if !has_outbound {
-            // No outbound yet — ensure one is opening and buffer the response
-            info!("[stream_mgr.rs] send_response: no outbound to {} seq={}, buffering and opening stream", peer, seq_id);
-            self.ensure_opening(peer);
-            self.pending_responses.push_back((peer, seq_id, response));
-            return;
-        }
-
-        let writer = self.peers.get(&peer).unwrap().outbound.as_ref().unwrap().writer.clone();
-        let write_fail_tx = self.write_fail_tx.clone();
-        let resp_retry_tx = self.response_retry_tx.clone();
-        info!("[stream_mgr.rs] send_response: writing response to {} seq={}", peer, seq_id);
-        tokio::spawn(async move {
-            let mut w = writer.lock().await;
-            match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
-                Ok(()) => info!("[stream_mgr.rs] send_response: wrote response to {} seq={} successfully", peer, seq_id),
-                Err(e) => {
-                    warn!("[stream_mgr.rs] Response write to {} seq={} failed: {} — will retry", peer, seq_id, e);
-                    let _ = write_fail_tx.send(peer);
-                    let _ = resp_retry_tx.send((peer, seq_id, response));
-                }
-            }
-        });
     }
 
     /// Accept an inbound stream from a peer.
@@ -271,14 +218,6 @@ impl StreamManager {
 
     /// Collect completed background outbound opens and drain write failures.
     pub fn poll_open_streams(&mut self) -> usize {
-        // Drain responses from spawned inbound handlers first
-        self.drain_responses();
-
-        // Drain response retry channel (failed writes that need retry)
-        while let Ok(item) = self.response_retry_rx.try_recv() {
-            self.pending_responses.push_back(item);
-        }
-
         let mut opened = 0;
         while let Ok((peer, result)) = self.open_result_rx.try_recv() {
             self.opening.remove(&peer);
@@ -302,34 +241,6 @@ impl StreamManager {
             self.close_outbound(&peer);
             self.ensure_opening(peer);
         }
-
-        // Flush pending responses now that streams may have opened
-        let mut remaining = VecDeque::new();
-        while let Some((peer, seq_id, response)) = self.pending_responses.pop_front() {
-            if self.peers.get(&peer).map_or(false, |pc| pc.outbound.is_some()) {
-                // Stream available now — send
-                let writer = self.peers.get(&peer).unwrap().outbound.as_ref().unwrap().writer.clone();
-                let wf_tx = self.write_fail_tx.clone();
-                let retry_tx = self.response_retry_tx.clone();
-                info!("[stream_mgr.rs] Flushing pending response to {} seq={}", peer, seq_id);
-                tokio::spawn(async move {
-                    let mut w = writer.lock().await;
-                    match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
-                        Ok(()) => info!("[stream_mgr.rs] Flushed pending response to {} seq={} successfully", peer, seq_id),
-                        Err(e) => {
-                            warn!("[stream_mgr.rs] Pending response write to {} seq={} failed: {}", peer, seq_id, e);
-                            let _ = wf_tx.send(peer);
-                            let _ = retry_tx.send((peer, seq_id, response));
-                        }
-                    }
-                });
-            } else {
-                // Still no stream — keep buffered
-                self.ensure_opening(peer);
-                remaining.push_back((peer, seq_id, response));
-            }
-        }
-        self.pending_responses = remaining;
 
         {
             let mut need_peers = HashSet::new();
@@ -417,7 +328,8 @@ impl StreamManager {
     }
 
     fn register_outbound(&mut self, peer: PeerId, stream: libp2p::Stream) {
-        let writer_arc = Arc::new(Mutex::new(stream));
+        let (read_half, write_half) = stream.split();
+        let writer_arc = Arc::new(Mutex::new(write_half));
         let seq_arc = Arc::new(AtomicU64::new(0));
         let poisoned_arc = Arc::new(AtomicBool::new(false));
 
@@ -427,10 +339,17 @@ impl StreamManager {
             poisoned: poisoned_arc,
         });
 
+        // Read responses from the same stream we write requests on
+        let pending_acks = self.get_or_create_peer(peer).pending_acks.clone();
+        let outbound_reader_handle = tokio::spawn(Self::outbound_response_reader(
+            peer, read_half, pending_acks,
+        ));
+
         let pc = self.get_or_create_peer(peer);
         pc.outbound = Some(OutboundHandle {
             writer: writer_arc,
             next_seq: seq_arc,
+            _reader_handle: outbound_reader_handle,
         });
     }
 
@@ -442,11 +361,14 @@ impl StreamManager {
             old.reader_handle.abort();
         }
 
+        let (read_half, write_half) = stream.split();
+        let writer = Arc::new(Mutex::new(write_half));
+
         let reader_handle = tokio::spawn(Self::reader_loop(
-            peer, stream, pending_acks, self.inbound_tx.clone(),
+            peer, read_half, pending_acks, self.inbound_tx.clone(), writer.clone(),
         ));
 
-        self.peers.get_mut(&peer).unwrap().inbound = Some(InboundHandle { reader_handle });
+        self.peers.get_mut(&peer).unwrap().inbound = Some(InboundHandle { reader_handle, writer });
     }
 
     /// Background writer task.
@@ -608,15 +530,16 @@ impl StreamManager {
     /// Reader loop for a peer's inbound stream.
     async fn reader_loop(
         peer: PeerId,
-        mut stream: libp2p::Stream,
+        mut reader: StreamReadHalf,
         pending_acks: PendingAcks,
         inbound_tx: mpsc::Sender<InboundMessage>,
+        response_writer: InboundWriter,
     ) {
         loop {
-            match read_frame(&mut stream).await {
+            match read_frame(&mut reader).await {
                 Ok(StreamFrame::Request { seq_id, request }) => {
                     info!("[stream_mgr.rs] Inbound request from {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&request));
-                    match inbound_tx.try_send(InboundMessage { peer, seq_id, request }) {
+                    match inbound_tx.try_send(InboundMessage { peer, seq_id, request, response_writer: response_writer.clone() }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             warn!("[stream_mgr.rs] Inbound channel full for {} — dropping message seq={}", peer, seq_id);
@@ -645,6 +568,40 @@ impl StreamManager {
             }
         }
         debug!("Reader loop ended for peer {}", peer);
+    }
+
+    /// Read responses from the outbound stream (same stream we write requests on).
+    async fn outbound_response_reader(
+        peer: PeerId,
+        mut reader: StreamReadHalf,
+        pending_acks: PendingAcks,
+    ) {
+        loop {
+            match read_frame(&mut reader).await {
+                Ok(StreamFrame::Response { seq_id, response }) => {
+                    info!("[stream_mgr.rs] Outbound response from {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
+                    let sender = pending_acks.lock().unwrap().remove(&seq_id);
+                    if let Some(tx) = sender {
+                        info!("[stream_mgr.rs] Dispatching outbound response from {} seq={}", peer, seq_id);
+                        let _ = tx.send(response);
+                    } else {
+                        warn!("[stream_mgr.rs] Outbound response from {} for unknown seq_id={}", peer, seq_id);
+                    }
+                }
+                Ok(StreamFrame::Request { seq_id, .. }) => {
+                    warn!("[stream_mgr.rs] Unexpected request on outbound stream from {} seq={}", peer, seq_id);
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        debug!("Outbound response reader for {} closed (EOF)", peer);
+                    } else {
+                        warn!("[stream_mgr.rs] Outbound read error from {}: {}", peer, e);
+                    }
+                    break;
+                }
+            }
+        }
+        debug!("Outbound response reader ended for peer {}", peer);
     }
 }
 

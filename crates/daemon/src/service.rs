@@ -778,7 +778,7 @@ async fn drive_swarm(
     // Peer reconnector for exponential backoff reconnection
     let mut peer_reconnector = PeerReconnector::new();
     // Channel for spawned inbound handlers to return responses without blocking swarm loop
-    let (inbound_response_tx, mut inbound_response_rx) = mpsc::unbounded_channel::<(libp2p::PeerId, u64, DataCraftResponse)>();
+    // Responses now written directly on the inbound stream by spawned handlers (bidirectional streams).
 
     let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -991,20 +991,19 @@ async fn drive_swarm(
                 let proto_clone = protocol.clone();
                 let peer = msg.peer;
                 let seq_id = msg.seq_id;
-                let resp_tx = inbound_response_tx.clone();
+                let response_writer = msg.response_writer;
                 tokio::spawn(async move {
                     let response = handle_incoming_transfer_request(
                         &peer, msg.request, &store_clone, &ct_clone, &proto_clone,
                     ).await;
                     info!("[service.rs] Spawned handler done for {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
-                    let _ = resp_tx.send((peer, seq_id, response));
+                    // Write response back on the SAME stream the request came from
+                    let mut w = response_writer.lock().await;
+                    match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
+                        Ok(()) => info!("[service.rs] Wrote response to {} seq={} on inbound stream", peer, seq_id),
+                        Err(e) => warn!("[service.rs] Failed to write response to {} seq={}: {}", peer, seq_id, e),
+                    }
                 });
-            }
-
-            // Drain responses from spawned inbound handlers
-            Some((peer, seq_id, response)) = inbound_response_rx.recv() => {
-                info!("[service.rs] Sending spawned response to {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
-                stream_manager.send_response(peer, seq_id, response);
             }
 
             // Peer reconnection + stream manager maintenance
@@ -1297,7 +1296,7 @@ async fn handle_command(
                     }
                     Err(_) => { 
                         warn!("[service.rs] PieceSync to {}: timed out after 5s", peer_id);
-                        let _ = reply_tx.send(Err("piece sync timed out (15s)".into())); 
+                        let _ = reply_tx.send(Err("piece sync timed out".into())); 
                     }
                 }
             });
@@ -1426,7 +1425,7 @@ async fn handle_command(
                     }
                     Err(_) => {
                         warn!("[service.rs] PushPiece to {}: timed out after 5s", peer_id);
-                        let _ = reply_tx.send(Err("piece push timed out (10s)".into()));
+                        let _ = reply_tx.send(Err("piece push timed out".into()));
                     }
                 }
             });
@@ -1468,7 +1467,7 @@ async fn handle_command(
                     }
                     Err(_) => {
                         warn!("[service.rs] PushManifest to {}: timed out after 5s", peer_id);
-                        let _ = reply_tx.send(Err("manifest push timed out (10s)".into()));
+                        let _ = reply_tx.send(Err("manifest push timed out".into()));
                     }
                 }
             });
