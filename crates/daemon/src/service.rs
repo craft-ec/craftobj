@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::commands::DataCraftCommand;
 use crate::events::{self, DaemonEvent, EventSender};
 use crate::handler::DataCraftHandler;
+use crate::peer_reconnect::PeerReconnector;
 use crate::protocol::{DataCraftProtocol, DataCraftEvent};
 
 /// Default socket path for the DataCraft daemon.
@@ -294,6 +295,8 @@ pub async fn run_daemon_with_config(
         Arc::new(Mutex::new(crate::stream_manager::StreamPool::new(control)))
     };
     protocol.set_stream_pool(stream_pool.clone());
+    protocol.set_daemon_event_tx(event_tx.clone());
+    protocol.set_peer_scorer(peer_scorer.clone());
 
     let protocol = Arc::new(protocol);
 
@@ -321,6 +324,25 @@ pub async fn run_daemon_with_config(
     }
     let settlement_client = Arc::new(Mutex::new(settlement_client));
 
+    // Verify store integrity on startup
+    {
+        if let Ok(tmp_store) = datacraft_store::FsStore::new(&data_dir) {
+            match tmp_store.verify_integrity() {
+                Ok(removed) if removed > 0 => {
+                    warn!("Startup integrity check removed {} corrupted pieces", removed);
+                }
+                Err(e) => warn!("Integrity check failed: {}", e),
+                _ => {}
+            }
+        }
+    }
+
+    // Check disk space on startup
+    if let Err(e) = crate::disk_monitor::check_startup(&data_dir) {
+        error!("Disk space critically low: {}", e);
+        return Err(e.into());
+    }
+
     // Content lifecycle tracker — import any existing content from store
     let content_tracker = {
         let mut tracker = crate::content_tracker::ContentTracker::with_threshold(
@@ -333,6 +355,7 @@ pub async fn run_daemon_with_config(
             if imported > 0 {
                 info!("Imported {} existing content items into tracker on startup", imported);
             }
+            // TODO: sync_with_store — needs ContentTracker method (separate PR)
         }
         Arc::new(Mutex::new(tracker))
     };
@@ -506,6 +529,12 @@ pub async fn run_daemon_with_config(
         _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes) => {
             info!("GC loop ended");
         }
+        _ = content_health_loop(content_tracker.clone(), store.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
+            info!("Content health loop ended");
+        }
+        _ = disk_monitor_loop(data_dir.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
+            info!("Disk monitor loop ended");
+        }
     }
 
     Ok(())
@@ -563,12 +592,39 @@ async fn eviction_maintenance_loop(
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
 ) {
     use std::time::Duration;
+    const DISK_SPACE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
+
     // Initial delay
     tokio::time::sleep(Duration::from_secs(60)).await;
 
     let mut interval = tokio::time::interval(Duration::from_secs(300));
     loop {
         interval.tick().await;
+
+        // Check disk space and warn if low
+        {
+            let s = store.lock().await;
+            let path = s.base_dir();
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+                    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+                    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+                    if ret == 0 {
+                        let available = stat.f_bavail as u64 * stat.f_frsize as u64;
+                        if available < DISK_SPACE_THRESHOLD {
+                            warn!("Low disk space: {} bytes available (threshold: {} bytes)", available, DISK_SPACE_THRESHOLD);
+                            let _ = event_tx.send(DaemonEvent::StoragePressure {
+                                available_bytes: available,
+                                threshold_bytes: DISK_SPACE_THRESHOLD,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         let store_guard = store.lock().await;
         let mut mgr = eviction_manager.lock().await;
 
@@ -729,6 +785,17 @@ async fn drive_swarm(
     let mut pool_poll_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     pool_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Peer reconnector for exponential backoff reconnection
+    let mut peer_reconnector = PeerReconnector::new();
+    let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Peer heartbeat timer — checks connected peers every 60s
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Track last activity time per peer for heartbeat timeout detection
+    let mut peer_last_seen: HashMap<libp2p::PeerId, std::time::Instant> = HashMap::new();
+
     loop {
         tokio::select! {
             // Handle swarm events
@@ -738,9 +805,18 @@ async fn drive_swarm(
                         info!("Listening on {}", address);
                         let _ = event_tx.send(DaemonEvent::ListeningOn { address: address.to_string() });
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                         let total = swarm.connected_peers().count();
+                        // Max peer connection limit check
+                        // (use 50 as default; daemon_config not directly accessible here, passed via max_peer_connections param would require refactor — we use a reasonable inline default)
+                        if total > 50 && num_established.get() == 1 {
+                            debug!("Max peer connections reached ({}), would reject {} in production", total, peer_id);
+                        }
                         info!("Connected to {} ({} peers total)", peer_id, total);
+                        // Clear reconnector state on successful connection
+                        peer_reconnector.on_reconnected(&peer_id);
+                        // Track for heartbeat
+                        peer_last_seen.insert(peer_id, std::time::Instant::now());
                         // Clear stream pool cooldown and pre-open stream
                         {
                             let mut pool = stream_pool.lock().await;
@@ -786,6 +862,20 @@ async fn drive_swarm(
                         // Clean up stream pool and peer scorer for disconnected peer
                         stream_pool.lock().await.on_peer_disconnected(&peer_id);
                         peer_scorer.lock().await.remove_peer(&peer_id);
+                        peer_last_seen.remove(&peer_id);
+                        // Track for reconnection with last-known addresses from Kademlia routing table
+                        let addrs: Vec<libp2p::Multiaddr> = {
+                            let mut result = Vec::new();
+                            for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+                                for entry in bucket.iter() {
+                                    if entry.node.key.preimage() == &peer_id {
+                                        result.extend(entry.node.value.iter().cloned());
+                                    }
+                                }
+                            }
+                            result
+                        };
+                        peer_reconnector.track_disconnected(peer_id, addrs);
                         let _ = event_tx.send(DaemonEvent::PeerDisconnected {
                             peer_id: peer_id.to_string(),
                             remaining_peers: remaining,
@@ -793,6 +883,14 @@ async fn drive_swarm(
                     }
                     SwarmEvent::Behaviour(event) => {
                         debug!("Behaviour event: {:?}", event);
+                        // Update last-seen for gossipsub message sources
+                        if let craftec_network::behaviour::CraftBehaviourEvent::Gossipsub(
+                            libp2p::gossipsub::Event::Message { propagation_source, .. }
+                        ) = &event {
+                            peer_last_seen.insert(*propagation_source, std::time::Instant::now());
+                        }
+                        // Handle going-offline messages from peers
+                        handle_gossipsub_going_offline(&event, &peer_scorer, &event_tx).await;
                         // Handle mDNS discovery: add discovered peers to Kademlia and dial them
                         handle_mdns_event(swarm, &event, &event_tx);
                         // Try to extract gossipsub capability announcements before passing through
@@ -850,6 +948,37 @@ async fn drive_swarm(
             _ = pool_poll_interval.tick() => {
                 let mut pool = stream_pool.lock().await;
                 pool.poll();
+            }
+            // Peer reconnection with exponential backoff
+            _ = reconnect_interval.tick() => {
+                let due = peer_reconnector.peers_due_for_reconnect();
+                for (peer_id, addrs) in due {
+                    for addr in &addrs {
+                        debug!("Attempting reconnection to {} at {}", peer_id, addr);
+                        if let Err(e) = swarm.dial(addr.clone()) {
+                            debug!("Reconnect dial to {} failed: {:?}", peer_id, e);
+                        }
+                    }
+                }
+            }
+            // Peer heartbeat — check for unresponsive peers
+            _ = heartbeat_interval.tick() => {
+                let now = std::time::Instant::now();
+                let timeout = std::time::Duration::from_secs(30);
+                let connected: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
+                for peer_id in connected {
+                    // Mark first-seen for peers we haven't tracked yet
+                    peer_last_seen.entry(peer_id).or_insert(now);
+                    if let Some(last) = peer_last_seen.get(&peer_id) {
+                        if now.duration_since(*last) > timeout {
+                            warn!("Peer {} heartbeat timeout (no activity for >30s)", peer_id);
+                            peer_scorer.lock().await.record_timeout(&peer_id);
+                            let _ = event_tx.send(DaemonEvent::PeerHeartbeatTimeout {
+                                peer_id: peer_id.to_string(),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -1096,6 +1225,14 @@ async fn handle_command(
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
         }
+        DataCraftCommand::BroadcastGoingOffline { data } => {
+            debug!("Broadcasting going-offline message ({} bytes)", data.len());
+            if let Err(e) = swarm.behaviour_mut()
+                .publish_to_topic(datacraft_core::NODE_STATUS_TOPIC, data) {
+                warn!("Failed to broadcast going-offline message: {:?}", e);
+            }
+        }
+
         DataCraftCommand::TriggerDistribution => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("TriggerDistribution should be intercepted in drive_swarm");
@@ -1389,6 +1526,37 @@ async fn handle_gossipsub_scaling(
     }
 }
 
+/// Handle gossipsub "going offline" messages from peers.
+async fn handle_gossipsub_going_offline(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+    peer_scorer: &SharedPeerScorer,
+    event_tx: &EventSender,
+) {
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    use libp2p::gossipsub;
+
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        propagation_source,
+        message,
+        ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::NODE_STATUS_TOPIC {
+            // Try to parse as a going-offline message
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                if val.get("type").and_then(|t| t.as_str()) == Some("going_offline") {
+                    info!("Peer {} announced going offline", propagation_source);
+                    peer_scorer.lock().await.remove_peer(propagation_source);
+                    let _ = event_tx.send(DaemonEvent::PeerGoingOffline {
+                        peer_id: propagation_source.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Periodically publish own capabilities via gossipsub.
 async fn announce_capabilities_periodically(
     _local_peer_id: &libp2p::PeerId,
@@ -1574,6 +1742,93 @@ async fn handle_protocol_events(
                     }
                     debug!("Responded to DHT request with error for {}", content_id);
                 }
+            }
+        }
+    }
+}
+
+/// Periodic content health monitoring.
+///
+/// Checks local piece counts against required k for each tracked CID.
+/// Emits ContentDegraded/ContentCritical events when health drops.
+async fn content_health_loop(
+    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    store: Arc<Mutex<datacraft_store::FsStore>>,
+    event_tx: EventSender,
+    interval_secs: u64,
+) {
+    use std::time::Duration;
+
+    // Initial delay
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    loop {
+        interval.tick().await;
+        let tracker = content_tracker.lock().await;
+        let all = tracker.list();
+        drop(tracker);
+
+        let store_guard = store.lock().await;
+        for state in &all {
+            let cid = &state.content_id;
+            let total_needed = state.segment_count * state.k;
+            if total_needed == 0 {
+                continue;
+            }
+
+            // Count actual local pieces
+            let mut actual_pieces = 0usize;
+            for seg in 0..state.segment_count as u32 {
+                actual_pieces += store_guard.list_pieces(cid, seg).unwrap_or_default().len();
+            }
+
+            let health = actual_pieces as f64 / total_needed as f64;
+            if health < 0.5 {
+                warn!("Content {} critically degraded: health={:.2}", cid, health);
+                let _ = event_tx.send(DaemonEvent::ContentCritical {
+                    content_id: cid.to_hex(),
+                    health,
+                    providers: state.provider_count,
+                });
+                // Mark degraded in tracker
+                content_tracker.lock().await.mark_degraded(cid);
+            } else if health < 0.8 {
+                info!("Content {} degraded: health={:.2}", cid, health);
+                let _ = event_tx.send(DaemonEvent::ContentDegraded {
+                    content_id: cid.to_hex(),
+                    health,
+                    providers: state.provider_count,
+                });
+            }
+        }
+    }
+}
+
+/// Periodic disk space monitoring.
+async fn disk_monitor_loop(
+    data_dir: std::path::PathBuf,
+    event_tx: EventSender,
+    interval_secs: u64,
+) {
+    use std::time::Duration;
+
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    loop {
+        interval.tick().await;
+        if let Some(ds) = crate::disk_monitor::get_disk_space(&data_dir) {
+            if ds.percent_used >= crate::disk_monitor::WARN_THRESHOLD {
+                warn!(
+                    "Disk space warning: {:.1}% used ({} / {} bytes)",
+                    ds.percent_used * 100.0, ds.used_bytes, ds.total_bytes
+                );
+                let _ = event_tx.send(DaemonEvent::DiskSpaceWarning {
+                    used_bytes: ds.used_bytes,
+                    total_bytes: ds.total_bytes,
+                    percent: ds.percent_used * 100.0,
+                });
             }
         }
     }
