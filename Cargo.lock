@@ -1391,11 +1391,13 @@ dependencies = [
 name = "datacraft-transfer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
  "craftec-erasure",
  "craftec-network",
  "datacraft-core",
  "datacraft-store",
+ "futures",
  "libp2p",
  "libp2p-stream",
  "serde",

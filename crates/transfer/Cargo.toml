@@ -17,3 +17,5 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }

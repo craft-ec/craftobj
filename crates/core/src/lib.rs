@@ -323,7 +323,7 @@ impl StorageReceipt {
 pub const WIRE_MAGIC: [u8; 4] = [0x44, 0x43, 0x52, 0x46];
 
 /// Transfer stream protocol ID.
-pub const TRANSFER_PROTOCOL: &str = "/datacraft/transfer/2.0.0";
+pub const TRANSFER_PROTOCOL: &str = "/datacraft/transfer/3.0.0";
 
 /// Manifest exchange protocol ID.
 pub const MANIFEST_PROTOCOL: &str = "/datacraft/manifest/2.0.0";

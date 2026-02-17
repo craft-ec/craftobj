@@ -2,31 +2,398 @@
 //!
 //! Piece exchange protocol for DataCraft using RLNC coding.
 //!
-//! Protocol: `/datacraft/transfer/2.0.0`
+//! Protocol: `/datacraft/transfer/3.0.0`
 //!
-//! Wire format:
+//! Uses `libp2p::request_response` for transport — no manual stream management.
+//!
+//! Wire format (self-describing via magic + type byte):
 //! ```text
-//! PieceRequest:  [magic:4][type:1][content_id:32][segment_index:4][piece_id:32] = 73 bytes
-//! PieceResponse: [status:1][coeff_len:4][coefficients][data_len:4][data]
-//! PiecePush:     [magic:4][type:1][content_id:32][segment_index:4][piece_id:32][coeff_len:4][coeff][data_len:4][data]
+//! Request:
+//!   PieceRequest:     [magic:4][type:1][content_id:32][segment_index:4][piece_id:32] = 73 bytes
+//!   PiecePush:        [magic:4][type:1][content_id:32][segment_index:4][piece_id:32][coeff_len:4][coeff][data_len:4][data]
+//!   ManifestPush:     [magic:4][type:1][content_id:32][payload_len:4][manifest_json]
+//!   InventoryRequest: [magic:4][type:1][content_id:32] = 37 bytes
+//!
+//! Response:
+//!   PieceResponse:    [status:1][coeff_len:4][coefficients][data_len:4][data]
+//!   PushAck:          [status:1]
+//!   ManifestAck:      [status:1]
+//!   InventoryResp:    [status:1][payload_len:4][bincode InventoryResponse]
 //! ```
 
+use async_trait::async_trait;
 use datacraft_core::{
-    ContentId, DataCraftError, Result, WireMessageType, WireStatus, WIRE_MAGIC,
+    ContentId, DataCraftError, InventoryResponse, Result,
+    WireMessageType, WireStatus, WIRE_MAGIC,
 };
 use datacraft_store::FsStore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, warn};
+use futures::prelude::*;
+use libp2p::StreamProtocol;
+use std::io;
+
+// ========================================================================
+// Request / Response types for request_response
+// ========================================================================
+
+/// A request in the DataCraft transfer protocol.
+#[derive(Debug, Clone)]
+pub enum DataCraftRequest {
+    /// Request a piece (piece_id all zeros = "any random piece").
+    PieceRequest {
+        content_id: ContentId,
+        segment_index: u32,
+        piece_id: [u8; 32],
+    },
+    /// Push a piece to a peer for storage.
+    PiecePush {
+        content_id: ContentId,
+        segment_index: u32,
+        piece_id: [u8; 32],
+        coefficients: Vec<u8>,
+        data: Vec<u8>,
+    },
+    /// Push a manifest to a peer.
+    ManifestPush {
+        content_id: ContentId,
+        manifest_json: Vec<u8>,
+    },
+    /// Request inventory of segments/pieces a peer has.
+    InventoryRequest {
+        content_id: ContentId,
+    },
+}
+
+/// A response in the DataCraft transfer protocol.
+#[derive(Debug, Clone)]
+pub enum DataCraftResponse {
+    /// Piece data response.
+    Piece {
+        status: WireStatus,
+        coefficients: Vec<u8>,
+        data: Vec<u8>,
+    },
+    /// Ack for a piece push.
+    PushAck {
+        status: WireStatus,
+    },
+    /// Ack for a manifest push.
+    ManifestAck {
+        status: WireStatus,
+    },
+    /// Inventory response.
+    Inventory {
+        status: WireStatus,
+        payload: Vec<u8>, // bincode-encoded InventoryResponse
+    },
+}
+
+// ========================================================================
+// Codec
+// ========================================================================
+
+/// Codec for the DataCraft transfer request-response protocol.
+#[derive(Debug, Clone, Default)]
+pub struct DataCraftCodec;
+
+/// Maximum piece data size (16 MB).
+const MAX_PIECE_DATA_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum coefficient vector size (64 KB).
+const MAX_COEFF_SIZE: usize = 64 * 1024;
+/// Maximum manifest payload size (10 MB).
+const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024;
+/// Maximum inventory payload size (50 MB).
+const MAX_INVENTORY_SIZE: usize = 50 * 1024 * 1024;
 
 /// Size of a piece request header.
 pub const PIECE_REQUEST_SIZE: usize = 73; // 4 + 1 + 32 + 4 + 32
 
+/// Manifest push header size: magic(4) + type(1) + content_id(32) + payload_len(4) = 41
+pub const MANIFEST_PUSH_HEADER_SIZE: usize = 41;
+
+/// Inventory request header size: magic(4) + type(1) + content_id(32) = 37
+pub const INVENTORY_REQUEST_SIZE: usize = 37;
+
 /// Size of a piece response header (status + coeff_len).
 pub const PIECE_RESPONSE_HEADER_SIZE: usize = 5; // 1 + 4
 
+#[async_trait]
+impl libp2p::request_response::Codec for DataCraftCodec {
+    type Protocol = StreamProtocol;
+    type Request = DataCraftRequest;
+    type Response = DataCraftResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        // Read magic(4) + type(1)
+        let mut header = [0u8; 5];
+        io.read_exact(&mut header).await?;
+
+        if header[0..4] != WIRE_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid magic"));
+        }
+
+        let msg_type = header[4];
+
+        if msg_type == WireMessageType::PieceRequest as u8 {
+            // Read content_id(32) + segment_index(4) + piece_id(32)
+            let mut rest = [0u8; 68];
+            io.read_exact(&mut rest).await?;
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(&rest[0..32]);
+            let seg = u32::from_be_bytes([rest[32], rest[33], rest[34], rest[35]]);
+            let mut pid = [0u8; 32];
+            pid.copy_from_slice(&rest[36..68]);
+            Ok(DataCraftRequest::PieceRequest {
+                content_id: ContentId(cid),
+                segment_index: seg,
+                piece_id: pid,
+            })
+        } else if msg_type == WireMessageType::PiecePush as u8 {
+            // content_id(32) + segment_index(4) + piece_id(32) = 68
+            let mut fixed = [0u8; 68];
+            io.read_exact(&mut fixed).await?;
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(&fixed[0..32]);
+            let seg = u32::from_be_bytes([fixed[32], fixed[33], fixed[34], fixed[35]]);
+            let mut pid = [0u8; 32];
+            pid.copy_from_slice(&fixed[36..68]);
+
+            let mut len_buf = [0u8; 4];
+            io.read_exact(&mut len_buf).await?;
+            let coeff_len = u32::from_be_bytes(len_buf) as usize;
+            if coeff_len > MAX_COEFF_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "coeff too large"));
+            }
+            let mut coefficients = vec![0u8; coeff_len];
+            if coeff_len > 0 {
+                io.read_exact(&mut coefficients).await?;
+            }
+
+            io.read_exact(&mut len_buf).await?;
+            let data_len = u32::from_be_bytes(len_buf) as usize;
+            if data_len > MAX_PIECE_DATA_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "data too large"));
+            }
+            let mut data = vec![0u8; data_len];
+            if data_len > 0 {
+                io.read_exact(&mut data).await?;
+            }
+
+            Ok(DataCraftRequest::PiecePush {
+                content_id: ContentId(cid),
+                segment_index: seg,
+                piece_id: pid,
+                coefficients,
+                data,
+            })
+        } else if msg_type == WireMessageType::ManifestPush as u8 {
+            // content_id(32) + payload_len(4)
+            let mut rest = [0u8; 36];
+            io.read_exact(&mut rest).await?;
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(&rest[0..32]);
+            let payload_len = u32::from_be_bytes([rest[32], rest[33], rest[34], rest[35]]) as usize;
+            if payload_len > MAX_MANIFEST_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest too large"));
+            }
+            let mut payload = vec![0u8; payload_len];
+            io.read_exact(&mut payload).await?;
+            Ok(DataCraftRequest::ManifestPush {
+                content_id: ContentId(cid),
+                manifest_json: payload,
+            })
+        } else if msg_type == WireMessageType::InventoryRequest as u8 {
+            let mut cid = [0u8; 32];
+            io.read_exact(&mut cid).await?;
+            Ok(DataCraftRequest::InventoryRequest {
+                content_id: ContentId(cid),
+            })
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown message type: {}", msg_type),
+            ))
+        }
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        // All responses start with status(1)
+        let mut status_byte = [0u8; 1];
+        io.read_exact(&mut status_byte).await?;
+        let status = WireStatus::from_u8(status_byte[0]).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid status: {}", status_byte[0]))
+        })?;
+
+        // Read response_type(1) to distinguish response kinds
+        let mut resp_type = [0u8; 1];
+        io.read_exact(&mut resp_type).await?;
+
+        match resp_type[0] {
+            0 => {
+                // Piece response: [coeff_len:4][coeff][data_len:4][data]
+                let mut len_buf = [0u8; 4];
+                io.read_exact(&mut len_buf).await?;
+                let coeff_len = u32::from_be_bytes(len_buf) as usize;
+                if coeff_len > MAX_COEFF_SIZE {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "coeff too large"));
+                }
+                let mut coefficients = vec![0u8; coeff_len];
+                if coeff_len > 0 {
+                    io.read_exact(&mut coefficients).await?;
+                }
+
+                io.read_exact(&mut len_buf).await?;
+                let data_len = u32::from_be_bytes(len_buf) as usize;
+                if data_len > MAX_PIECE_DATA_SIZE {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "data too large"));
+                }
+                let mut data = vec![0u8; data_len];
+                if data_len > 0 {
+                    io.read_exact(&mut data).await?;
+                }
+
+                Ok(DataCraftResponse::Piece { status, coefficients, data })
+            }
+            1 => {
+                // PushAck: just status
+                Ok(DataCraftResponse::PushAck { status })
+            }
+            2 => {
+                // ManifestAck: just status
+                Ok(DataCraftResponse::ManifestAck { status })
+            }
+            3 => {
+                // Inventory: [payload_len:4][payload]
+                let mut len_buf = [0u8; 4];
+                io.read_exact(&mut len_buf).await?;
+                let payload_len = u32::from_be_bytes(len_buf) as usize;
+                if payload_len > MAX_INVENTORY_SIZE {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "inventory too large"));
+                }
+                let mut payload = vec![0u8; payload_len];
+                if payload_len > 0 {
+                    io.read_exact(&mut payload).await?;
+                }
+                Ok(DataCraftResponse::Inventory { status, payload })
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown response type: {}", resp_type[0]),
+            )),
+        }
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        match req {
+            DataCraftRequest::PieceRequest { content_id, segment_index, piece_id } => {
+                let mut buf = Vec::with_capacity(PIECE_REQUEST_SIZE);
+                buf.extend_from_slice(&WIRE_MAGIC);
+                buf.push(WireMessageType::PieceRequest as u8);
+                buf.extend_from_slice(&content_id.0);
+                buf.extend_from_slice(&segment_index.to_be_bytes());
+                buf.extend_from_slice(&piece_id);
+                io.write_all(&buf).await?;
+            }
+            DataCraftRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
+                let mut buf = Vec::with_capacity(73 + 4 + coefficients.len() + 4 + data.len());
+                buf.extend_from_slice(&WIRE_MAGIC);
+                buf.push(WireMessageType::PiecePush as u8);
+                buf.extend_from_slice(&content_id.0);
+                buf.extend_from_slice(&segment_index.to_be_bytes());
+                buf.extend_from_slice(&piece_id);
+                buf.extend_from_slice(&(coefficients.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&coefficients);
+                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&data);
+                io.write_all(&buf).await?;
+            }
+            DataCraftRequest::ManifestPush { content_id, manifest_json } => {
+                let mut buf = Vec::with_capacity(MANIFEST_PUSH_HEADER_SIZE + manifest_json.len());
+                buf.extend_from_slice(&WIRE_MAGIC);
+                buf.push(WireMessageType::ManifestPush as u8);
+                buf.extend_from_slice(&content_id.0);
+                buf.extend_from_slice(&(manifest_json.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&manifest_json);
+                io.write_all(&buf).await?;
+            }
+            DataCraftRequest::InventoryRequest { content_id } => {
+                let mut buf = Vec::with_capacity(INVENTORY_REQUEST_SIZE);
+                buf.extend_from_slice(&WIRE_MAGIC);
+                buf.push(WireMessageType::InventoryRequest as u8);
+                buf.extend_from_slice(&content_id.0);
+                io.write_all(&buf).await?;
+            }
+        }
+        io.close().await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        match res {
+            DataCraftResponse::Piece { status, coefficients, data } => {
+                let mut buf = Vec::with_capacity(2 + 4 + coefficients.len() + 4 + data.len());
+                buf.push(status as u8);
+                buf.push(0u8); // response type: piece
+                buf.extend_from_slice(&(coefficients.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&coefficients);
+                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&data);
+                io.write_all(&buf).await?;
+            }
+            DataCraftResponse::PushAck { status } => {
+                io.write_all(&[status as u8, 1u8]).await?;
+            }
+            DataCraftResponse::ManifestAck { status } => {
+                io.write_all(&[status as u8, 2u8]).await?;
+            }
+            DataCraftResponse::Inventory { status, payload } => {
+                let mut buf = Vec::with_capacity(2 + 4 + payload.len());
+                buf.push(status as u8);
+                buf.push(3u8); // response type: inventory
+                buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&payload);
+                io.write_all(&buf).await?;
+            }
+        }
+        io.close().await?;
+        Ok(())
+    }
+}
+
+// ========================================================================
+// Legacy encoding functions (kept for tests + backward compat during transition)
+// ========================================================================
+
 /// Encode a piece request into wire format.
-///
-/// `piece_id` of all zeros means "any random piece for this segment".
 pub fn encode_piece_request(
     content_id: &ContentId,
     segment_index: u32,
@@ -42,9 +409,6 @@ pub fn encode_piece_request(
 }
 
 /// Decode a piece request from wire format.
-///
-/// Returns (content_id, segment_index, piece_id).
-/// piece_id of all zeros means "any piece".
 pub fn decode_piece_request(buf: &[u8]) -> Result<(ContentId, u32, [u8; 32])> {
     if buf.len() < PIECE_REQUEST_SIZE {
         return Err(DataCraftError::TransferError("request too short".into()));
@@ -85,14 +449,12 @@ pub fn encode_piece_response(
 pub fn encode_piece_response_error(status: WireStatus) -> Vec<u8> {
     let mut buf = Vec::with_capacity(9);
     buf.push(status as u8);
-    buf.extend_from_slice(&0u32.to_be_bytes()); // coeff_len = 0
-    buf.extend_from_slice(&0u32.to_be_bytes()); // data_len = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
     buf
 }
 
 /// Encode a piece push message.
-///
-/// Wire format: `[magic:4][type:1(PiecePush)][content_id:32][segment_index:4][piece_id:32][coeff_len:4][coeff][data_len:4][data]`
 pub fn encode_piece_push(
     content_id: &ContentId,
     segment_index: u32,
@@ -100,7 +462,7 @@ pub fn encode_piece_push(
     coefficients: &[u8],
     data: &[u8],
 ) -> Vec<u8> {
-    let header_size = 4 + 1 + 32 + 4 + 32; // 73
+    let header_size = 4 + 1 + 32 + 4 + 32;
     let mut buf = Vec::with_capacity(header_size + 4 + coefficients.len() + 4 + data.len());
     buf.extend_from_slice(&WIRE_MAGIC);
     buf.push(WireMessageType::PiecePush as u8);
@@ -114,9 +476,7 @@ pub fn encode_piece_push(
     buf
 }
 
-/// Decode a piece push header (first 73 bytes) plus the variable-length payload.
-///
-/// Returns (content_id, segment_index, piece_id, coefficients, data).
+/// Decode a piece push header plus variable-length payload.
 #[allow(clippy::type_complexity)]
 pub fn decode_piece_push(buf: &[u8]) -> Result<(ContentId, u32, [u8; 32], Vec<u8>, Vec<u8>)> {
     if buf.len() < 73 + 8 {
@@ -159,23 +519,7 @@ pub fn decode_piece_push(buf: &[u8]) -> Result<(ContentId, u32, [u8; 32], Vec<u8
     Ok((ContentId(cid_bytes), segment_index, piece_id, coefficients, data))
 }
 
-/// Manifest push header size: magic(4) + type(1) + content_id(32) + payload_len(4) = 41
-pub const MANIFEST_PUSH_HEADER_SIZE: usize = 41;
-
-/// Encode a manifest push message.
-/// Wire format: `[magic:4][type:1(ManifestPush=6)][content_id:32][payload_len:4][manifest_json]`
-pub fn encode_manifest_push(content_id: &ContentId, manifest_json: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(MANIFEST_PUSH_HEADER_SIZE + manifest_json.len());
-    buf.extend_from_slice(&WIRE_MAGIC);
-    buf.push(WireMessageType::ManifestPush as u8);
-    buf.extend_from_slice(&content_id.0);
-    buf.extend_from_slice(&(manifest_json.len() as u32).to_be_bytes());
-    buf.extend_from_slice(manifest_json);
-    buf
-}
-
 /// Decode a manifest push header.
-/// Returns (content_id, payload_len).
 pub fn decode_manifest_push_header(buf: &[u8]) -> Result<(ContentId, u32)> {
     if buf.len() < MANIFEST_PUSH_HEADER_SIZE {
         return Err(DataCraftError::TransferError(
@@ -197,6 +541,65 @@ pub fn decode_manifest_push_header(buf: &[u8]) -> Result<(ContentId, u32)> {
     Ok((ContentId(cid_bytes), payload_len))
 }
 
+/// Encode a manifest push message.
+pub fn encode_manifest_push(content_id: &ContentId, manifest_json: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(MANIFEST_PUSH_HEADER_SIZE + manifest_json.len());
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::ManifestPush as u8);
+    buf.extend_from_slice(&content_id.0);
+    buf.extend_from_slice(&(manifest_json.len() as u32).to_be_bytes());
+    buf.extend_from_slice(manifest_json);
+    buf
+}
+
+/// Encode an inventory request.
+pub fn encode_inventory_request(content_id: &ContentId) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(INVENTORY_REQUEST_SIZE);
+    buf.extend_from_slice(&WIRE_MAGIC);
+    buf.push(WireMessageType::InventoryRequest as u8);
+    buf.extend_from_slice(&content_id.0);
+    buf
+}
+
+/// Decode an inventory request. Returns content_id.
+pub fn decode_inventory_request(buf: &[u8]) -> Result<ContentId> {
+    if buf.len() < INVENTORY_REQUEST_SIZE {
+        return Err(DataCraftError::TransferError(
+            "inventory request too short".into(),
+        ));
+    }
+    if buf[0..4] != WIRE_MAGIC {
+        return Err(DataCraftError::TransferError("invalid magic".into()));
+    }
+    if buf[4] != WireMessageType::InventoryRequest as u8 {
+        return Err(DataCraftError::TransferError(format!(
+            "expected InventoryRequest type (7), got {}",
+            buf[4]
+        )));
+    }
+    let mut cid_bytes = [0u8; 32];
+    cid_bytes.copy_from_slice(&buf[5..37]);
+    Ok(ContentId(cid_bytes))
+}
+
+/// Encode an inventory response.
+pub fn encode_inventory_response(response: &InventoryResponse) -> Vec<u8> {
+    let payload = bincode::serialize(response).unwrap_or_default();
+    let mut buf = Vec::with_capacity(5 + payload.len());
+    buf.push(WireStatus::Ok as u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// Encode an inventory response error.
+pub fn encode_inventory_response_error(status: WireStatus) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.push(status as u8);
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf
+}
+
 /// Handle an incoming piece request: read from local store and respond.
 pub async fn handle_piece_request<S>(
     stream: &mut S,
@@ -206,7 +609,7 @@ pub async fn handle_piece_request<S>(
     piece_id: &[u8; 32],
 ) -> Result<()>
 where
-    S: AsyncWriteExt + Unpin,
+    S: tokio::io::AsyncWriteExt + Unpin,
 {
     let is_any = *piece_id == [0u8; 32];
 
@@ -220,20 +623,12 @@ where
 
     match result {
         Ok(Some((_pid, data, coefficients))) => {
-            debug!(
-                "Serving piece {}/{} ({} bytes data, {} bytes coeff)",
-                content_id,
-                segment_index,
-                data.len(),
-                coefficients.len()
-            );
             let response = encode_piece_response(WireStatus::Ok, &coefficients, &data);
             stream.write_all(&response).await.map_err(|e| {
                 DataCraftError::TransferError(format!("write response: {}", e))
             })?;
         }
         Ok(None) | Err(_) => {
-            warn!("Piece not found: {}/{}", content_id, segment_index);
             let response = encode_piece_response_error(WireStatus::NotFound);
             stream.write_all(&response).await.map_err(|e| {
                 DataCraftError::TransferError(format!("write not-found: {}", e))
@@ -244,8 +639,6 @@ where
 }
 
 /// Request a piece from a remote peer over an async stream.
-///
-/// Returns (coefficients, data) on success.
 pub async fn request_piece<S>(
     stream: &mut S,
     content_id: &ContentId,
@@ -253,14 +646,13 @@ pub async fn request_piece<S>(
     piece_id: &[u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>)>
 where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
 {
     let request = encode_piece_request(content_id, segment_index, piece_id);
     stream.write_all(&request).await.map_err(|e| {
         DataCraftError::TransferError(format!("write request: {}", e))
     })?;
 
-    // Read status
     let mut status_byte = [0u8; 1];
     stream.read_exact(&mut status_byte).await.map_err(|e| {
         DataCraftError::TransferError(format!("read status: {}", e))
@@ -269,7 +661,6 @@ where
         DataCraftError::TransferError(format!("invalid status: {}", status_byte[0]))
     })?;
 
-    // Read coeff_len
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.map_err(|e| {
         DataCraftError::TransferError(format!("read coeff_len: {}", e))
@@ -301,59 +692,6 @@ where
         ))),
         WireStatus::Error => Err(DataCraftError::TransferError("remote error".into())),
     }
-}
-
-/// Inventory request header size: magic(4) + type(1) + content_id(32) = 37
-pub const INVENTORY_REQUEST_SIZE: usize = 37;
-
-/// Encode an inventory request.
-/// Wire format: `[magic:4][type:1(InventoryRequest=7)][content_id:32]`
-pub fn encode_inventory_request(content_id: &ContentId) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(INVENTORY_REQUEST_SIZE);
-    buf.extend_from_slice(&WIRE_MAGIC);
-    buf.push(WireMessageType::InventoryRequest as u8);
-    buf.extend_from_slice(&content_id.0);
-    buf
-}
-
-/// Decode an inventory request. Returns content_id.
-pub fn decode_inventory_request(buf: &[u8]) -> Result<ContentId> {
-    if buf.len() < INVENTORY_REQUEST_SIZE {
-        return Err(DataCraftError::TransferError(
-            "inventory request too short".into(),
-        ));
-    }
-    if buf[0..4] != WIRE_MAGIC {
-        return Err(DataCraftError::TransferError("invalid magic".into()));
-    }
-    if buf[4] != WireMessageType::InventoryRequest as u8 {
-        return Err(DataCraftError::TransferError(format!(
-            "expected InventoryRequest type (7), got {}",
-            buf[4]
-        )));
-    }
-    let mut cid_bytes = [0u8; 32];
-    cid_bytes.copy_from_slice(&buf[5..37]);
-    Ok(ContentId(cid_bytes))
-}
-
-/// Encode an inventory response.
-/// Wire format: `[status:1][payload_len:4 BE][bincode InventoryResponse]`
-pub fn encode_inventory_response(response: &datacraft_core::InventoryResponse) -> Vec<u8> {
-    let payload = bincode::serialize(response).unwrap_or_default();
-    let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(WireStatus::Ok as u8);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&payload);
-    buf
-}
-
-/// Encode an inventory response error.
-pub fn encode_inventory_response_error(status: WireStatus) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(5);
-    buf.push(status as u8);
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf
 }
 
 #[cfg(test)]
@@ -525,7 +863,6 @@ mod tests {
                 .unwrap();
         });
 
-        // Request with zeroed piece_id = "any piece"
         let zeroed = [0u8; 32];
         let (coeff, data) = request_piece(&mut client, &cid, 0, &zeroed)
             .await
