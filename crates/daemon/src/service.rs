@@ -797,12 +797,12 @@ async fn drive_swarm(
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                         let total = swarm.connected_peers().count();
+                        info!("[service.rs] ConnectionEstablished to {} (num_established={}, {} peers total, endpoint={:?})", peer_id, num_established, total, endpoint);
                         // Max peer connection limit check
                         if total > max_peer_connections && num_established.get() == 1 {
                             warn!("[service.rs] Max peer connections reached ({}/{}), rejecting {}", total, max_peer_connections, peer_id);
                             // Close the connection by not opening streams and letting it timeout
                         }
-                        info!("[service.rs] Connected to {} ({} peers total)", peer_id, total);
                         // Clear reconnector state on successful connection
                         peer_reconnector.on_reconnected(&peer_id);
                         stream_manager.clear_open_cooldown(&peer_id);
@@ -865,9 +865,14 @@ async fn drive_swarm(
                             });
                         });
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                         let remaining = swarm.connected_peers().count();
-                        info!("[service.rs] Disconnected from {} ({} peers remaining)", peer_id, remaining);
+                        info!("[service.rs] ConnectionClosed for {} (num_established={}, {} peers remaining)", peer_id, num_established, remaining);
+                        if num_established > 0 {
+                            info!("[service.rs] Still have {} connections to {} — keeping streams alive", num_established, peer_id);
+                            continue;
+                        }
+                        info!("[service.rs] Fully disconnected from {} — cleaning up", peer_id);
                         peer_scorer.lock().await.remove_peer(&peer_id);
                         peer_last_seen.remove(&peer_id);
                         stream_manager.on_peer_disconnected(&peer_id);
@@ -1366,20 +1371,34 @@ async fn handle_command(
             let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
+                info!("[service.rs] PushPiece: sending to outbound queue for {}", peer_id);
                 if tx.send(msg).await.is_err() {
+                    warn!("[service.rs] PushPiece to {}: outbound channel closed", peer_id);
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                match ack_rx.await {
-                    Ok(DataCraftResponse::Ack { status }) => {
+                info!("[service.rs] PushPiece: waiting for ack from {} (10s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+                    Ok(Ok(DataCraftResponse::Ack { status })) => {
+                        info!("[service.rs] PushPiece to {}: got ack status={:?}", peer_id, status);
                         if status == datacraft_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
                         } else {
                             let _ = reply_tx.send(Err(format!("PushPiece ack: {:?}", status)));
                         }
                     }
-                    Ok(_) => { let _ = reply_tx.send(Err("unexpected response type".into())); }
-                    Err(_) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
+                    Ok(Ok(other)) => { 
+                        warn!("[service.rs] PushPiece to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
+                        let _ = reply_tx.send(Err("unexpected response type".into())); 
+                    }
+                    Ok(Err(_)) => { 
+                        warn!("[service.rs] PushPiece to {}: ack channel closed", peer_id);
+                        let _ = reply_tx.send(Err("ack channel closed".into())); 
+                    }
+                    Err(_) => {
+                        warn!("[service.rs] PushPiece to {}: timed out after 10s", peer_id);
+                        let _ = reply_tx.send(Err("piece push timed out (10s)".into()));
+                    }
                 }
             });
         }
@@ -1394,20 +1413,34 @@ async fn handle_command(
             let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
+                info!("[service.rs] PushManifest: sending to outbound queue for {}", peer_id);
                 if tx.send(msg).await.is_err() {
+                    warn!("[service.rs] PushManifest to {}: outbound channel closed", peer_id);
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                match ack_rx.await {
-                    Ok(DataCraftResponse::Ack { status }) => {
+                info!("[service.rs] PushManifest: waiting for ack from {} (10s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+                    Ok(Ok(DataCraftResponse::Ack { status })) => {
+                        info!("[service.rs] PushManifest to {}: got ack status={:?}", peer_id, status);
                         if status == datacraft_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
                         } else {
                             let _ = reply_tx.send(Err(format!("ManifestPush ack: {:?}", status)));
                         }
                     }
-                    Ok(_) => { let _ = reply_tx.send(Err("unexpected response type".into())); }
-                    Err(_) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
+                    Ok(Ok(other)) => { 
+                        warn!("[service.rs] PushManifest to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
+                        let _ = reply_tx.send(Err("unexpected response type".into())); 
+                    }
+                    Ok(Err(_)) => { 
+                        warn!("[service.rs] PushManifest to {}: ack channel closed", peer_id);
+                        let _ = reply_tx.send(Err("ack channel closed".into())); 
+                    }
+                    Err(_) => {
+                        warn!("[service.rs] PushManifest to {}: timed out after 10s", peer_id);
+                        let _ = reply_tx.send(Err("manifest push timed out (10s)".into()));
+                    }
                 }
             });
         }
