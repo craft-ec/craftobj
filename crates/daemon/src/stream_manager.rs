@@ -139,19 +139,19 @@ impl StreamManager {
         if let Some(pc) = self.peers.get(&peer) {
             if let Some(ref out) = pc.outbound {
                 let writer = out.writer.clone();
-                info!("send_response: writing response to {} seq={}", peer, seq_id);
+                info!("[stream_mgr.rs] send_response: writing response to {} seq={}", peer, seq_id);
                 tokio::spawn(async move {
                     let mut w = writer.lock().await;
                     match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
-                        Ok(()) => info!("send_response: wrote response to {} seq={} successfully", peer, seq_id),
-                        Err(e) => warn!("Response write to {} seq={} failed: {}", peer, seq_id, e),
+                        Ok(()) => info!("[stream_mgr.rs] send_response: wrote response to {} seq={} successfully", peer, seq_id),
+                        Err(e) => warn!("[stream_mgr.rs] Response write to {} seq={} failed: {}", peer, seq_id, e),
                     }
                 });
             } else {
-                warn!("No outbound to peer {} for response (seq={}) — cannot reply!", peer, seq_id);
+                warn!("[stream_mgr.rs] No outbound to peer {} for response (seq={}) — cannot reply!", peer, seq_id);
             }
         } else {
-            warn!("No peer state for {} — cannot send response (seq={})", peer, seq_id);
+            warn!("[stream_mgr.rs] No peer state for {} — cannot send response (seq={})", peer, seq_id);
         }
     }
 
@@ -169,7 +169,7 @@ impl StreamManager {
 
         self.open_cooldown.remove(&peer);
         self.register_inbound(peer, stream);
-        info!("Accepted inbound from peer {}", peer);
+        info!("[stream_mgr.rs] Accepted inbound from peer {}", peer);
         self.ensure_opening(peer);
     }
 
@@ -209,11 +209,11 @@ impl StreamManager {
             {
                 Ok(Ok(stream)) => { let _ = tx.send((peer, Ok(stream))); }
                 Ok(Err(e)) => {
-                    warn!("Background: outbound open to {} failed: {}", peer, e);
+                    warn!("[stream_mgr.rs] Background: outbound open to {} failed: {}", peer, e);
                     let _ = tx.send((peer, Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, format!("open_stream failed: {}", e)))));
                 }
                 Err(_) => {
-                    warn!("Background: outbound open to {} timed out (10s)", peer);
+                    warn!("[stream_mgr.rs] Background: outbound open to {} timed out (10s)", peer);
                     let _ = tx.send((peer, Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "open_stream timed out"))));
                 }
             }
@@ -231,7 +231,7 @@ impl StreamManager {
                         continue;
                     }
                     self.register_outbound(peer, stream);
-                    info!("Opened outbound to peer {}", peer);
+                    info!("[stream_mgr.rs] Opened outbound to peer {}", peer);
                     opened += 1;
                 }
                 Err(e) => {
@@ -431,19 +431,19 @@ impl StreamManager {
             let retry_tx = write_retry_tx.clone();
             let reg = registry.clone();
             let ack_reg = ack_registry.clone();
-            info!("StreamManager: writing {} to {} (seq={})", req_desc, peer, seq_id);
+            info!("[stream_mgr.rs] StreamManager: writing {} to {} (seq={})", req_desc, peer, seq_id);
             tokio::spawn(async move {
                 if poisoned.load(Ordering::Relaxed) { 
-                    warn!("StreamManager: stream to {} is poisoned, skipping write", peer);
+                    warn!("[stream_mgr.rs] StreamManager: stream to {} is poisoned, skipping write", peer);
                     return; 
                 }
                 let mut w = writer.lock().await;
                 match write_request_frame(&mut *w, seq_id, &request).await {
                     Ok(()) => {
-                        info!("StreamManager: wrote {} to {} (seq={}) successfully", req_desc, peer, seq_id);
+                        info!("[stream_mgr.rs] StreamManager: wrote {} to {} (seq={}) successfully", req_desc, peer, seq_id);
                     }
                     Err(e) => {
-                        warn!("Outbound write to {} failed: {} (seq={})", peer, e, seq_id);
+                        warn!("[stream_mgr.rs] Outbound write to {} failed: {} (seq={})", peer, e, seq_id);
                         poisoned.store(true, Ordering::Relaxed);
                         drop(w);
                         reg.write().unwrap().remove(&peer);
@@ -457,7 +457,7 @@ impl StreamManager {
                 }
             });
         } else {
-            info!("StreamManager: no writer for {}, buffering message (retry_buf={})", outbound.peer, retry_buf.len());
+            info!("[stream_mgr.rs] StreamManager: no writer for {}, buffering message (retry_buf={})", outbound.peer, retry_buf.len());
             let _ = need_stream_tx.send(outbound.peer);
             if retry_buf.len() < 1024 { retry_buf.push_back(outbound); }
         }
@@ -499,7 +499,7 @@ impl StreamManager {
                     if poisoned.load(Ordering::Relaxed) { return; }
                     let mut w = writer.lock().await;
                     if let Err(e) = write_request_frame(&mut *w, seq_id, &request).await {
-                        warn!("Outbound write to {} failed: {}", peer, e);
+                        warn!("[stream_mgr.rs] Outbound write to {} failed: {}", peer, e);
                         poisoned.store(true, Ordering::Relaxed);
                         drop(w);
                         reg.write().unwrap().remove(&peer);
@@ -530,30 +530,30 @@ impl StreamManager {
         loop {
             match read_frame(&mut stream).await {
                 Ok(StreamFrame::Request { seq_id, request }) => {
-                    info!("Inbound request from {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&request));
+                    info!("[stream_mgr.rs] Inbound request from {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&request));
                     match inbound_tx.try_send(InboundMessage { peer, seq_id, request }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("Inbound channel full for {} — dropping message seq={}", peer, seq_id);
+                            warn!("[stream_mgr.rs] Inbound channel full for {} — dropping message seq={}", peer, seq_id);
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
                 Ok(StreamFrame::Response { seq_id, response }) => {
-                    info!("Inbound response from {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
+                    info!("[stream_mgr.rs] Inbound response from {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
                     let sender = pending_acks.lock().unwrap().remove(&seq_id);
                     if let Some(tx) = sender {
-                        info!("Dispatching response from {} seq={} to waiting ack channel", peer, seq_id);
+                        info!("[stream_mgr.rs] Dispatching response from {} seq={} to waiting ack channel", peer, seq_id);
                         let _ = tx.send(response);
                     } else {
-                        warn!("Response from {} for unknown seq_id={} (no ack channel found)", peer, seq_id);
+                        warn!("[stream_mgr.rs] Response from {} for unknown seq_id={} (no ack channel found)", peer, seq_id);
                     }
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         debug!("Inbound from {} closed (EOF)", peer);
                     } else {
-                        warn!("Inbound read error from {}: {}", peer, e);
+                        warn!("[stream_mgr.rs] Inbound read error from {}: {}", peer, e);
                     }
                     break;
                 }

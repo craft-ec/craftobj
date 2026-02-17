@@ -42,7 +42,7 @@ pub async fn run_maintenance_cycle(
     event_tx: &EventSender,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
 ) {
-    info!("Content maintenance cycle starting");
+    info!("[reannounce.rs] Content maintenance cycle starting");
 
     let needs_announce = {
         let t = tracker.lock().await;
@@ -72,7 +72,7 @@ pub async fn run_maintenance_cycle(
         t.needs_distribution()
     };
     for cid in &needs_push {
-        info!("Maintenance: retrying initial push for {}", cid);
+        info!("[reannounce.rs] Maintenance: retrying initial push for {}", cid);
         run_initial_push(cid, tracker, command_tx, client, peer_scorer, event_tx).await;
     }
 
@@ -103,7 +103,7 @@ async fn reannounce_content(
         match c.store().get_manifest(content_id) {
             Ok(m) => m,
             Err(e) => {
-                warn!("Cannot re-announce {}: manifest not found: {}", content_id, e);
+                warn!("[reannounce.rs] Cannot re-announce {}: manifest not found: {}", content_id, e);
                 return;
             }
         }
@@ -117,7 +117,7 @@ async fn reannounce_content(
     };
 
     if command_tx.send(cmd).is_err() {
-        warn!("Failed to send re-announce command for {}", content_id);
+        warn!("[reannounce.rs] Failed to send re-announce command for {}", content_id);
         return;
     }
 
@@ -131,10 +131,10 @@ async fn reannounce_content(
             t.mark_announced(content_id);
         }
         Ok(Err(e)) => {
-            warn!("Re-announce failed for {}: {}", content_id, e);
+            warn!("[reannounce.rs] Re-announce failed for {}: {}", content_id, e);
         }
         Err(e) => {
-            warn!("Re-announce reply channel closed for {}: {}", content_id, e);
+            warn!("[reannounce.rs] Re-announce reply channel closed for {}: {}", content_id, e);
         }
     }
 }
@@ -191,7 +191,7 @@ pub async fn run_initial_push(
     };
 
     if storage_peers.is_empty() {
-        info!("Initial push for {}: no storage peers available, will retry next cycle", content_id);
+        info!("[reannounce.rs] Initial push for {}: no storage peers available, will retry next cycle", content_id);
         return; // Don't mark as done — needs_distribution() will still return it
     }
 
@@ -205,7 +205,7 @@ pub async fn run_initial_push(
         match c.store().get_manifest(content_id) {
             Ok(m) => m,
             Err(e) => {
-                warn!("Cannot push {}: {}", content_id, e);
+                warn!("[reannounce.rs] Cannot push {}: {}", content_id, e);
                 return;
             }
         }
@@ -215,7 +215,7 @@ pub async fn run_initial_push(
     let manifest_json = match serde_json::to_vec(&manifest) {
         Ok(j) => j,
         Err(e) => {
-            warn!("Cannot serialize manifest for {}: {}", content_id, e);
+            warn!("[reannounce.rs] Cannot serialize manifest for {}: {}", content_id, e);
             return;
         }
     };
@@ -239,21 +239,21 @@ pub async fn run_initial_push(
         for (peer, result) in futures::future::join_all(manifest_futs).await {
             match result {
                 Ok(Ok(())) => {
-                    info!("Pushed manifest for {} to {}", content_id, peer);
+                    info!("[reannounce.rs] Pushed manifest for {} to {}", content_id, peer);
                     manifest_ok_peers.push(peer);
                 }
-                Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
-                Err(_) => { warn!("Manifest push to {} — reply channel dropped", peer); }
+                Ok(Err(e)) => warn!("[reannounce.rs] Manifest push to {} failed: {}", peer, e),
+                Err(_) => { warn!("[reannounce.rs] Manifest push to {} — reply channel dropped", peer); }
             }
         }
     }
 
     if manifest_ok_peers.is_empty() {
-        warn!("Initial push for {}: manifest push failed for ALL peers, will retry next cycle", content_id);
+        warn!("[reannounce.rs] Initial push for {}: manifest push failed for ALL peers, will retry next cycle", content_id);
         return;
     }
 
-    info!("Initial push for {}: manifest accepted by {}/{} peers", content_id, manifest_ok_peers.len(), ranked_peers.len());
+    info!("[reannounce.rs] Initial push for {}: manifest accepted by {}/{} peers", content_id, manifest_ok_peers.len(), ranked_peers.len());
 
     // Collect all local pieces
     let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
@@ -282,7 +282,7 @@ pub async fn run_initial_push(
             .copied()
             .collect();
         if available_peers.is_empty() {
-            warn!("Initial push for {}: all peers failed, stopping at piece {}/{}", content_id, i, total_pieces);
+            warn!("[reannounce.rs] Initial push for {}: all peers failed, stopping at piece {}/{}", content_id, i, total_pieces);
             break;
         }
         let peer = available_peers[i % available_peers.len()];
@@ -313,18 +313,18 @@ pub async fn run_initial_push(
         match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
             Ok(Ok(Ok(()))) => {
                 total_pushed += 1;
-                info!("Pushed piece {}/{} for {} to {}", total_pushed, total_pieces, content_id, peer);
+                info!("[reannounce.rs] Pushed piece {}/{} for {} to {}", total_pushed, total_pieces, content_id, peer);
             }
             Ok(Ok(Err(e))) => {
-                warn!("Push piece {}/{} to {} failed: {}, marking as dead", i+1, total_pieces, peer, e);
+                warn!("[reannounce.rs] Push piece {}/{} to {} failed: {}, marking as dead", i+1, total_pieces, peer, e);
                 failed_peers.insert(peer);
             }
             Ok(Err(_)) => {
-                warn!("Push piece {}/{} to {} — reply channel dropped, marking as dead", i+1, total_pieces, peer);
+                warn!("[reannounce.rs] Push piece {}/{} to {} — reply channel dropped, marking as dead", i+1, total_pieces, peer);
                 failed_peers.insert(peer);
             }
             Err(_) => {
-                warn!("Push piece {}/{} to {} timed out (10s), marking as dead", i+1, total_pieces, peer);
+                warn!("[reannounce.rs] Push piece {}/{} to {} timed out (10s), marking as dead", i+1, total_pieces, peer);
                 failed_peers.insert(peer);
             }
         }
@@ -341,7 +341,7 @@ pub async fn run_initial_push(
         }
     }
 
-    info!("Initial push for {}: pushed {}/{} pieces to {} peers", content_id, total_pushed, total_pieces, ranked_peers.len());
+    info!("[reannounce.rs] Initial push for {}: pushed {}/{} pieces to {} peers", content_id, total_pushed, total_pieces, ranked_peers.len());
 
     if total_pushed > 0 {
         let _ = event_tx.send(DaemonEvent::ContentDistributed {
@@ -363,12 +363,12 @@ pub async fn run_initial_push(
         // Publisher is a client, not a storage node. Delete local pieces after full distribution.
         let c = client.lock().await;
         if let Err(e) = c.store().delete_content(content_id) {
-            warn!("Failed to clean up publisher pieces for {}: {}", content_id, e);
+            warn!("[reannounce.rs] Failed to clean up publisher pieces for {}: {}", content_id, e);
         } else {
-            info!("Publisher cleanup: deleted local pieces for {} after distributing all {} pieces", content_id, total_pushed);
+            info!("[reannounce.rs] Publisher cleanup: deleted local pieces for {} after distributing all {} pieces", content_id, total_pushed);
         }
     } else {
-        info!("Initial push for {}: partial ({}/{}), will retry next cycle", content_id, total_pushed, total_pieces);
+        info!("[reannounce.rs] Initial push for {}: partial ({}/{}), will retry next cycle", content_id, total_pushed, total_pieces);
     }
 }
 
@@ -503,7 +503,7 @@ async fn equalize_pressure(
             let c = client.lock().await;
             for (seg, pid) in &pieces_deleted {
                 if let Err(e) = c.store().delete_piece(&content_id, *seg, pid) {
-                    warn!("Failed to delete pushed piece {}/{}: {}", content_id, seg, e);
+                    warn!("[reannounce.rs] Failed to delete pushed piece {}/{}: {}", content_id, seg, e);
                 }
             }
             drop(c);

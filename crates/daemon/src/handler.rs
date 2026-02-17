@@ -229,7 +229,7 @@ impl DataCraftHandler {
             };
             
             if let Err(e) = command_tx.send(command) {
-                warn!("Failed to send announce command: {}", e);
+                warn!("[handler.rs] Failed to send announce command: {}", e);
             } else {
                 // Wait for the announcement to complete
                 match reply_rx.await {
@@ -241,10 +241,10 @@ impl DataCraftHandler {
                         }
                     }
                     Ok(Err(e)) => {
-                        warn!("Failed to announce {} to DHT: {}", result.content_id, e);
+                        warn!("[handler.rs] Failed to announce {} to DHT: {}", result.content_id, e);
                     }
                     Err(e) => {
-                        warn!("DHT announcement reply channel closed: {}", e);
+                        warn!("[handler.rs] DHT announcement reply channel closed: {}", e);
                     }
                 }
             }
@@ -331,7 +331,7 @@ impl DataCraftHandler {
             };
 
             if let Some(manifest) = local_manifest {
-                info!("Found manifest locally for {}", cid);
+                info!("[handler.rs] Found manifest locally for {}", cid);
 
                 // Step 2: Get providers from peer scorer (peers that announced having pieces for this CID)
                 let cid_hex_key = cid.to_hex();
@@ -343,10 +343,10 @@ impl DataCraftHandler {
                             if count > 0 {
                                 // Skip self — sending PieceSync to ourselves deadlocks
                                 if self.local_peer_id.as_ref() == Some(peer_id) {
-                                    info!("Skipping self ({}) as provider for {}", peer_id, cid);
+                                    info!("[handler.rs] Skipping self ({}) as provider for {}", peer_id, cid);
                                     continue;
                                 }
-                                info!("Provider {} has {} pieces for {}", peer_id, count, cid);
+                                info!("[handler.rs] Provider {} has {} pieces for {}", peer_id, count, cid);
                                 providers.push(*peer_id);
                             }
                         }
@@ -354,25 +354,25 @@ impl DataCraftHandler {
                 }
 
                 if !providers.is_empty() {
-                    info!("Found {} remote providers for {} via peer scorer", providers.len(), cid);
+                    info!("[handler.rs] Found {} remote providers for {} via peer scorer", providers.len(), cid);
                     // Step 3: Fetch missing pieces from these providers
                     match self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                         Ok(()) => {
-                            info!("Successfully fetched pieces via local-first P2P path");
+                            info!("[handler.rs] Successfully fetched pieces via local-first P2P path");
                             p2p_fetched = true;
                         }
                         Err(e) => {
-                            info!("Local-first P2P fetch failed: {}, trying DHT fallback", e);
+                            info!("[handler.rs] Local-first P2P fetch failed: {}, trying DHT fallback", e);
                         }
                     }
                 } else {
-                    info!("No local providers found for {} in peer scorer", cid);
+                    info!("[handler.rs] No local providers found for {} in peer scorer", cid);
                 }
             }
 
             // DHT fallback: try DHT resolution if local-first path didn't succeed
             if !p2p_fetched {
-                info!("Attempting DHT resolution for {}", cid);
+                info!("[handler.rs] Attempting DHT resolution for {}", cid);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let command = DataCraftCommand::ResolveProviders {
@@ -383,7 +383,7 @@ impl DataCraftHandler {
                 if command_tx.send(command).is_ok() {
                     match reply_rx.await {
                         Ok(Ok(providers)) if !providers.is_empty() => {
-                            info!("Found {} providers for {} via DHT", providers.len(), cid);
+                            info!("[handler.rs] Found {} providers for {} via DHT", providers.len(), cid);
 
                             let (manifest_tx, manifest_rx) = oneshot::channel();
                             let command = DataCraftCommand::GetManifest {
@@ -398,7 +398,7 @@ impl DataCraftHandler {
                                         if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                                             debug!("DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
                                         } else {
-                                            info!("Successfully fetched pieces via DHT P2P path");
+                                            info!("[handler.rs] Successfully fetched pieces via DHT P2P path");
                                         }
                                     }
                                     Ok(Err(e)) => debug!("Failed to get manifest from DHT: {}", e),
@@ -415,7 +415,7 @@ impl DataCraftHandler {
         }
 
         // Fall back to local reconstruction (blocking I/O — run off the runtime)
-        info!("Using local reconstruction for {}", cid);
+        info!("[handler.rs] Using local reconstruction for {}", cid);
         let client = self.client.clone();
         let output_clone = output.clone();
         tokio::task::spawn_blocking(move || {
@@ -698,7 +698,7 @@ impl DataCraftHandler {
 
         const MAX_CONCURRENT: usize = 20;
 
-        info!("Fetching pieces for {} from {} providers", content_id, providers.len());
+        info!("[handler.rs] Fetching pieces for {} from {} providers", content_id, providers.len());
 
         let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
             let mut s = scorer.lock().await;
@@ -723,7 +723,7 @@ impl DataCraftHandler {
                 }
                 (piece_ids, coeffs)
             };
-            info!("Segment {}: have {} local pieces, {} coefficients", seg_idx, local_piece_ids.len(), coeff_matrix.len());
+            info!("[handler.rs] Segment {}: have {} local pieces, {} coefficients", seg_idx, local_piece_ids.len(), coeff_matrix.len());
 
             let mut current_rank = if coeff_matrix.is_empty() {
                 0
@@ -736,7 +736,7 @@ impl DataCraftHandler {
             }
 
             let needed = k - current_rank;
-            info!("Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
+            info!("[handler.rs] Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
 
             // Spawn parallel piece requests using JoinSet
             let concurrency = needed.min(ranked_providers.len()).min(MAX_CONCURRENT);
@@ -761,7 +761,7 @@ impl DataCraftHandler {
                 let cmd_tx = command_tx.clone();
                 let cid = *content_id;
                 let have_piece_ids = have_piece_ids.clone();
-                info!("Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
+                info!("[handler.rs] Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
                     let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
@@ -830,24 +830,24 @@ impl DataCraftHandler {
                                     total_fetched += 1;
 
                                     if current_rank >= k {
-                                        info!("Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
+                                        info!("[handler.rs] Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
                                         break; // segment done
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Failed to store piece: {}", e);
+                                    warn!("[handler.rs] Failed to store piece: {}", e);
                                 }
                             }
                         } else {
                             // Dependent piece — discard, record success anyway (peer was fine)
-                            info!("Discarded dependent piece for segment {} from {}", seg_idx, provider);
+                            info!("[handler.rs] Discarded dependent piece for segment {} from {}", seg_idx, provider);
                             if let Some(ref scorer) = self.peer_scorer {
                                 scorer.lock().await.record_success(&provider, latency);
                             }
                         }
                     }
                     Err(ref e) => {
-                        info!("Failed to get piece from {}: {}", provider, e);
+                        info!("[handler.rs] Failed to get piece from {}: {}", provider, e);
                         let failures = provider_failures.entry(provider).or_insert(0);
                         *failures += 1;
                         if let Some(ref scorer) = self.peer_scorer {
@@ -1184,7 +1184,7 @@ impl DataCraftHandler {
             t.remove(&content_id);
         }
 
-        info!("Deleted local content {}", content_id);
+        info!("[handler.rs] Deleted local content {}", content_id);
         Ok(serde_json::json!({ "deleted": true }))
     }
 
@@ -1236,10 +1236,10 @@ impl DataCraftHandler {
                     debug!("Successfully published removal notice for {}", content_id);
                 }
                 Ok(Err(e)) => {
-                    warn!("Failed to publish removal notice: {}", e);
+                    warn!("[handler.rs] Failed to publish removal notice: {}", e);
                 }
                 Err(e) => {
-                    warn!("Removal notice channel closed: {}", e);
+                    warn!("[handler.rs] Removal notice channel closed: {}", e);
                 }
             }
         }
@@ -1580,7 +1580,7 @@ impl DataCraftHandler {
         config.merge(&partial);
         config.save(data_dir).map_err(|e| e.to_string())?;
 
-        info!("Config updated and saved");
+        info!("[handler.rs] Config updated and saved");
         serde_json::to_value(&*config).map_err(|e| e.to_string())
     }
 
@@ -2030,7 +2030,7 @@ impl IpcHandler for DataCraftHandler {
                 "network.health" => self.handle_network_health().await,
                 "node.stats" => self.handle_node_stats().await,
                 "shutdown" => {
-                    info!("Shutdown requested via RPC — broadcasting going-offline");
+                    info!("[handler.rs] Shutdown requested via RPC — broadcasting going-offline");
                     // Broadcast going-offline message before shutdown
                     if let Some(ref tx) = self.command_tx {
                         let local_peer_id = serde_json::json!({

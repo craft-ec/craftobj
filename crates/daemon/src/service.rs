@@ -118,7 +118,7 @@ pub async fn run_daemon_with_config(
             let cfg = crate::config::DaemonConfig::load_from(path);
             if !path.exists() {
                 if let Err(e) = cfg.save_to(path) {
-                    warn!("Failed to write default config to {:?}: {}", path, e);
+                    warn!("[service.rs] Failed to write default config to {:?}: {}", path, e);
                 }
             }
             cfg
@@ -128,13 +128,13 @@ pub async fn run_daemon_with_config(
             let config_file = data_dir.join("config.json");
             if !config_file.exists() {
                 if let Err(e) = cfg.save(&data_dir) {
-                    warn!("Failed to write default config to {:?}: {}", config_file, e);
+                    warn!("[service.rs] Failed to write default config to {:?}: {}", config_file, e);
                 }
             }
             cfg
         }
     };
-    info!("Daemon config: capability_announce={}s, reannounce_interval={}s, reannounce_threshold={}s",
+    info!("[service.rs] Daemon config: capability_announce={}s, reannounce_interval={}s, reannounce_threshold={}s",
         daemon_config.capability_announce_interval_secs,
         daemon_config.reannounce_interval_secs,
         daemon_config.reannounce_threshold_secs,
@@ -154,17 +154,17 @@ pub async fn run_daemon_with_config(
         let tmp_store = datacraft_store::FsStore::new(&data_dir)?;
         let tree = datacraft_store::merkle::StorageMerkleTree::build_from_store(&tmp_store)
             .unwrap_or_else(|e| {
-                warn!("Failed to build storage Merkle tree: {}, starting empty", e);
+                warn!("[service.rs] Failed to build storage Merkle tree: {}, starting empty", e);
                 datacraft_store::merkle::StorageMerkleTree::new()
             });
-        info!("Storage Merkle tree built: {} leaves, root={}", tree.len(), hex::encode(&tree.root()[..8]));
+        info!("[service.rs] Storage Merkle tree built: {} leaves, root={}", tree.len(), hex::encode(&tree.root()[..8]));
         Arc::new(Mutex::new(tree))
     };
 
     // Build swarm with DataCraft wrapper behaviour (CraftBehaviour + libp2p_stream)
     let (mut swarm, local_peer_id) = build_datacraft_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
-    info!("DataCraft node started: {}", local_peer_id);
+    info!("[service.rs] DataCraft node started: {}", local_peer_id);
 
     // Set Kademlia to server mode so DHT queries work (especially on localhost / LAN)
     swarm.behaviour_mut().craft.kademlia.set_mode(Some(libp2p::kad::Mode::Server));
@@ -187,20 +187,20 @@ pub async fn run_daemon_with_config(
                         .collect();
                     swarm.behaviour_mut().craft.add_address(&pid, dial_addr);
                     if let Err(e) = swarm.dial(pid) {
-                        warn!("Failed to dial boot peer {}: {:?}", addr_str, e);
+                        warn!("[service.rs] Failed to dial boot peer {}: {:?}", addr_str, e);
                     } else {
-                        info!("Dialing boot peer: {}", addr_str);
+                        info!("[service.rs] Dialing boot peer: {}", addr_str);
                     }
                 } else {
                     // No peer ID in multiaddr — dial the address directly.
                     // Won't add to Kademlia but will establish a connection for gossipsub.
-                    info!("Dialing boot peer (no peer_id): {}", addr_str);
+                    info!("[service.rs] Dialing boot peer (no peer_id): {}", addr_str);
                     if let Err(e) = swarm.dial(addr) {
-                        warn!("Failed to dial boot peer {}: {:?}", addr_str, e);
+                        warn!("[service.rs] Failed to dial boot peer {}: {:?}", addr_str, e);
                     }
                 }
             }
-            Err(e) => warn!("Invalid boot peer address '{}': {}", addr_str, e),
+            Err(e) => warn!("[service.rs] Invalid boot peer address '{}': {}", addr_str, e),
         }
     }
 
@@ -317,9 +317,9 @@ pub async fn run_daemon_with_config(
         if let Ok(tmp_store) = datacraft_store::FsStore::new(&data_dir) {
             match tmp_store.verify_integrity() {
                 Ok(removed) if removed > 0 => {
-                    warn!("Startup integrity check removed {} corrupted pieces", removed);
+                    warn!("[service.rs] Startup integrity check removed {} corrupted pieces", removed);
                 }
-                Err(e) => warn!("Integrity check failed: {}", e),
+                Err(e) => warn!("[service.rs] Integrity check failed: {}", e),
                 _ => {}
             }
         }
@@ -341,7 +341,7 @@ pub async fn run_daemon_with_config(
         if let Ok(tmp_store) = datacraft_store::FsStore::new(&data_dir) {
             let imported = tracker.import_from_store(&tmp_store);
             if imported > 0 {
-                info!("Imported {} existing content items into tracker on startup", imported);
+                info!("[service.rs] Imported {} existing content items into tracker on startup", imported);
             }
             // Sync tracker state with disk: validate local piece counts, reset stale remote state
             tracker.sync_with_store(&tmp_store);
@@ -356,7 +356,7 @@ pub async fn run_daemon_with_config(
             match cap.to_lowercase().as_str() {
                 "storage" => result.push(DataCraftCapability::Storage),
                 "client" => result.push(DataCraftCapability::Client),
-                _ => warn!("Unknown capability '{}' in config, skipping", cap),
+                _ => warn!("[service.rs] Unknown capability '{}' in config, skipping", cap),
             }
         }
         if result.is_empty() {
@@ -365,7 +365,7 @@ pub async fn run_daemon_with_config(
             result
         }
     };
-    info!("Capabilities: {:?}", own_capabilities);
+    info!("[service.rs] Capabilities: {:?}", own_capabilities);
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
     let mut handler = DataCraftHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone(), channel_store);
@@ -379,7 +379,7 @@ pub async fn run_daemon_with_config(
     if let Some(key) = node_signing_key {
         handler.set_node_signing_key(key);
     }
-    info!("Starting IPC server on {}", socket_path);
+    info!("[service.rs] Starting IPC server on {}", socket_path);
 
     // Create challenger manager
     let local_pubkey = crate::pdp::peer_id_to_local_pubkey(&local_peer_id);
@@ -413,7 +413,7 @@ pub async fn run_daemon_with_config(
     // Load or generate API key for WebSocket authentication
     let api_key = crate::api_key::load_or_generate(&data_dir)
         .map_err(|e| format!("Failed to load/generate API key: {}", e))?;
-    info!("API key loaded for WebSocket authentication");
+    info!("[service.rs] API key loaded for WebSocket authentication");
 
     // Start WebSocket server if enabled
     let ws_handler = handler.clone();
@@ -480,19 +480,19 @@ pub async fn run_daemon_with_config(
             }
         }
         _ = ws_future => {
-            info!("WebSocket server ended");
+            info!("[service.rs] WebSocket server ended");
         }
         _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections) => {
-            info!("Swarm event loop ended");
+            info!("[service.rs] Swarm event loop ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
-            info!("Protocol events handler ended");
+            info!("[service.rs] Protocol events handler ended");
         }
         _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes, daemon_config.region.clone(), merkle_tree.clone(), content_tracker.clone()) => {
-            info!("Capability announcement loop ended");
+            info!("[service.rs] Capability announcement loop ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
-            info!("Challenger loop ended");
+            info!("[service.rs] Challenger loop ended");
         }
         _ = crate::reannounce::content_maintenance_loop(
             content_tracker.clone(),
@@ -502,25 +502,25 @@ pub async fn run_daemon_with_config(
             event_tx.clone(),
             peer_scorer.clone(),
         ) => {
-            info!("Content maintenance loop ended");
+            info!("[service.rs] Content maintenance loop ended");
         }
         _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone(), content_tracker.clone()) => {
-            info!("Scaling maintenance loop ended");
+            info!("[service.rs] Scaling maintenance loop ended");
         }
         _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone()) => {
-            info!("Eviction maintenance loop ended");
+            info!("[service.rs] Eviction maintenance loop ended");
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
-            info!("Aggregation loop ended");
+            info!("[service.rs] Aggregation loop ended");
         }
         _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes) => {
-            info!("GC loop ended");
+            info!("[service.rs] GC loop ended");
         }
         _ = content_health_loop(content_tracker.clone(), store.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
-            info!("Content health loop ended");
+            info!("[service.rs] Content health loop ended");
         }
         _ = disk_monitor_loop(data_dir.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
-            info!("Disk monitor loop ended");
+            info!("[service.rs] Disk monitor loop ended");
         }
     }
 
@@ -562,7 +562,7 @@ async fn scaling_maintenance_loop(
                     let _ = command_tx.send(DataCraftCommand::BroadcastDemandSignal {
                         signal_data: data,
                     });
-                    info!("Broadcasting demand signal for {}: level={}", cid, demand_level);
+                    info!("[service.rs] Broadcasting demand signal for {}: level={}", cid, demand_level);
                 }
             }
         }
@@ -601,7 +601,7 @@ async fn eviction_maintenance_loop(
                     if ret == 0 {
                         let available = stat.f_bavail as u64 * stat.f_frsize as u64;
                         if available < DISK_SPACE_THRESHOLD {
-                            warn!("Low disk space: {} bytes available (threshold: {} bytes)", available, DISK_SPACE_THRESHOLD);
+                            warn!("[service.rs] Low disk space: {} bytes available (threshold: {} bytes)", available, DISK_SPACE_THRESHOLD);
                             let _ = event_tx.send(DaemonEvent::StoragePressure {
                                 available_bytes: available,
                                 threshold_bytes: DISK_SPACE_THRESHOLD,
@@ -684,7 +684,7 @@ async fn gc_loop(
         let all_cids = match s.list_content() {
             Ok(cids) => cids,
             Err(e) => {
-                warn!("GC: failed to list content: {}", e);
+                warn!("[service.rs] GC: failed to list content: {}", e);
                 continue;
             }
         };
@@ -726,7 +726,7 @@ async fn gc_loop(
 
         // Rebuild merkle tree if we deleted anything
         if deleted_count > 0 {
-            info!("GC: deleted {} unpinned content items", deleted_count);
+            info!("[service.rs] GC: deleted {} unpinned content items", deleted_count);
             if let Ok(new_tree) = datacraft_store::merkle::StorageMerkleTree::build_from_store(&s) {
                 *merkle_tree.lock().await = new_tree;
                 debug!("GC: rebuilt storage Merkle tree");
@@ -792,17 +792,17 @@ async fn drive_swarm(
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        info!("Listening on {}", address);
+                        info!("[service.rs] Listening on {}", address);
                         let _ = event_tx.send(DaemonEvent::ListeningOn { address: address.to_string() });
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                         let total = swarm.connected_peers().count();
                         // Max peer connection limit check
                         if total > max_peer_connections && num_established.get() == 1 {
-                            warn!("Max peer connections reached ({}/{}), rejecting {}", total, max_peer_connections, peer_id);
+                            warn!("[service.rs] Max peer connections reached ({}/{}), rejecting {}", total, max_peer_connections, peer_id);
                             // Close the connection by not opening streams and letting it timeout
                         }
-                        info!("Connected to {} ({} peers total)", peer_id, total);
+                        info!("[service.rs] Connected to {} ({} peers total)", peer_id, total);
                         // Clear reconnector state on successful connection
                         peer_reconnector.on_reconnected(&peer_id);
                         stream_manager.clear_open_cooldown(&peer_id);
@@ -867,7 +867,7 @@ async fn drive_swarm(
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         let remaining = swarm.connected_peers().count();
-                        info!("Disconnected from {} ({} peers remaining)", peer_id, remaining);
+                        info!("[service.rs] Disconnected from {} ({} peers remaining)", peer_id, remaining);
                         peer_scorer.lock().await.remove_peer(&peer_id);
                         peer_last_seen.remove(&peer_id);
                         stream_manager.on_peer_disconnected(&peer_id);
@@ -935,7 +935,7 @@ async fn drive_swarm(
                 if let Some(cmd) = command {
                     match cmd {
                         DataCraftCommand::TriggerDistribution => {
-                            info!("Received TriggerDistribution command — running initial push");
+                            info!("[service.rs] Received TriggerDistribution command — running initial push");
                             let ct = content_tracker.clone();
                             let ctx = command_tx.clone();
                             let cl = client.clone();
@@ -967,11 +967,11 @@ async fn drive_swarm(
 
             // Process inbound messages from peer streams
             Some(msg) = inbound_rx.recv() => {
-                info!("Processing inbound from {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&msg.request));
+                info!("[service.rs] Processing inbound from {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&msg.request));
                 let response = handle_incoming_transfer_request(
                     &msg.peer, msg.request, &store_for_repair, &content_tracker, &protocol,
                 ).await;
-                info!("Sending response to {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&response));
+                info!("[service.rs] Sending response to {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&response));
                 stream_manager.send_response(msg.peer, msg.seq_id, response);
             }
 
@@ -999,7 +999,7 @@ async fn drive_swarm(
                     peer_last_seen.entry(peer_id).or_insert(now);
                     if let Some(last) = peer_last_seen.get(&peer_id) {
                         if now.duration_since(*last) > timeout {
-                            warn!("Peer {} heartbeat timeout (no activity for >30s)", peer_id);
+                            warn!("[service.rs] Peer {} heartbeat timeout (no activity for >30s)", peer_id);
                             peer_scorer.lock().await.record_timeout(&peer_id);
                             let _ = event_tx.send(DaemonEvent::PeerHeartbeatTimeout {
                                 peer_id: peer_id.to_string(),
@@ -1022,10 +1022,10 @@ async fn handle_incoming_transfer_request(
 ) -> DataCraftResponse {
     match request {
         DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
-            info!("Handling PieceSync from {} for {}/seg{} (they have {} pieces, want max {})", peer, content_id, segment_index, have_pieces.len(), max_pieces);
+            info!("[service.rs] Handling PieceSync from {} for {}/seg{} (they have {} pieces, want max {})", peer, content_id, segment_index, have_pieces.len(), max_pieces);
             let store_guard = store.lock().await;
             let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
-            info!("We have {} pieces for {}/seg{}", piece_ids.len(), content_id, segment_index);
+            info!("[service.rs] We have {} pieces for {}/seg{}", piece_ids.len(), content_id, segment_index);
 
             let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
             let mut pieces = Vec::new();
@@ -1052,22 +1052,22 @@ async fn handle_incoming_transfer_request(
                 }
             }
 
-            info!("Responding with {} pieces for {}/seg{}", pieces.len(), content_id, segment_index);
+            info!("[service.rs] Responding with {} pieces for {}/seg{}", pieces.len(), content_id, segment_index);
             DataCraftResponse::PieceBatch { pieces }
         }
         DataCraftRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
-            info!("Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
+            info!("[service.rs] Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
             let store_guard = store.lock().await;
 
             // Check if we have the manifest (must receive ManifestPush first)
             if store_guard.get_manifest(&content_id).is_err() {
-                warn!("Received piece push for {} but no manifest — rejecting", content_id);
+                warn!("[service.rs] Received piece push for {} but no manifest — rejecting", content_id);
                 return DataCraftResponse::Ack { status: WireStatus::Error };
             }
 
             match store_guard.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
                 Ok(()) => {
-                    info!("Stored pushed piece for {}/seg{}", content_id, segment_index);
+                    info!("[service.rs] Stored pushed piece for {}/seg{}", content_id, segment_index);
                     // Notify protocol of piece push for tracker update
                     if let Err(e) = protocol.event_tx.send(DataCraftEvent::PiecePushReceived { content_id }) {
                         debug!("Failed to send piece push event: {}", e);
@@ -1075,19 +1075,19 @@ async fn handle_incoming_transfer_request(
                     DataCraftResponse::Ack { status: WireStatus::Ok }
                 }
                 Err(e) => {
-                    warn!("Failed to store pushed piece: {}", e);
+                    warn!("[service.rs] Failed to store pushed piece: {}", e);
                     DataCraftResponse::Ack { status: WireStatus::Error }
                 }
             }
         }
         DataCraftRequest::ManifestPush { content_id, manifest_json } => {
-            info!("Handling ManifestPush from {} for {}", peer, content_id);
+            info!("[service.rs] Handling ManifestPush from {} for {}", peer, content_id);
             match serde_json::from_slice::<datacraft_core::ContentManifest>(&manifest_json) {
                 Ok(manifest) => {
                     let store_guard = store.lock().await;
                     match store_guard.store_manifest(&manifest) {
                         Ok(()) => {
-                            info!("Stored manifest for {}", content_id);
+                            info!("[service.rs] Stored manifest for {}", content_id);
                             if let Err(e) = protocol.event_tx.send(DataCraftEvent::ManifestPushReceived {
                                 content_id,
                                 manifest,
@@ -1097,13 +1097,13 @@ async fn handle_incoming_transfer_request(
                             DataCraftResponse::Ack { status: WireStatus::Ok }
                         }
                         Err(e) => {
-                            warn!("Failed to store manifest: {}", e);
+                            warn!("[service.rs] Failed to store manifest: {}", e);
                             DataCraftResponse::Ack { status: WireStatus::Error }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to parse manifest JSON: {}", e);
+                    warn!("[service.rs] Failed to parse manifest JSON: {}", e);
                     DataCraftResponse::Ack { status: WireStatus::Error }
                 }
             }
@@ -1225,7 +1225,7 @@ async fn handle_command(
         }
         
         DataCraftCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
-            info!("Handling PieceSync command: {}/{} to peer {} (sending {} have_pieces, max_pieces={})", content_id, segment_index, peer_id, have_pieces.len(), max_pieces);
+            info!("[service.rs] Handling PieceSync command: {}/{} to peer {} (sending {} have_pieces, max_pieces={})", content_id, segment_index, peer_id, have_pieces.len(), max_pieces);
             let request = DataCraftRequest::PieceSync {
                 content_id,
                 segment_index,
@@ -1237,28 +1237,28 @@ async fn handle_command(
             let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
-                info!("Sending PieceSync outbound message to {}", peer_id);
+                info!("[service.rs] Sending PieceSync outbound message to {}", peer_id);
                 if tx.send(msg).await.is_err() {
-                    warn!("PieceSync to {}: outbound channel closed", peer_id);
+                    warn!("[service.rs] PieceSync to {}: outbound channel closed", peer_id);
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("PieceSync sent to outbound queue for {}, waiting for ack (15s timeout)", peer_id);
+                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (15s timeout)", peer_id);
                 match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await {
                     Ok(Ok(response)) => { 
                         let desc = match &response {
                             datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
                             other => format!("{:?}", other),
                         };
-                        info!("PieceSync to {}: got response: {}", peer_id, desc);
+                        info!("[service.rs] PieceSync to {}: got response: {}", peer_id, desc);
                         let _ = reply_tx.send(Ok(response)); 
                     }
                     Ok(Err(_)) => { 
-                        warn!("PieceSync to {}: ack channel closed (dropped)", peer_id);
+                        warn!("[service.rs] PieceSync to {}: ack channel closed (dropped)", peer_id);
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => { 
-                        warn!("PieceSync to {}: timed out after 15s", peer_id);
+                        warn!("[service.rs] PieceSync to {}: timed out after 15s", peer_id);
                         let _ = reply_tx.send(Err("piece sync timed out (15s)".into())); 
                     }
                 }
@@ -1318,7 +1318,7 @@ async fn handle_command(
             if let Ok(data) = bincode::serialize(&notice) {
                 if let Err(e) = swarm.behaviour_mut().craft
                     .publish_to_topic(datacraft_core::REMOVAL_TOPIC, data) {
-                    warn!("Failed to broadcast removal notice via gossipsub: {:?}", e);
+                    warn!("[service.rs] Failed to broadcast removal notice via gossipsub: {:?}", e);
                 }
             }
 
@@ -1329,7 +1329,7 @@ async fn handle_command(
             debug!("Broadcasting StorageReceipt via gossipsub ({} bytes)", receipt_data.len());
             if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::STORAGE_RECEIPT_TOPIC, receipt_data) {
-                warn!("Failed to broadcast StorageReceipt via gossipsub: {:?}", e);
+                warn!("[service.rs] Failed to broadcast StorageReceipt via gossipsub: {:?}", e);
             }
         }
 
@@ -1337,7 +1337,7 @@ async fn handle_command(
             debug!("Broadcasting repair message via gossipsub ({} bytes)", repair_data.len());
             if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::REPAIR_TOPIC, repair_data) {
-                warn!("Failed to broadcast repair message via gossipsub: {:?}", e);
+                warn!("[service.rs] Failed to broadcast repair message via gossipsub: {:?}", e);
             }
         }
 
@@ -1345,7 +1345,7 @@ async fn handle_command(
             debug!("Broadcasting demand signal via gossipsub ({} bytes)", signal_data.len());
             if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::SCALING_TOPIC, signal_data) {
-                warn!("Failed to broadcast demand signal via gossipsub: {:?}", e);
+                warn!("[service.rs] Failed to broadcast demand signal via gossipsub: {:?}", e);
             }
         }
 
@@ -1424,7 +1424,7 @@ async fn handle_command(
             debug!("Broadcasting going-offline message ({} bytes)", data.len());
             if let Err(e) = swarm.behaviour_mut().craft
                 .publish_to_topic(datacraft_core::NODE_STATUS_TOPIC, data) {
-                warn!("Failed to broadcast going-offline message: {:?}", e);
+                warn!("[service.rs] Failed to broadcast going-offline message: {:?}", e);
             }
         }
 
@@ -1446,7 +1446,7 @@ fn handle_mdns_event(
 
     if let CraftBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) = event {
         for (peer_id, addr) in peers {
-            info!("mDNS discovered peer {} at {}", peer_id, addr);
+            info!("[service.rs] mDNS discovered peer {} at {}", peer_id, addr);
             let _ = event_tx.send(DaemonEvent::PeerDiscovered {
                 peer_id: peer_id.to_string(),
                 address: addr.to_string(),
@@ -1742,7 +1742,7 @@ async fn handle_gossipsub_going_offline(
             // Try to parse as a going-offline message
             if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
                 if val.get("type").and_then(|t| t.as_str()) == Some("going_offline") {
-                    info!("Peer {} announced going offline", propagation_source);
+                    info!("[service.rs] Peer {} announced going offline", propagation_source);
                     peer_scorer.lock().await.remove_peer(propagation_source);
                     let _ = event_tx.send(DaemonEvent::PeerGoingOffline {
                         peer_id: propagation_source.to_string(),
@@ -1808,12 +1808,12 @@ async fn handle_protocol_events(
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
 ) {
-    info!("Starting protocol events handler");
+    info!("[service.rs] Starting protocol events handler");
     
     while let Some(event) = event_rx.recv().await {
         match event {
             DataCraftEvent::ProvidersResolved { content_id, providers } => {
-                info!("Found {} providers for {}", providers.len(), content_id);
+                info!("[service.rs] Found {} providers for {}", providers.len(), content_id);
                 let _ = daemon_event_tx.send(DaemonEvent::ProvidersResolved {
                     content_id: content_id.to_hex(),
                     count: providers.len(),
@@ -1836,7 +1836,7 @@ async fn handle_protocol_events(
             }
             
             DataCraftEvent::ManifestRetrieved { content_id, manifest } => {
-                info!("Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count);
+                info!("[service.rs] Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count);
                 let _ = daemon_event_tx.send(DaemonEvent::ManifestRetrieved {
                     content_id: content_id.to_hex(),
                     segments: manifest.segment_count,
@@ -1851,7 +1851,7 @@ async fn handle_protocol_events(
             }
             
             DataCraftEvent::AccessListRetrieved { content_id, access_list } => {
-                info!("Retrieved access list for {} ({} entries)", content_id, access_list.entries.len());
+                info!("[service.rs] Retrieved access list for {} ({} entries)", content_id, access_list.entries.len());
                 let mut pending = pending_requests.lock().await;
                 if let Some(PendingRequest::GetAccessList { reply_tx }) = pending.remove(&content_id) {
                     let _ = reply_tx.send(Ok(access_list));
@@ -1864,7 +1864,7 @@ async fn handle_protocol_events(
                 t.increment_local_pieces(&content_id);
             }
             DataCraftEvent::ManifestPushReceived { content_id, manifest } => {
-                info!("Received manifest push for {} — tracking as storage provider", content_id);
+                info!("[service.rs] Received manifest push for {} — tracking as storage provider", content_id);
                 let mut t = content_tracker.lock().await;
                 t.track_stored(content_id, &manifest);
                 drop(t);
@@ -1884,8 +1884,8 @@ async fn handle_protocol_events(
                 };
                 if command_tx.send(cmd).is_ok() {
                     match reply_rx.await {
-                        Ok(Ok(())) => info!("Announced as provider for {} after receiving push", content_id),
-                        Ok(Err(e)) => warn!("Failed to announce as provider for {}: {}", content_id, e),
+                        Ok(Ok(())) => info!("[service.rs] Announced as provider for {} after receiving push", content_id),
+                        Ok(Err(e)) => warn!("[service.rs] Failed to announce as provider for {}: {}", content_id, e),
                         Err(_) => {}
                     }
                 }
@@ -1904,13 +1904,13 @@ async fn handle_protocol_events(
                             for peer in &providers {
                                 t.add_provider(&content_id, *peer);
                             }
-                            info!("Storage node discovered {} providers for {}", providers.len(), content_id);
+                            info!("[service.rs] Storage node discovered {} providers for {}", providers.len(), content_id);
                         }
                     }
                 });
             }
             DataCraftEvent::DhtError { content_id, error } => {
-                warn!("DHT error for {}: {}", content_id, error);
+                warn!("[service.rs] DHT error for {}: {}", content_id, error);
                 let _ = daemon_event_tx.send(DaemonEvent::DhtError {
                     content_id: content_id.to_hex(),
                     error: error.clone(),
@@ -1976,7 +1976,7 @@ async fn content_health_loop(
 
             let health = actual_pieces as f64 / total_needed as f64;
             if health < 0.5 {
-                warn!("Content {} critically degraded: health={:.2}", cid, health);
+                warn!("[service.rs] Content {} critically degraded: health={:.2}", cid, health);
                 let _ = event_tx.send(DaemonEvent::ContentCritical {
                     content_id: cid.to_hex(),
                     health,
@@ -1985,7 +1985,7 @@ async fn content_health_loop(
                 // Mark degraded in tracker
                 content_tracker.lock().await.mark_degraded(cid);
             } else if health < 0.8 {
-                info!("Content {} degraded: health={:.2}", cid, health);
+                info!("[service.rs] Content {} degraded: health={:.2}", cid, health);
                 let _ = event_tx.send(DaemonEvent::ContentDegraded {
                     content_id: cid.to_hex(),
                     health,
@@ -2043,7 +2043,7 @@ async fn run_challenger_loop(
         let mut mgr = challenger.lock().await;
         let rounds = mgr.periodic_check(&store_guard).await;
         if rounds > 0 {
-            info!("Challenger completed {} rounds", rounds);
+            info!("[service.rs] Challenger completed {} rounds", rounds);
             let _ = event_tx.send(DaemonEvent::ChallengerRoundCompleted { rounds: rounds as u32 });
         }
     }
