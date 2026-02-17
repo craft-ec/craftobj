@@ -15,7 +15,7 @@ use libp2p::request_response;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::behaviour::{build_datacraft_swarm, DataCraftBehaviour, DataCraftBehaviourEvent, DataCraftSwarm};
+use crate::behaviour::{build_datacraft_swarm, DataCraftBehaviourEvent, DataCraftSwarm};
 use crate::commands::DataCraftCommand;
 use crate::events::{self, DaemonEvent, EventSender};
 use crate::handler::DataCraftHandler;
@@ -751,7 +751,7 @@ async fn drive_swarm(
     repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>>,
     store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
     scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
-    demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
+    _demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
@@ -916,7 +916,7 @@ async fn drive_swarm(
                                                 let response = handle_incoming_transfer_request(
                                                     &peer, request, &store_for_repair, &content_tracker, &protocol,
                                                 ).await;
-                                                if let Err(resp) = swarm.behaviour_mut().transfer.send_response(channel, response) {
+                                                if let Err(_resp) = swarm.behaviour_mut().transfer.send_response(channel, response) {
                                                     warn!("Failed to send transfer response to {}: response dropped", peer);
                                                 }
                                             }
@@ -1018,7 +1018,7 @@ async fn handle_incoming_transfer_request(
     peer: &libp2p::PeerId,
     request: DataCraftRequest,
     store: &Arc<Mutex<datacraft_store::FsStore>>,
-    content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    _content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
     protocol: &Arc<DataCraftProtocol>,
 ) -> DataCraftResponse {
     match request {
@@ -1730,7 +1730,7 @@ async fn announce_capabilities_periodically(
     interval_secs: u64,
     client: Arc<Mutex<datacraft_client::DataCraftClient>>,
     max_storage_bytes: u64,
-    region: Option<String>,
+    _region: Option<String>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {

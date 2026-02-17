@@ -8,7 +8,7 @@ use craftec_network::behaviour::CraftBehaviourEvent;
 use craftec_network::NetworkConfig;
 use datacraft_transfer::{DataCraftCodec, DataCraftRequest, DataCraftResponse};
 use libp2p::identity::Keypair;
-use libp2p::{noise, request_response, tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
+use libp2p::{noise, request_response, tcp, yamux, PeerId, StreamProtocol, SwarmBuilder};
 use libp2p::swarm::NetworkBehaviour;
 use std::time::Duration;
 use tracing::info;

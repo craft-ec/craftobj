@@ -154,7 +154,7 @@ impl RepairCoordinator {
     pub fn execute_repair(
         &mut self,
         store: &FsStore,
-        manifest: &ContentManifest,
+        _manifest: &ContentManifest,
         content_id: ContentId,
         segment_index: u32,
         known_providers: &[PeerId],

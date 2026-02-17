@@ -94,7 +94,7 @@ impl ContentTracker {
 
     pub fn with_threshold(data_dir: &std::path::Path, reannounce_threshold_secs: u64) -> Self {
         let path = data_dir.join("content_tracker.json");
-        let mut states = Self::load_from(&path).unwrap_or_default();
+        let states = Self::load_from(&path).unwrap_or_default();
         debug!("ContentTracker loaded {} entries from {:?}", states.len(), path);
         Self { states, path, reannounce_threshold_secs, providers: HashMap::new() }
     }

@@ -698,7 +698,7 @@ impl DataCraftHandler {
             let k = manifest.k_for_segment(seg_idx as usize);
 
             // Load existing pieces' coefficient vectors for independence checking
-            let (local_pieces, mut coeff_matrix) = {
+            let (_local_pieces, mut coeff_matrix) = {
                 let client = self.client.lock().await;
                 let piece_ids = client.store().list_pieces(content_id, seg_idx).unwrap_or_default();
                 let mut coeffs = Vec::with_capacity(piece_ids.len());
