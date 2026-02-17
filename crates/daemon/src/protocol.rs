@@ -27,12 +27,14 @@ use crate::events::{DaemonEvent, EventSender};
 use crate::receipt_store::PersistentReceiptStore;
 use crate::stream_manager::StreamPool;
 
-/// Timeout for read operations (30 seconds).
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for read operations (30 seconds).
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 /// Timeout for write operations (15 seconds).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Timeout for opening a new stream (10 seconds).
-const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default timeout for opening a new stream (10 seconds).
+const DEFAULT_STREAM_OPEN_TIMEOUT_SECS: u64 = 10;
+/// Fallback stream open timeout used by static methods that don't have access to config.
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(DEFAULT_STREAM_OPEN_TIMEOUT_SECS);
 /// Maximum retry attempts for transient errors.
 const MAX_RETRIES: u32 = 3;
 /// Minimum disk space threshold in bytes (100 MB).
@@ -106,6 +108,10 @@ pub struct DataCraftProtocol {
     daemon_event_tx: Option<EventSender>,
     /// Peer scorer for tracking bad data.
     peer_scorer: Option<Arc<Mutex<crate::peer_scorer::PeerScorer>>>,
+    /// Configurable piece timeout (read timeout) in seconds.
+    piece_timeout_secs: u64,
+    /// Configurable stream open timeout in seconds.
+    stream_open_timeout_secs: u64,
 }
 
 /// Tracks what we're waiting for from a DHT query.
@@ -121,7 +127,15 @@ async fn timed_read<F, T>(fut: F) -> Result<T, TransferError>
 where
     F: std::future::Future<Output = Result<T, std::io::Error>>,
 {
-    match tokio::time::timeout(READ_TIMEOUT, fut).await {
+    timed_read_secs(fut, DEFAULT_READ_TIMEOUT_SECS).await
+}
+
+/// Helper: wrap a read operation with configurable timeout.
+async fn timed_read_secs<F, T>(fut: F, timeout_secs: u64) -> Result<T, TransferError>
+where
+    F: std::future::Future<Output = Result<T, std::io::Error>>,
+{
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(e)) => Err(TransferError::from_io(&e)),
         Err(_) => Err(TransferError::Timeout),
@@ -188,6 +202,8 @@ impl DataCraftProtocol {
             inbound_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             daemon_event_tx: None,
             peer_scorer: None,
+            piece_timeout_secs: DEFAULT_READ_TIMEOUT_SECS,
+            stream_open_timeout_secs: DEFAULT_STREAM_OPEN_TIMEOUT_SECS,
         }
     }
 
@@ -223,6 +239,13 @@ impl DataCraftProtocol {
 
     pub fn set_peer_scorer(&mut self, scorer: Arc<Mutex<crate::peer_scorer::PeerScorer>>) {
         self.peer_scorer = Some(scorer);
+    }
+
+    /// Configure protocol limits from daemon config.
+    pub fn set_limits(&mut self, max_concurrent_transfers: usize, piece_timeout_secs: u64, stream_open_timeout_secs: u64) {
+        self.inbound_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_transfers));
+        self.piece_timeout_secs = piece_timeout_secs;
+        self.stream_open_timeout_secs = stream_open_timeout_secs;
     }
 
     /// Emit a transfer error event to the UI.
@@ -555,7 +578,7 @@ impl DataCraftProtocol {
         } else {
             let mut control = behaviour.stream_control();
             let stream = tokio::time::timeout(
-                STREAM_OPEN_TIMEOUT,
+                Duration::from_secs(self.stream_open_timeout_secs),
                 control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
             )
             .await

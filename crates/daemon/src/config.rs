@@ -163,7 +163,11 @@ impl DaemonConfig {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        // Atomic write: write to .tmp then rename
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Save config to `{data_dir}/config.json`.

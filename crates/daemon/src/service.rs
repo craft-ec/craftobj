@@ -297,6 +297,11 @@ pub async fn run_daemon_with_config(
     protocol.set_stream_pool(stream_pool.clone());
     protocol.set_daemon_event_tx(event_tx.clone());
     protocol.set_peer_scorer(peer_scorer.clone());
+    protocol.set_limits(
+        daemon_config.max_concurrent_transfers,
+        daemon_config.piece_timeout_secs,
+        daemon_config.stream_open_timeout_secs,
+    );
 
     let protocol = Arc::new(protocol);
 
@@ -355,7 +360,8 @@ pub async fn run_daemon_with_config(
             if imported > 0 {
                 info!("Imported {} existing content items into tracker on startup", imported);
             }
-            // TODO: sync_with_store — needs ContentTracker method (separate PR)
+            // Sync tracker state with disk: validate local piece counts, reset stale remote state
+            tracker.sync_with_store(&tmp_store);
         }
         Arc::new(Mutex::new(tracker))
     };
@@ -492,7 +498,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), stream_pool.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), stream_pool.clone(), daemon_config.max_peer_connections) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -777,6 +783,7 @@ async fn drive_swarm(
     signing_key: Option<ed25519_dalek::SigningKey>,
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     stream_pool: Arc<Mutex<crate::stream_manager::StreamPool>>,
+    max_peer_connections: usize,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -808,9 +815,9 @@ async fn drive_swarm(
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                         let total = swarm.connected_peers().count();
                         // Max peer connection limit check
-                        // (use 50 as default; daemon_config not directly accessible here, passed via max_peer_connections param would require refactor — we use a reasonable inline default)
-                        if total > 50 && num_established.get() == 1 {
-                            debug!("Max peer connections reached ({}), would reject {} in production", total, peer_id);
+                        if total > max_peer_connections && num_established.get() == 1 {
+                            warn!("Max peer connections reached ({}/{}), rejecting {}", total, max_peer_connections, peer_id);
+                            // Close the connection by not opening streams and letting it timeout
                         }
                         info!("Connected to {} ({} peers total)", peer_id, total);
                         // Clear reconnector state on successful connection
