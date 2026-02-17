@@ -142,6 +142,15 @@ impl StreamManager {
     }
 
     /// Send a response frame to a peer on our outbound stream (fire-and-forget).
+    /// Force close and re-open outbound to a peer.
+    /// Used when a duplicate connection is detected — our existing outbound
+    /// may be on the connection that libp2p is about to close.
+    pub fn force_reopen_outbound(&mut self, peer: &PeerId) {
+        info!("[stream_mgr.rs] force_reopen_outbound: closing outbound to {} and re-opening", peer);
+        self.close_outbound(peer);
+        self.ensure_opening(*peer);
+    }
+
     /// Get a sender for spawned tasks to return responses.
     pub fn get_response_sender(&self) -> mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)> {
         self.response_tx.clone()

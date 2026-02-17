@@ -809,7 +809,14 @@ async fn drive_swarm(
                         // Clear reconnector state on successful connection
                         peer_reconnector.on_reconnected(&peer_id);
                         stream_manager.clear_open_cooldown(&peer_id);
-                        stream_manager.ensure_opening(peer_id);
+                        // Duplicate connection: our outbound may be on the connection libp2p
+                        // is about to close. Force re-open to land on the surviving one.
+                        if num_established.get() > 1 {
+                            info!("[service.rs] Duplicate connection to {} (num_established={}), forcing outbound stream re-open", peer_id, num_established);
+                            stream_manager.force_reopen_outbound(&peer_id);
+                        } else {
+                            stream_manager.ensure_opening(peer_id);
+                        }
                         // Track for heartbeat
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
