@@ -742,7 +742,7 @@ impl DataCraftHandler {
             let concurrency = needed.min(ranked_providers.len()).min(MAX_CONCURRENT);
             let mut join_set: JoinSet<(
                 libp2p::PeerId,
-                std::result::Result<(Vec<u8>, Vec<u8>), String>,
+                std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, String>,
                 std::time::Duration,
             )> = JoinSet::new();
 
@@ -775,14 +775,17 @@ impl DataCraftHandler {
                         reply_tx,
                     };
                     if cmd_tx.send(command).is_err() {
-                        return (provider, Err::<(Vec<u8>, Vec<u8>), String>("command channel closed".into()), start.elapsed());
+                        return (provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
                     }
                     match reply_rx.await {
                         Ok(Ok(datacraft_transfer::DataCraftResponse::PieceBatch { pieces })) => {
-                            if let Some(piece) = pieces.into_iter().next() {
-                                (provider, Ok((piece.coefficients, piece.data)), start.elapsed())
-                            } else {
+                            if pieces.is_empty() {
                                 (provider, Err("no pieces returned".into()), start.elapsed())
+                            } else {
+                                let batch: Vec<(Vec<u8>, Vec<u8>)> = pieces.into_iter()
+                                    .map(|p| (p.coefficients, p.data))
+                                    .collect();
+                                (provider, Ok(batch), start.elapsed())
                             }
                         }
                         Ok(Ok(_)) => (provider, Err("unexpected response type".into()), start.elapsed()),
@@ -801,51 +804,53 @@ impl DataCraftHandler {
                 };
 
                 match piece_result {
-                    Ok((coefficients, piece_data)) => {
-                        info!("[handler.rs] Got piece from {}, data_len={}, coeff_len={}", provider, piece_data.len(), coefficients.len());
-                        // Check linear independence before storing
-                        let mut test_matrix = coeff_matrix.clone();
-                        test_matrix.push(coefficients.clone());
-                        let new_rank = craftec_erasure::check_independence(&test_matrix);
-                        info!("[handler.rs] Independence check: old_rank={}, new_rank={}, k={}", current_rank, new_rank, k);
+                    Ok(batch) => {
+                        info!("[handler.rs] Got {} pieces from {}", batch.len(), provider);
+                        let mut any_stored = false;
+                        for (coefficients, piece_data) in batch {
+                            // Check linear independence before storing
+                            let mut test_matrix = coeff_matrix.clone();
+                            test_matrix.push(coefficients.clone());
+                            let new_rank = craftec_erasure::check_independence(&test_matrix);
 
-                        if new_rank > current_rank {
-                            // Independent piece — store it
-                            let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+                            if new_rank > current_rank {
+                                // Independent piece — store it
+                                let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
 
+                                let stored = {
+                                    let client = self.client.lock().await;
+                                    client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients)
+                                };
+
+                                match stored {
+                                    Ok(()) => {
+                                        if let Some(ref mt) = self.merkle_tree {
+                                            mt.lock().await.insert(content_id, seg_idx, &piece_id);
+                                        }
+                                        coeff_matrix.push(coefficients);
+                                        current_rank = new_rank;
+                                        total_fetched += 1;
+                                        any_stored = true;
+                                        info!("[handler.rs] Stored piece from {}: rank now {}/{}", provider, current_rank, k);
+
+                                        if current_rank >= k {
+                                            info!("[handler.rs] Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[handler.rs] Failed to store piece: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        if any_stored {
                             if let Some(ref scorer) = self.peer_scorer {
                                 scorer.lock().await.record_success(&provider, latency);
                             }
-
-                            let stored = {
-                                let client = self.client.lock().await;
-                                client.store().store_piece(content_id, seg_idx, &piece_id, &piece_data, &coefficients)
-                            };
-
-                            match stored {
-                                Ok(()) => {
-                                    if let Some(ref mt) = self.merkle_tree {
-                                        mt.lock().await.insert(content_id, seg_idx, &piece_id);
-                                    }
-                                    coeff_matrix.push(coefficients);
-                                    current_rank = new_rank;
-                                    total_fetched += 1;
-
-                                    if current_rank >= k {
-                                        info!("[handler.rs] Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
-                                        break; // segment done
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("[handler.rs] Failed to store piece: {}", e);
-                                }
-                            }
-                        } else {
-                            // Dependent piece — discard, record success anyway (peer was fine)
-                            info!("[handler.rs] Discarded dependent piece for segment {} from {}", seg_idx, provider);
-                            if let Some(ref scorer) = self.peer_scorer {
-                                scorer.lock().await.record_success(&provider, latency);
-                            }
+                        }
+                        if current_rank >= k {
+                            break; // segment done
                         }
                     }
                     Err(ref e) => {
@@ -881,14 +886,17 @@ impl DataCraftHandler {
                                     reply_tx,
                                 };
                                 if cmd_tx.send(command).is_err() {
-                                    return (next_provider, Err::<(Vec<u8>, Vec<u8>), String>("command channel closed".into()), start.elapsed());
+                                    return (next_provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
                                 }
                                 match reply_rx.await {
                                     Ok(Ok(datacraft_transfer::DataCraftResponse::PieceBatch { pieces })) => {
-                                        if let Some(piece) = pieces.into_iter().next() {
-                                            (next_provider, Ok((piece.coefficients, piece.data)), start.elapsed())
-                                        } else {
+                                        if pieces.is_empty() {
                                             (next_provider, Err("no pieces returned".into()), start.elapsed())
+                                        } else {
+                                            let batch: Vec<(Vec<u8>, Vec<u8>)> = pieces.into_iter()
+                                                .map(|p| (p.coefficients, p.data))
+                                                .collect();
+                                            (next_provider, Ok(batch), start.elapsed())
                                         }
                                     }
                                     Ok(Ok(_)) => (next_provider, Err("unexpected response type".into()), start.elapsed()),
