@@ -770,9 +770,6 @@ async fn drive_swarm(
 
     // Stream manager for persistent piece transfer
     let mut stream_control = swarm.behaviour().stream.new_control();
-    let mut incoming_streams = stream_control
-        .accept(transfer_stream_protocol())
-        .expect("failed to accept transfer streams");
     let (mut stream_manager, mut inbound_rx, outbound_tx) = StreamManager::new(stream_control);
 
     // Peer reconnector for exponential backoff reconnection
@@ -975,11 +972,7 @@ async fn drive_swarm(
                     }
                 }
             }
-            // Accept incoming transfer streams from peers
-            Some((peer, stream)) = incoming_streams.next() => {
-                debug!("Accepted incoming transfer stream from {}", peer);
-                stream_manager.accept_stream(peer, stream);
-            }
+            // Incoming streams handled by StreamManager's inbound_acceptor task
 
             // Process inbound messages from peer streams
             Some(msg) = inbound_rx.recv() => {
@@ -991,16 +984,15 @@ async fn drive_swarm(
                 let proto_clone = protocol.clone();
                 let peer = msg.peer;
                 let seq_id = msg.seq_id;
-                let response_writer = msg.response_writer;
+                let mut stream = msg.stream;
                 tokio::spawn(async move {
                     let response = handle_incoming_transfer_request(
                         &peer, msg.request, &store_clone, &ct_clone, &proto_clone,
                     ).await;
                     info!("[service.rs] Spawned handler done for {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
                     // Write response back on the SAME stream the request came from
-                    let mut w = response_writer.lock().await;
-                    match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
-                        Ok(()) => info!("[service.rs] Wrote response to {} seq={} on inbound stream", peer, seq_id),
+                    match datacraft_transfer::wire::write_response_frame(&mut stream, seq_id, &response).await {
+                        Ok(()) => info!("[service.rs] Wrote response to {} seq={}", peer, seq_id),
                         Err(e) => warn!("[service.rs] Failed to write response to {} seq={}: {}", peer, seq_id, e),
                     }
                 });
@@ -1271,7 +1263,7 @@ async fn handle_command(
                 max_pieces,
             };
             let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
                 info!("[service.rs] Sending PieceSync outbound message to {}", peer_id);
@@ -1396,7 +1388,7 @@ async fn handle_command(
                 data: piece_data,
             };
             let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
                 info!("[service.rs] PushPiece: sending to outbound queue for {}", peer_id);
@@ -1438,7 +1430,7 @@ async fn handle_command(
                 manifest_json,
             };
             let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, ack_tx: Some(ack_tx) };
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
                 info!("[service.rs] PushManifest: sending to outbound queue for {}", peer_id);
