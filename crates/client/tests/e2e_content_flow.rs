@@ -355,7 +355,7 @@ fn exact_one_segment_file() {
     let mut client = DataCraftClient::new(&dir).unwrap();
 
     // 10MB = segment_size → exactly 1 segment, k = 10MB/100KB = 100
-    let content = random_data(10_240_000);
+    let content = random_data(10_485_760);
     let file_path = dir.join("exact.bin");
     std::fs::write(&file_path, &content).unwrap();
 

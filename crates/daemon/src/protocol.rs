@@ -154,6 +154,15 @@ where
     }
 }
 
+/// Write data and flush in one call. Without flush, data may sit in yamux buffers
+/// and never reach the remote peer (causing both sides to hang).
+async fn write_and_flush(stream: &mut libp2p::Stream, data: &[u8]) -> Result<(), TransferError> {
+    use futures::AsyncWriteExt;
+    timed_write(stream.write_all(data)).await?;
+    timed_write(stream.flush()).await?;
+    Ok(())
+}
+
 /// Check available disk space at the given path. Returns bytes available.
 fn available_disk_space(path: &std::path::Path) -> Option<u64> {
     #[cfg(unix)]
@@ -559,47 +568,23 @@ impl DataCraftProtocol {
             content_id, segment_index, peer_id
         );
 
-        // Try stream pool first, fall back to fresh open_stream
-        let (stream_arc, use_pool) = if let Some(ref pool) = self.stream_pool {
-            let mut p = pool.lock().await;
-            if let Some(s) = p.get_stream(&peer_id) {
-                (Some(s), true)
+        // Always open a fresh stream for piece requests to avoid
+        // interference with push streams in the pool.
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(self.stream_open_timeout_secs),
+            control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
+        )
+        .await
+        .map_err(|_| TransferError::Timeout)?
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("refused") || msg.contains("Refused") {
+                TransferError::PeerRefused
             } else {
-                p.ensure_opening(peer_id);
-                (None, true)
+                TransferError::ConnectionLost
             }
-        } else {
-            (None, false)
-        };
-
-        let result = if let Some(stream_arc) = stream_arc {
-            let mut stream = stream_arc.lock().await;
-            Self::do_request_piece(&mut *stream, peer_id, content_id, segment_index, piece_id).await
-        } else {
-            let stream = tokio::time::timeout(
-                Duration::from_secs(self.stream_open_timeout_secs),
-                control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
-            )
-            .await
-            .map_err(|_| TransferError::Timeout)?
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("refused") || msg.contains("Refused") {
-                    TransferError::PeerRefused
-                } else {
-                    TransferError::ConnectionLost
-                }
-            })?;
-            let mut stream = stream;
-            Self::do_request_piece(&mut stream, peer_id, content_id, segment_index, piece_id).await
-        };
-
-        if result.is_err() {
-            if let Some(ref pool) = self.stream_pool {
-                pool.lock().await.mark_dead(&peer_id);
-            }
-        }
-        result
+        })?;
+        Self::do_request_piece(&mut stream, peer_id, content_id, segment_index, piece_id).await
     }
 
     /// Internal: perform piece request on an already-opened stream.
@@ -615,7 +600,7 @@ impl DataCraftProtocol {
         use datacraft_core::WireStatus;
 
         let request = encode_piece_request(content_id, segment_index, piece_id);
-        timed_write(stream.write_all(&request)).await?;
+        write_and_flush(stream, &request).await?;
 
         let mut status_byte = [0u8; 1];
         timed_read(stream.read_exact(&mut status_byte)).await?;
@@ -901,7 +886,7 @@ impl DataCraftProtocol {
         if content_id.0 == [0u8; 32] {
             warn!("Rejecting piece request with zero content_id");
             let response = encode_piece_response_error(datacraft_core::WireStatus::Error);
-            let _ = timed_write(stream.write_all(&response)).await;
+            let _ = write_and_flush(stream, &response).await;
             return;
         }
 
@@ -911,7 +896,7 @@ impl DataCraftProtocol {
             if cache.is_removed(&content_id) {
                 warn!("Refusing to serve removed content: {}", content_id);
                 let response = encode_piece_response_error(datacraft_core::WireStatus::NotFound);
-                let _ = timed_write(stream.write_all(&response)).await;
+                let _ = write_and_flush(stream, &response).await;
                 return;
             }
         }
@@ -934,7 +919,7 @@ impl DataCraftProtocol {
                     content_id, segment_index, data.len(), coefficients.len()
                 );
                 let response = encode_piece_response(datacraft_core::WireStatus::Ok, &coefficients, &data);
-                if let Err(e) = timed_write(stream.write_all(&response)).await {
+                if let Err(e) = write_and_flush(stream, &response).await {
                     error!("Failed to write response: {}", e);
                 }
                 // Record fetch for demand tracking (scaling)
@@ -951,7 +936,7 @@ impl DataCraftProtocol {
             _ => {
                 warn!("Piece not found: {}/{}", content_id, segment_index);
                 let response = encode_piece_response_error(datacraft_core::WireStatus::NotFound);
-                let _ = timed_write(stream.write_all(&response)).await;
+                let _ = write_and_flush(stream, &response).await;
             }
         }
     }
@@ -1067,7 +1052,8 @@ impl DataCraftProtocol {
 
         // Ack immediately — data is in memory, storage happens async.
         // This unblocks the sender and frees the stream for the next piece.
-        let _ = timed_write(stream.write_all(&[datacraft_core::WireStatus::Ok as u8])).await;
+        // Flush is critical: without it, the ack sits in yamux buffer and the sender hangs.
+        let _ = write_and_flush(stream, &[datacraft_core::WireStatus::Ok as u8]).await;
 
         // Spawn storage work with bounded concurrency
         let store = self.store.clone();

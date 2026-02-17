@@ -554,8 +554,8 @@ mod tests {
         ContentManifest {
             content_id: cid,
             content_hash: cid.0,
-            segment_size: 10_240_000,
-            piece_size: 102_400,
+            segment_size: 10_485_760,
+            piece_size: 262_144,
             segment_count: 1,
             total_size: 1000,
             creator: String::new(),
