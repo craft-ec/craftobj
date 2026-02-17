@@ -131,6 +131,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !listen.is_empty() {
         network_config.listen_addrs = vec![listen.parse()?];
+    } else {
+        // Use listen_port from config if available, otherwise random port
+        let actual_config_path = config_path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| data_dir.join("config.json"));
+        if actual_config_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&actual_config_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(port) = json.get("listen_port").and_then(|v| v.as_u64()) {
+                        let addr = format!("/ip4/0.0.0.0/tcp/{}", port);
+                        info!("Using listen_port {} from config", port);
+                        network_config.listen_addrs = vec![addr.parse()?];
+                    }
+                }
+            }
+        }
     }
 
     info!("DataCraft daemon starting with peer ID {}", peer_id);

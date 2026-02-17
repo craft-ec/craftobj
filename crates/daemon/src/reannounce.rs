@@ -239,11 +239,11 @@ pub async fn run_initial_push(
         for (peer, result) in futures::future::join_all(manifest_futs).await {
             match result {
                 Ok(Ok(())) => {
-                    debug!("Pushed manifest for {} to {}", content_id, peer);
+                    info!("Pushed manifest for {} to {}", content_id, peer);
                     manifest_ok_peers.push(peer);
                 }
                 Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
-                Err(_) => {}
+                Err(_) => { warn!("Manifest push to {} — reply channel dropped", peer); }
             }
         }
     }
@@ -313,17 +313,18 @@ pub async fn run_initial_push(
         match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
             Ok(Ok(Ok(()))) => {
                 total_pushed += 1;
+                info!("Pushed piece {}/{} for {} to {}", total_pushed, total_pieces, content_id, peer);
             }
             Ok(Ok(Err(e))) => {
-                warn!("Push piece to {} failed: {}, marking as dead", peer, e);
+                warn!("Push piece {}/{} to {} failed: {}, marking as dead", i+1, total_pieces, peer, e);
                 failed_peers.insert(peer);
             }
             Ok(Err(_)) => {
-                // channel closed
+                warn!("Push piece {}/{} to {} — reply channel dropped, marking as dead", i+1, total_pieces, peer);
                 failed_peers.insert(peer);
             }
             Err(_) => {
-                warn!("Push piece to {} timed out, marking as dead", peer);
+                warn!("Push piece {}/{} to {} timed out (10s), marking as dead", i+1, total_pieces, peer);
                 failed_peers.insert(peer);
             }
         }
