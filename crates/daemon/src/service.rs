@@ -1281,8 +1281,8 @@ async fn handle_command(
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (30s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(30), ack_rx).await {
+                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (5s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
                     Ok(Ok(response)) => { 
                         let desc = match &response {
                             datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
@@ -1296,7 +1296,7 @@ async fn handle_command(
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => { 
-                        warn!("[service.rs] PieceSync to {}: timed out after 30s", peer_id);
+                        warn!("[service.rs] PieceSync to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("piece sync timed out (15s)".into())); 
                     }
                 }
@@ -1406,8 +1406,8 @@ async fn handle_command(
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("[service.rs] PushPiece: waiting for ack from {} (30s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(30), ack_rx).await {
+                info!("[service.rs] PushPiece: waiting for ack from {} (5s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
                     Ok(Ok(DataCraftResponse::Ack { status })) => {
                         info!("[service.rs] PushPiece to {}: got ack status={:?}", peer_id, status);
                         if status == datacraft_core::WireStatus::Ok {
@@ -1425,7 +1425,7 @@ async fn handle_command(
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => {
-                        warn!("[service.rs] PushPiece to {}: timed out after 30s", peer_id);
+                        warn!("[service.rs] PushPiece to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("piece push timed out (10s)".into()));
                     }
                 }
@@ -1448,8 +1448,8 @@ async fn handle_command(
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("[service.rs] PushManifest: waiting for ack from {} (30s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(30), ack_rx).await {
+                info!("[service.rs] PushManifest: waiting for ack from {} (5s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
                     Ok(Ok(DataCraftResponse::Ack { status })) => {
                         info!("[service.rs] PushManifest to {}: got ack status={:?}", peer_id, status);
                         if status == datacraft_core::WireStatus::Ok {
@@ -1467,7 +1467,7 @@ async fn handle_command(
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => {
-                        warn!("[service.rs] PushManifest to {}: timed out after 30s", peer_id);
+                        warn!("[service.rs] PushManifest to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("manifest push timed out (10s)".into()));
                     }
                 }
