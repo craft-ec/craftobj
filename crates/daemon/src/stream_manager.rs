@@ -90,6 +90,13 @@ pub struct StreamManager {
     /// Channel for spawned inbound handlers to send responses back
     response_rx: mpsc::UnboundedReceiver<(PeerId, u64, DataCraftResponse)>,
     response_tx: mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)>,
+    /// Buffered responses waiting for outbound stream to open
+    pending_responses: VecDeque<(PeerId, u64, DataCraftResponse)>,
+    /// Channel for response write failures to retry
+    response_retry_rx: mpsc::UnboundedReceiver<(PeerId, u64, DataCraftResponse)>,
+    response_retry_tx: mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)>,
+    /// Clone of write_fail_tx for send_response to signal stream death
+    write_fail_tx: mpsc::UnboundedSender<PeerId>,
 }
 
 impl StreamManager {
@@ -107,6 +114,7 @@ impl StreamManager {
         let (open_result_tx, open_result_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(8192);
         let (write_fail_tx, write_fail_rx) = mpsc::unbounded_channel();
+        let write_fail_tx2 = write_fail_tx.clone();
         let (need_stream_tx, need_stream_rx) = mpsc::unbounded_channel();
 
         let writer_registry: WriterRegistry = Arc::new(std::sync::RwLock::new(HashMap::new()));
@@ -121,6 +129,7 @@ impl StreamManager {
         ));
 
         let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (response_retry_tx, response_retry_rx) = mpsc::unbounded_channel();
 
         let mgr = Self {
             control,
@@ -132,10 +141,14 @@ impl StreamManager {
             open_cooldown: HashMap::new(),
             writer_registry,
             pending_acks_registry,
-            write_fail_rx,
+            write_fail_rx: write_fail_rx,
+            write_fail_tx: write_fail_tx2,
             need_stream_rx,
             response_rx,
             response_tx,
+            pending_responses: VecDeque::new(),
+            response_retry_rx,
+            response_retry_tx,
         };
 
         (mgr, inbound_rx, outbound_tx)
@@ -164,24 +177,31 @@ impl StreamManager {
         }
     }
 
-    pub fn send_response(&self, peer: PeerId, seq_id: u64, response: DataCraftResponse) {
-        if let Some(pc) = self.peers.get(&peer) {
-            if let Some(ref out) = pc.outbound {
-                let writer = out.writer.clone();
-                info!("[stream_mgr.rs] send_response: writing response to {} seq={}", peer, seq_id);
-                tokio::spawn(async move {
-                    let mut w = writer.lock().await;
-                    match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
-                        Ok(()) => info!("[stream_mgr.rs] send_response: wrote response to {} seq={} successfully", peer, seq_id),
-                        Err(e) => warn!("[stream_mgr.rs] Response write to {} seq={} failed: {}", peer, seq_id, e),
-                    }
-                });
-            } else {
-                warn!("[stream_mgr.rs] No outbound to peer {} for response (seq={}) — cannot reply!", peer, seq_id);
-            }
-        } else {
-            warn!("[stream_mgr.rs] No peer state for {} — cannot send response (seq={})", peer, seq_id);
+    pub fn send_response(&mut self, peer: PeerId, seq_id: u64, response: DataCraftResponse) {
+        let has_outbound = self.peers.get(&peer).map_or(false, |pc| pc.outbound.is_some());
+        if !has_outbound {
+            // No outbound yet — ensure one is opening and buffer the response
+            info!("[stream_mgr.rs] send_response: no outbound to {} seq={}, buffering and opening stream", peer, seq_id);
+            self.ensure_opening(peer);
+            self.pending_responses.push_back((peer, seq_id, response));
+            return;
         }
+
+        let writer = self.peers.get(&peer).unwrap().outbound.as_ref().unwrap().writer.clone();
+        let write_fail_tx = self.write_fail_tx.clone();
+        let resp_retry_tx = self.response_retry_tx.clone();
+        info!("[stream_mgr.rs] send_response: writing response to {} seq={}", peer, seq_id);
+        tokio::spawn(async move {
+            let mut w = writer.lock().await;
+            match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
+                Ok(()) => info!("[stream_mgr.rs] send_response: wrote response to {} seq={} successfully", peer, seq_id),
+                Err(e) => {
+                    warn!("[stream_mgr.rs] Response write to {} seq={} failed: {} — will retry", peer, seq_id, e);
+                    let _ = write_fail_tx.send(peer);
+                    let _ = resp_retry_tx.send((peer, seq_id, response));
+                }
+            }
+        });
     }
 
     /// Accept an inbound stream from a peer.
@@ -254,6 +274,11 @@ impl StreamManager {
         // Drain responses from spawned inbound handlers first
         self.drain_responses();
 
+        // Drain response retry channel (failed writes that need retry)
+        while let Ok(item) = self.response_retry_rx.try_recv() {
+            self.pending_responses.push_back(item);
+        }
+
         let mut opened = 0;
         while let Ok((peer, result)) = self.open_result_rx.try_recv() {
             self.opening.remove(&peer);
@@ -277,6 +302,34 @@ impl StreamManager {
             self.close_outbound(&peer);
             self.ensure_opening(peer);
         }
+
+        // Flush pending responses now that streams may have opened
+        let mut remaining = VecDeque::new();
+        while let Some((peer, seq_id, response)) = self.pending_responses.pop_front() {
+            if self.peers.get(&peer).map_or(false, |pc| pc.outbound.is_some()) {
+                // Stream available now — send
+                let writer = self.peers.get(&peer).unwrap().outbound.as_ref().unwrap().writer.clone();
+                let wf_tx = self.write_fail_tx.clone();
+                let retry_tx = self.response_retry_tx.clone();
+                info!("[stream_mgr.rs] Flushing pending response to {} seq={}", peer, seq_id);
+                tokio::spawn(async move {
+                    let mut w = writer.lock().await;
+                    match datacraft_transfer::wire::write_response_frame(&mut *w, seq_id, &response).await {
+                        Ok(()) => info!("[stream_mgr.rs] Flushed pending response to {} seq={} successfully", peer, seq_id),
+                        Err(e) => {
+                            warn!("[stream_mgr.rs] Pending response write to {} seq={} failed: {}", peer, seq_id, e);
+                            let _ = wf_tx.send(peer);
+                            let _ = retry_tx.send((peer, seq_id, response));
+                        }
+                    }
+                });
+            } else {
+                // Still no stream — keep buffered
+                self.ensure_opening(peer);
+                remaining.push_back((peer, seq_id, response));
+            }
+        }
+        self.pending_responses = remaining;
 
         {
             let mut need_peers = HashSet::new();
