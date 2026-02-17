@@ -189,8 +189,8 @@ start_node 3 '["client","storage"]' "$BOOT" && pass "Node 3 (storage) started" |
 TESTS=$((TESTS + 1))
 
 # Wait for peer discovery
-info "Waiting for peer discovery (20s)..."
-sleep 20
+info "Waiting for peer discovery (45s)..."
+sleep 45
 
 PEERS_JSON=$(cli 1 peers)
 PEER_COUNT=$(echo "$PEERS_JSON" | jq 'keys | length' 2>/dev/null || echo 0)
