@@ -246,62 +246,77 @@ pub async fn run_initial_push(
     }
 
     // Push ALL pieces round-robin across peers. Publisher uploads everything (1.2x content size).
-    // Each peer gets consecutive pieces to maximize chance of getting pieces from same segment.
-    let mut assignments: Vec<(libp2p::PeerId, u32, [u8; 32])> = Vec::new();
+    // Skip failed peers for remaining pieces. Emit progress events periodically.
+    let total_pieces = all_pieces.len();
+    let mut failed_peers: std::collections::HashSet<libp2p::PeerId> = std::collections::HashSet::new();
+    let mut total_pushed: usize = 0;
+    let progress_interval = std::cmp::max(total_pieces / 20, 10); // ~5% or every 10
 
-    for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
-        let peer = ranked_peers[i % ranked_peers.len()];
-        assignments.push((peer, *seg_idx, *piece_id));
-    }
-
-    // Push assigned pieces with bounded concurrency
-    let max_concurrent: usize = 30;
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-    let pushed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    let mut push_futs = Vec::new();
     let cid = *content_id;
-    for (peer, seg_idx, piece_id) in assignments {
+    for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
+        // Find next available peer (round-robin, skipping failed)
+        let available_peers: Vec<libp2p::PeerId> = ranked_peers.iter()
+            .filter(|p| !failed_peers.contains(p))
+            .copied()
+            .collect();
+        if available_peers.is_empty() {
+            warn!("Initial push for {}: all peers failed, stopping at piece {}/{}", content_id, i, total_pieces);
+            break;
+        }
+        let peer = available_peers[i % available_peers.len()];
+
         let (piece_data, coefficients) = {
             let c = client.lock().await;
-            match c.store().get_piece(&cid, seg_idx, &piece_id) {
+            match c.store().get_piece(&cid, *seg_idx, piece_id) {
                 Ok(d) => d,
                 Err(_) => continue,
             }
         };
 
-        let sem = semaphore.clone();
-        let cmd_tx = command_tx.clone();
-        let pushed = pushed_count.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = DataCraftCommand::PushPiece {
+            peer_id: peer,
+            content_id: cid,
+            segment_index: *seg_idx,
+            piece_id: *piece_id,
+            coefficients,
+            piece_data,
+            reply_tx,
+        };
+        if command_tx.send(cmd).is_err() {
+            continue;
+        }
 
-        push_futs.push(async move {
-            let _permit = sem.acquire().await;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let cmd = DataCraftCommand::PushPiece {
-                peer_id: peer,
-                content_id: cid,
-                segment_index: seg_idx,
-                piece_id,
-                coefficients,
-                piece_data,
-                reply_tx,
-            };
-            if cmd_tx.send(cmd).is_err() {
-                return;
+        // Timeout per piece push: 10 seconds
+        match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+            Ok(Ok(Ok(()))) => {
+                total_pushed += 1;
             }
-            match reply_rx.await {
-                Ok(Ok(())) => {
-                    pushed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Err(e)) => {
-                    warn!("Push piece to {} failed: {}", peer, e);
-                }
-                Err(_) => {}
+            Ok(Ok(Err(e))) => {
+                warn!("Push piece to {} failed: {}, marking as dead", peer, e);
+                failed_peers.insert(peer);
             }
-        });
+            Ok(Err(_)) => {
+                // channel closed
+                failed_peers.insert(peer);
+            }
+            Err(_) => {
+                warn!("Push piece to {} timed out, marking as dead", peer);
+                failed_peers.insert(peer);
+            }
+        }
+
+        // Emit progress event periodically
+        if total_pushed > 0 && (total_pushed % progress_interval == 0 || i == total_pieces - 1) {
+            let active_peers = ranked_peers.len() - failed_peers.len();
+            let _ = event_tx.send(DaemonEvent::DistributionProgress {
+                content_id: content_id.to_hex(),
+                pieces_pushed: total_pushed,
+                total_pieces,
+                peers_active: active_peers,
+            });
+        }
     }
-    futures::future::join_all(push_futs).await;
-    let total_pushed = pushed_count.load(std::sync::atomic::Ordering::Relaxed);
 
     info!("Initial push for {}: pushed {} pieces to {} peers", content_id, total_pushed, ranked_peers.len());
 

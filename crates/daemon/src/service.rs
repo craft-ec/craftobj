@@ -783,8 +783,9 @@ async fn drive_swarm(
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         let remaining = swarm.connected_peers().count();
                         info!("Disconnected from {} ({} peers remaining)", peer_id, remaining);
-                        // Clean up stream pool for disconnected peer
+                        // Clean up stream pool and peer scorer for disconnected peer
                         stream_pool.lock().await.on_peer_disconnected(&peer_id);
+                        peer_scorer.lock().await.remove_peer(&peer_id);
                         let _ = event_tx.send(DaemonEvent::PeerDisconnected {
                             peer_id: peer_id.to_string(),
                             remaining_peers: remaining,

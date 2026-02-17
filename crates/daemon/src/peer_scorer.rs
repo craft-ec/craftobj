@@ -233,6 +233,11 @@ impl PeerScorer {
             .retain(|_, score| now.duration_since(score.last_announcement) < ttl);
     }
 
+    /// Remove a peer entirely from the scorer (e.g. on connection close).
+    pub fn remove_peer(&mut self, peer: &PeerId) {
+        self.scores.remove(peer);
+    }
+
     /// Get a reference to a peer's score data.
     pub fn get(&self, peer: &PeerId) -> Option<&PeerScore> {
         self.scores.get(peer)

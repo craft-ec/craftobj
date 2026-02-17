@@ -64,6 +64,7 @@ pub enum DaemonEvent {
 
     // -- Distribution --
     ContentDistributed { content_id: String, pieces_pushed: usize, total_pieces: usize, target_peers: usize },
+    DistributionProgress { content_id: String, pieces_pushed: usize, total_pieces: usize, peers_active: usize },
     DistributionSkipped { reason: String, retry_secs: u64 },
 
     // -- Maintenance --
