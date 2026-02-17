@@ -777,6 +777,9 @@ async fn drive_swarm(
 
     // Peer reconnector for exponential backoff reconnection
     let mut peer_reconnector = PeerReconnector::new();
+    // Channel for spawned inbound handlers to return responses without blocking swarm loop
+    let (inbound_response_tx, mut inbound_response_rx) = mpsc::unbounded_channel::<(libp2p::PeerId, u64, DataCraftResponse)>();
+
     let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -977,11 +980,27 @@ async fn drive_swarm(
             // Process inbound messages from peer streams
             Some(msg) = inbound_rx.recv() => {
                 info!("[service.rs] Processing inbound from {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&msg.request));
-                let response = handle_incoming_transfer_request(
-                    &msg.peer, msg.request, &store_for_repair, &content_tracker, &protocol,
-                ).await;
-                info!("[service.rs] Sending response to {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&response));
-                stream_manager.send_response(msg.peer, msg.seq_id, response);
+                // Spawn handler as task to avoid blocking the swarm event loop
+                // while waiting for store lock (maintenance cycle may hold it).
+                let store_clone = store_for_repair.clone();
+                let ct_clone = content_tracker.clone();
+                let proto_clone = protocol.clone();
+                let peer = msg.peer;
+                let seq_id = msg.seq_id;
+                let resp_tx = inbound_response_tx.clone();
+                tokio::spawn(async move {
+                    let response = handle_incoming_transfer_request(
+                        &peer, msg.request, &store_clone, &ct_clone, &proto_clone,
+                    ).await;
+                    info!("[service.rs] Spawned handler done for {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
+                    let _ = resp_tx.send((peer, seq_id, response));
+                });
+            }
+
+            // Drain responses from spawned inbound handlers
+            Some((peer, seq_id, response)) = inbound_response_rx.recv() => {
+                info!("[service.rs] Sending spawned response to {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
+                stream_manager.send_response(peer, seq_id, response);
             }
 
             // Peer reconnection + stream manager maintenance

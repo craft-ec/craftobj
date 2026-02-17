@@ -87,6 +87,9 @@ pub struct StreamManager {
     pending_acks_registry: PendingAcksRegistry,
     write_fail_rx: mpsc::UnboundedReceiver<PeerId>,
     need_stream_rx: mpsc::UnboundedReceiver<PeerId>,
+    /// Channel for spawned inbound handlers to send responses back
+    response_rx: mpsc::UnboundedReceiver<(PeerId, u64, DataCraftResponse)>,
+    response_tx: mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)>,
 }
 
 impl StreamManager {
@@ -117,6 +120,8 @@ impl StreamManager {
             need_stream_tx,
         ));
 
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+
         let mgr = Self {
             control,
             peers: HashMap::new(),
@@ -129,12 +134,27 @@ impl StreamManager {
             pending_acks_registry,
             write_fail_rx,
             need_stream_rx,
+            response_rx,
+            response_tx,
         };
 
         (mgr, inbound_rx, outbound_tx)
     }
 
     /// Send a response frame to a peer on our outbound stream (fire-and-forget).
+    /// Get a sender for spawned tasks to return responses.
+    pub fn get_response_sender(&self) -> mpsc::UnboundedSender<(PeerId, u64, DataCraftResponse)> {
+        self.response_tx.clone()
+    }
+
+    /// Drain responses from spawned inbound handlers and write them.
+    pub fn drain_responses(&mut self) {
+        while let Ok((peer, seq_id, response)) = self.response_rx.try_recv() {
+            info!("[stream_mgr.rs] drain_responses: sending response to {} seq={}", peer, seq_id);
+            self.send_response(peer, seq_id, response);
+        }
+    }
+
     pub fn send_response(&self, peer: PeerId, seq_id: u64, response: DataCraftResponse) {
         if let Some(pc) = self.peers.get(&peer) {
             if let Some(ref out) = pc.outbound {
@@ -222,6 +242,9 @@ impl StreamManager {
 
     /// Collect completed background outbound opens and drain write failures.
     pub fn poll_open_streams(&mut self) -> usize {
+        // Drain responses from spawned inbound handlers first
+        self.drain_responses();
+
         let mut opened = 0;
         while let Ok((peer, result)) = self.open_result_rx.try_recv() {
             self.opening.remove(&peer);
