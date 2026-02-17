@@ -659,7 +659,7 @@ impl DataCraftHandler {
         debug!("Fetching pieces for {} from {} providers", content_id, providers.len());
 
         let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
-            let s = scorer.lock().await;
+            let mut s = scorer.lock().await;
             s.rank_peers(providers)
         } else {
             providers.to_vec()
@@ -1617,7 +1617,7 @@ impl DataCraftHandler {
             let providers = t.get_providers(&cid);
             drop(t);
             if let Some(ref scorer) = self.peer_scorer {
-                let ps = scorer.lock().await;
+                let mut ps = scorer.lock().await;
                 for peer in providers {
                     let region = ps.get_region(&peer).unwrap_or("unknown").to_string();
                     let score = ps.score(&peer);
@@ -1964,12 +1964,31 @@ impl IpcHandler for DataCraftHandler {
                 "network.health" => self.handle_network_health().await,
                 "node.stats" => self.handle_node_stats().await,
                 "shutdown" => {
-                    info!("Shutdown requested via RPC — exiting");
+                    info!("Shutdown requested via RPC — broadcasting going-offline");
+                    // Broadcast going-offline message before shutdown
+                    if let Some(ref tx) = self.command_tx {
+                        let local_peer_id = serde_json::json!({
+                            "type": "going_offline",
+                            "timestamp": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        });
+                        if let Ok(data) = serde_json::to_vec(&local_peer_id) {
+                            let _ = tx.send(DataCraftCommand::BroadcastGoingOffline { data });
+                        }
+                    }
+                    // Emit event
+                    if let Some(ref etx) = self.event_sender {
+                        let _ = etx.send(DaemonEvent::PeerGoingOffline {
+                            peer_id: "self".to_string(),
+                        });
+                    }
                     // Respond first, then exit
                     let result = Ok(serde_json::json!({"status": "shutting_down"}));
-                    // Schedule exit after response is sent
+                    // Schedule exit after response is sent (give time for gossipsub message to propagate)
                     tokio::spawn(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         std::process::exit(0);
                     });
                     result

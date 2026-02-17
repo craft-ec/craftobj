@@ -55,6 +55,20 @@ pub struct DaemonConfig {
     /// Set to 0 to disable GC.
     pub gc_interval_secs: u64,
 
+    /// Maximum number of simultaneous peer connections (default: 50).
+    /// New inbound connections are rejected when this limit is reached.
+    pub max_peer_connections: usize,
+
+    // ── Concurrency & Timeouts ───────────────────────────────
+    /// Maximum concurrent piece transfers (default: 64).
+    pub max_concurrent_transfers: usize,
+    /// Per-piece transfer timeout in seconds (default: 30).
+    pub piece_timeout_secs: u64,
+    /// Stream open timeout in seconds (default: 10).
+    pub stream_open_timeout_secs: u64,
+    /// Content health check interval in seconds (default: 300).
+    pub health_check_interval_secs: u64,
+
     // ── Bootstrap ─────────────────────────────────────────────
     /// Bootstrap peer multiaddrs (e.g. ["/ip4/1.2.3.4/tcp/9000/p2p/12D3KooW..."]).
     /// Nodes dial these on startup for reliable discovery beyond mDNS.
@@ -84,8 +98,13 @@ impl Default for DaemonConfig {
             reannounce_threshold_secs: 1200,
             challenger_interval_secs: None,
             aggregation_epoch_secs: None,
+            max_concurrent_transfers: 64,
+            piece_timeout_secs: 30,
+            stream_open_timeout_secs: 10,
+            health_check_interval_secs: 300,
             max_storage_bytes: 0,
             gc_interval_secs: 3600,
+            max_peer_connections: 50,
             boot_peers: Vec::new(),
             region: None,
             extra: serde_json::Map::new(),
@@ -235,6 +254,9 @@ impl DaemonConfig {
         }
         if let Some(v) = partial.get("max_storage_bytes").and_then(|v| v.as_u64()) {
             self.max_storage_bytes = v;
+        }
+        if let Some(v) = partial.get("max_peer_connections").and_then(|v| v.as_u64()) {
+            self.max_peer_connections = v as usize;
         }
     }
 

@@ -22,8 +22,35 @@ use datacraft_core::TRANSFER_PROTOCOL;
 /// Cooldown after a failed outbound open before retrying (seconds).
 const OPEN_RETRY_COOLDOWN_SECS: u64 = 1;
 
+/// Number of consecutive failures before opening the circuit breaker.
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
+/// Initial circuit-open duration in seconds.
+const CIRCUIT_OPEN_DURATION_SECS: u64 = 60;
+
+/// Maximum circuit-open duration in seconds.
+const CIRCUIT_MAX_OPEN_SECS: u64 = 600; // 10 minutes
+
 /// Timeout for background stream opens (seconds).
 const OPEN_TIMEOUT_SECS: u64 = 10;
+
+/// Circuit breaker state for a peer.
+#[derive(Debug)]
+enum CircuitState {
+    /// Normal operation — requests allowed.
+    Closed {
+        consecutive_failures: u32,
+    },
+    /// Circuit is open — requests blocked until deadline.
+    Open {
+        until: Instant,
+        open_duration_secs: u64,
+    },
+    /// One probe request allowed to test if the peer recovered.
+    HalfOpen {
+        open_duration_secs: u64,
+    },
+}
 
 /// Outbound stream pool — one persistent stream per peer.
 pub struct StreamPool {
@@ -33,6 +60,8 @@ pub struct StreamPool {
     open_result_rx: mpsc::UnboundedReceiver<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
     open_result_tx: mpsc::UnboundedSender<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
     open_cooldown: HashMap<PeerId, Instant>,
+    /// Circuit breaker state per peer.
+    circuits: HashMap<PeerId, CircuitState>,
 }
 
 impl StreamPool {
@@ -46,6 +75,7 @@ impl StreamPool {
             open_result_rx,
             open_result_tx,
             open_cooldown: HashMap::new(),
+            circuits: HashMap::new(),
         }
     }
 
@@ -154,11 +184,77 @@ impl StreamPool {
         self.ensure_opening(*peer);
     }
 
+    /// Check if a peer's circuit breaker allows requests.
+    /// Also transitions Open → HalfOpen when the deadline passes.
+    pub fn is_circuit_open(&mut self, peer: &PeerId) -> bool {
+        let state = match self.circuits.get_mut(peer) {
+            Some(s) => s,
+            None => return false,
+        };
+        match state {
+            CircuitState::Closed { .. } => false,
+            CircuitState::Open { until, open_duration_secs } => {
+                if Instant::now() >= *until {
+                    // Transition to half-open: allow one probe
+                    debug!("StreamPool: circuit for {} transitioning to half-open", peer);
+                    let dur = *open_duration_secs;
+                    *state = CircuitState::HalfOpen { open_duration_secs: dur };
+                    false // Allow the probe
+                } else {
+                    true // Still blocked
+                }
+            }
+            CircuitState::HalfOpen { .. } => false, // Allow probe
+        }
+    }
+
+    /// Record a successful request to a peer (closes circuit breaker).
+    pub fn record_success(&mut self, peer: &PeerId) {
+        self.circuits.insert(*peer, CircuitState::Closed { consecutive_failures: 0 });
+    }
+
+    /// Record a failed request to a peer (may open circuit breaker).
+    pub fn record_failure(&mut self, peer: &PeerId) {
+        let state = self.circuits.entry(*peer).or_insert(CircuitState::Closed { consecutive_failures: 0 });
+        match state {
+            CircuitState::Closed { consecutive_failures } => {
+                *consecutive_failures += 1;
+                if *consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                    let dur = CIRCUIT_OPEN_DURATION_SECS;
+                    warn!(
+                        "StreamPool: circuit breaker OPEN for {} after {} consecutive failures ({}s)",
+                        peer, consecutive_failures, dur
+                    );
+                    *state = CircuitState::Open {
+                        until: Instant::now() + std::time::Duration::from_secs(dur),
+                        open_duration_secs: dur,
+                    };
+                }
+            }
+            CircuitState::HalfOpen { open_duration_secs } => {
+                // Probe failed — double the open duration
+                let new_dur = (*open_duration_secs * 2).min(CIRCUIT_MAX_OPEN_SECS);
+                warn!(
+                    "StreamPool: probe failed for {}, circuit OPEN for {}s",
+                    peer, new_dur
+                );
+                *state = CircuitState::Open {
+                    until: Instant::now() + std::time::Duration::from_secs(new_dur),
+                    open_duration_secs: new_dur,
+                };
+            }
+            CircuitState::Open { .. } => {
+                // Shouldn't happen (requests blocked), but ignore
+            }
+        }
+    }
+
     /// Peer disconnected — clean up everything.
     pub fn on_peer_disconnected(&mut self, peer: &PeerId) {
         self.streams.remove(peer);
         self.opening.remove(peer);
         self.open_cooldown.remove(peer);
+        self.circuits.remove(peer);
         debug!("StreamPool: cleaned up peer {}", peer);
     }
 

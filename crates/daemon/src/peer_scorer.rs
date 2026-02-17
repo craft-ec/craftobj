@@ -60,6 +60,20 @@ pub struct PeerScore {
     pub storage_used_bytes: u64,
     /// Geographic region from capability announcement (e.g. "us-east", "eu-west").
     pub region: Option<String>,
+
+    // ── Transfer statistics ─────────────────────────────────
+    /// Total bytes sent to this peer.
+    pub bytes_sent: u64,
+    /// Total bytes received from this peer.
+    pub bytes_received: u64,
+    /// Total pieces sent to this peer.
+    pub pieces_sent: u32,
+    /// Total pieces received from this peer.
+    pub pieces_received: u32,
+    /// When the last transfer (send or receive) occurred.
+    pub last_transfer: Option<Instant>,
+    /// Rolling window of (timestamp, bytes) for transfer rate calculation.
+    transfer_samples: Vec<(Instant, u64)>,
 }
 
 impl PeerScore {
@@ -75,6 +89,12 @@ impl PeerScore {
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
             region: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+            pieces_sent: 0,
+            pieces_received: 0,
+            last_transfer: None,
+            transfer_samples: Vec::new(),
         }
     }
 
@@ -85,6 +105,24 @@ impl PeerScore {
         self.timeouts *= DECAY_FACTOR;
     }
 
+    /// Apply time-based reputation decay toward neutral (0.5).
+    /// Decay rate: 10% per hour toward neutral. Applied lazily when scores are read.
+    fn apply_time_decay(&mut self) {
+        if let Some(last) = self.last_interaction {
+            let elapsed_hours = last.elapsed().as_secs_f64() / 3600.0;
+            if elapsed_hours > 0.01 {
+                // Decay factor: 0.9^hours (10% per hour toward neutral)
+                let decay = 0.9_f64.powf(elapsed_hours);
+                // Decay counters toward zero (which yields DEFAULT_SCORE = 0.5)
+                self.successes *= decay;
+                self.failures *= decay;
+                self.timeouts *= decay;
+                // Update last_interaction so we don't double-decay
+                self.last_interaction = Some(Instant::now());
+            }
+        }
+    }
+
     /// Compute reliability score in [0.0, 1.0].
     /// Peers with no interactions get DEFAULT_SCORE.
     pub fn score(&self) -> f64 {
@@ -93,6 +131,12 @@ impl PeerScore {
             return DEFAULT_SCORE;
         }
         (self.successes / total).clamp(0.0, 1.0)
+    }
+
+    /// Compute reliability score with time-based decay applied.
+    pub fn score_with_decay(&mut self) -> f64 {
+        self.apply_time_decay();
+        self.score()
     }
 
     /// Whether this peer has had any interactions.
@@ -148,8 +192,68 @@ impl PeerScorer {
         entry.last_interaction = Some(Instant::now());
     }
 
-    /// Get the reliability score for a peer (0.0–1.0).
-    pub fn score(&self, peer: &PeerId) -> f64 {
+    /// Record bytes sent to a peer (piece push).
+    pub fn record_sent(&mut self, peer: &PeerId, bytes: u64) {
+        let entry = self.scores.entry(*peer).or_insert_with(|| {
+            PeerScore::new(Vec::new(), Instant::now())
+        });
+        entry.bytes_sent += bytes;
+        entry.pieces_sent += 1;
+        let now = Instant::now();
+        entry.last_transfer = Some(now);
+        entry.transfer_samples.push((now, bytes));
+        // Keep last 100 samples
+        if entry.transfer_samples.len() > 100 {
+            entry.transfer_samples.drain(..entry.transfer_samples.len() - 100);
+        }
+    }
+
+    /// Record bytes received from a peer (piece fetch).
+    pub fn record_received(&mut self, peer: &PeerId, bytes: u64) {
+        let entry = self.scores.entry(*peer).or_insert_with(|| {
+            PeerScore::new(Vec::new(), Instant::now())
+        });
+        entry.bytes_received += bytes;
+        entry.pieces_received += 1;
+        let now = Instant::now();
+        entry.last_transfer = Some(now);
+        entry.transfer_samples.push((now, bytes));
+        if entry.transfer_samples.len() > 100 {
+            entry.transfer_samples.drain(..entry.transfer_samples.len() - 100);
+        }
+    }
+
+    /// Get the rolling average transfer rate for a peer in bytes/second.
+    /// Returns 0.0 if insufficient data.
+    pub fn transfer_rate(&self, peer: &PeerId) -> f64 {
+        if let Some(entry) = self.scores.get(peer) {
+            if entry.transfer_samples.len() < 2 {
+                return 0.0;
+            }
+            let first = entry.transfer_samples.first().unwrap().0;
+            let last = entry.transfer_samples.last().unwrap().0;
+            let duration = last.duration_since(first).as_secs_f64();
+            if duration < 0.001 {
+                return 0.0;
+            }
+            let total_bytes: u64 = entry.transfer_samples.iter().map(|(_, b)| b).sum();
+            total_bytes as f64 / duration
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the reliability score for a peer (0.0–1.0) with time-based decay.
+    pub fn score(&mut self, peer: &PeerId) -> f64 {
+        if let Some(s) = self.scores.get_mut(peer) {
+            s.score_with_decay()
+        } else {
+            DEFAULT_SCORE
+        }
+    }
+
+    /// Get the reliability score without mutable access (no decay applied).
+    pub fn score_readonly(&self, peer: &PeerId) -> f64 {
         self.scores
             .get(peer)
             .map(|s| s.score())
@@ -157,10 +261,16 @@ impl PeerScorer {
     }
 
     /// Rank peers by score descending (best first). Unknown peers get DEFAULT_SCORE.
-    pub fn rank_peers(&self, peers: &[PeerId]) -> Vec<PeerId> {
+    pub fn rank_peers(&mut self, peers: &[PeerId]) -> Vec<PeerId> {
+        // Apply decay to all ranked peers
+        for p in peers {
+            if let Some(s) = self.scores.get_mut(p) {
+                s.apply_time_decay();
+            }
+        }
         let mut scored: Vec<(PeerId, f64)> = peers
             .iter()
-            .map(|p| (*p, self.score(p)))
+            .map(|p| (*p, self.score_readonly(p)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().map(|(p, _)| p).collect()
@@ -275,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_new_peer_default_score() {
-        let scorer = PeerScorer::new();
+        let mut scorer = PeerScorer::new();
         let peer = PeerId::random();
         assert!((scorer.score(&peer) - DEFAULT_SCORE).abs() < f64::EPSILON);
     }
@@ -422,6 +532,12 @@ mod tests {
                 storage_committed_bytes: 0,
                 storage_used_bytes: 0,
                 region: None,
+                bytes_sent: 0,
+                bytes_received: 0,
+                pieces_sent: 0,
+                pieces_received: 0,
+                last_transfer: None,
+                transfer_samples: Vec::new(),
             },
         );
 
@@ -434,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_score_clamped() {
-        let scorer = PeerScorer::new();
+        let mut scorer = PeerScorer::new();
         let peer = PeerId::random();
         let s = scorer.score(&peer);
         assert!(s >= 0.0 && s <= 1.0);
@@ -442,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_empty_scorer() {
-        let scorer = PeerScorer::new();
+        let mut scorer = PeerScorer::new();
         assert!(scorer.is_empty());
         assert_eq!(scorer.len(), 0);
     }

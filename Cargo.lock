@@ -1338,6 +1338,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
+ "libc",
  "libp2p",
  "libp2p-stream",
  "rand 0.8.5",

@@ -22,7 +22,7 @@ pub fn select_push_target(
     peer_scorer: &Option<Arc<Mutex<PeerScorer>>>,
 ) -> Option<PeerId> {
     let scorer = peer_scorer.as_ref()?;
-    let scorer_guard = scorer.try_lock().ok()?;
+    let mut scorer_guard = scorer.try_lock().ok()?;
 
     let all_peers: Vec<PeerId> = scorer_guard.iter().map(|(p, _)| *p).collect();
     if all_peers.is_empty() {

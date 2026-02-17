@@ -112,4 +112,8 @@ pub enum DataCraftCommand {
         piece_data: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Broadcast a "going offline" message via gossipsub before graceful shutdown.
+    BroadcastGoingOffline {
+        data: Vec<u8>,
+    },
 }

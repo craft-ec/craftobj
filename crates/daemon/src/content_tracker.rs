@@ -96,7 +96,11 @@ impl ContentTracker {
 
     pub fn with_threshold(data_dir: &std::path::Path, reannounce_threshold_secs: u64) -> Self {
         let path = data_dir.join("content_tracker.json");
-        let states = Self::load_from(&path).unwrap_or_default();
+        let mut states = Self::load_from(&path).unwrap_or_default();
+        // Reset stale remote state on restart
+        for state in states.values_mut() {
+            state.remote_pieces = 0;
+        }
         debug!("ContentTracker loaded {} entries from {:?}", states.len(), path);
         Self { states, path, reannounce_threshold_secs, providers: HashMap::new() }
     }
@@ -373,12 +377,68 @@ impl ContentTracker {
         Some((state.clone(), summary))
     }
 
+    /// Sync tracker state with actual disk contents.
+    /// Resets stale remote state and validates local piece counts.
+    pub fn sync_with_store(&mut self, store: &FsStore) {
+        let cids: Vec<ContentId> = self.states.keys().copied().collect();
+        for cid in cids {
+            let actual_pieces = {
+                let manifest = match store.get_manifest(&cid) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        warn!("Tracker has {} but no manifest on disk, removing", cid);
+                        self.states.remove(&cid);
+                        continue;
+                    }
+                };
+                let mut count = 0usize;
+                for seg in 0..manifest.segment_count as u32 {
+                    count += store.list_pieces(&cid, seg).unwrap_or_default().len();
+                }
+                count
+            };
+
+            if let Some(state) = self.states.get_mut(&cid) {
+                state.remote_pieces = 0;
+                if state.local_pieces != actual_pieces {
+                    info!("Sync: {} local_pieces {} -> {} (disk)", cid, state.local_pieces, actual_pieces);
+                    state.local_pieces = actual_pieces;
+                    if state.role == ContentRole::Publisher {
+                        state.initial_push_done = false;
+                    }
+                }
+            }
+        }
+        self.save();
+        info!("Content tracker synced with store");
+    }
+
     pub fn save(&self) {
         let entries: Vec<&ContentState> = self.states.values().collect();
         match serde_json::to_string_pretty(&entries) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    warn!("Failed to save content tracker: {}", e);
+                // Backup current file before writing
+                if self.path.exists() {
+                    let bak = self.path.with_extension("json.bak");
+                    if let Err(e) = std::fs::copy(&self.path, &bak) {
+                        debug!("Failed to create backup: {}", e);
+                    }
+                }
+                // Atomic write: tmp + rename
+                let tmp = self.path.with_extension("json.tmp");
+                if let Err(e) = std::fs::write(&tmp, &json) {
+                    warn!("Failed to write content tracker tmp: {}", e);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &self.path) {
+                    warn!("Failed to rename content tracker tmp: {}", e);
+                    return;
+                }
+                // fsync
+                if let Ok(f) = std::fs::File::open(&self.path) {
+                    if let Err(e) = f.sync_all() {
+                        debug!("Failed to fsync content tracker: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -388,6 +448,24 @@ impl ContentTracker {
     }
 
     fn load_from(path: &std::path::Path) -> Option<HashMap<ContentId, ContentState>> {
+        if let Some(map) = Self::try_parse_file(path) {
+            return Some(map);
+        }
+        let bak = path.with_extension("json.bak");
+        if bak.exists() {
+            warn!("Primary content tracker corrupt, trying backup");
+            if let Some(map) = Self::try_parse_file(&bak) {
+                if let Err(e) = std::fs::copy(&bak, path) {
+                    warn!("Failed to restore backup: {}", e);
+                }
+                return Some(map);
+            }
+            warn!("Backup also corrupt");
+        }
+        None
+    }
+
+    fn try_parse_file(path: &std::path::Path) -> Option<HashMap<ContentId, ContentState>> {
         let data = std::fs::read_to_string(path).ok()?;
         let entries: Vec<ContentState> = serde_json::from_str(&data).ok()?;
         let mut map = HashMap::new();
