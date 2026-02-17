@@ -394,7 +394,21 @@ async fn equalize_pressure(
             }
         };
 
-        // Find first available piece to push
+        // Push manifest first
+        let manifest_json = match serde_json::to_vec(&manifest) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = command_tx.send(DataCraftCommand::PushManifest {
+            peer_id: peer,
+            content_id,
+            manifest_json,
+            reply_tx,
+        });
+
+        // Push 2 pieces (minimum for RLNC provider status) from different segments if possible
+        let mut pushed = 0usize;
         'outer: for seg in 0..manifest.segment_count as u32 {
             let pieces = {
                 let c = client.lock().await;
@@ -402,6 +416,10 @@ async fn equalize_pressure(
             };
 
             for pid in pieces {
+                if pushed >= 2 {
+                    break 'outer;
+                }
+
                 let (piece_data, coefficients) = {
                     let c = client.lock().await;
                     match c.store().get_piece(&content_id, seg, &pid) {
@@ -409,19 +427,6 @@ async fn equalize_pressure(
                         Err(_) => continue,
                     }
                 };
-
-                // Push manifest first
-                let manifest_json = match serde_json::to_vec(&manifest) {
-                    Ok(j) => j,
-                    Err(_) => break 'outer,
-                };
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                let _ = command_tx.send(DataCraftCommand::PushManifest {
-                    peer_id: peer,
-                    content_id,
-                    manifest_json,
-                    reply_tx,
-                });
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let cmd = DataCraftCommand::PushPiece {
@@ -436,17 +441,19 @@ async fn equalize_pressure(
 
                 if command_tx.send(cmd).is_ok() {
                     if let Ok(Ok(())) = reply_rx.await {
-                        debug!("Equalization: pushed 1 piece for {} to {}", content_id, peer);
-                        let _ = event_tx.send(DaemonEvent::ContentDistributed {
-                            content_id: content_id.to_hex(),
-                            pieces_pushed: 1,
-                            total_pieces: 1,
-                            target_peers: 1,
-                        });
+                        pushed += 1;
                     }
                 }
-                break 'outer; // 1 piece per CID per cycle
             }
+        }
+        if pushed > 0 {
+            debug!("Equalization: pushed {} pieces for {} to {}", pushed, content_id, peer);
+            let _ = event_tx.send(DaemonEvent::ContentDistributed {
+                content_id: content_id.to_hex(),
+                pieces_pushed: pushed,
+                total_pieces: pushed,
+                target_peers: 1,
+            });
         }
     }
 }
