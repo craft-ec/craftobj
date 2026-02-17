@@ -508,7 +508,7 @@ impl DataCraftProtocol {
     /// Returns (coefficients, data) on success.
     pub async fn request_piece_from_peer(
         &self,
-        behaviour: &mut CraftBehaviour,
+        control: &mut libp2p_stream::Control,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
         segment_index: u32,
@@ -526,7 +526,7 @@ impl DataCraftProtocol {
                 tokio::time::sleep(backoff).await;
             }
 
-            match self.request_piece_from_peer_once(behaviour, peer_id, content_id, segment_index, piece_id).await {
+            match self.request_piece_from_peer_once(control, peer_id, content_id, segment_index, piece_id).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     if !err.should_retry() || attempt == MAX_RETRIES {
@@ -548,7 +548,7 @@ impl DataCraftProtocol {
     /// Single attempt to request a piece from a peer.
     async fn request_piece_from_peer_once(
         &self,
-        behaviour: &mut CraftBehaviour,
+        control: &mut libp2p_stream::Control,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
         segment_index: u32,
@@ -576,7 +576,6 @@ impl DataCraftProtocol {
             let mut stream = stream_arc.lock().await;
             Self::do_request_piece(&mut *stream, peer_id, content_id, segment_index, piece_id).await
         } else {
-            let mut control = behaviour.stream_control();
             let stream = tokio::time::timeout(
                 Duration::from_secs(self.stream_open_timeout_secs),
                 control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
@@ -669,7 +668,7 @@ impl DataCraftProtocol {
     /// Push a manifest to a remote peer.
     pub async fn push_manifest_to_peer(
         &self,
-        behaviour: &mut CraftBehaviour,
+        control: &mut libp2p_stream::Control,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
         manifest_json: &[u8],
@@ -691,18 +690,7 @@ impl DataCraftProtocol {
         let result = if let Some(stream_arc) = stream_arc {
             let mut stream = stream_arc.lock().await;
             Self::do_push_manifest(&mut *stream, peer_id, content_id, manifest_json).await
-        } else if use_pool {
-            let mut control = behaviour.stream_control();
-            let mut stream = tokio::time::timeout(
-                STREAM_OPEN_TIMEOUT,
-                control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
-            )
-            .await
-            .map_err(|_| format!("Timed out opening stream to {}", peer_id))?
-            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
-            Self::do_push_manifest(&mut stream, peer_id, content_id, manifest_json).await
         } else {
-            let mut control = behaviour.stream_control();
             let mut stream = tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
                 control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
@@ -749,7 +737,7 @@ impl DataCraftProtocol {
     /// Push a piece to a remote peer for storage.
     pub async fn push_piece_to_peer(
         &self,
-        behaviour: &mut CraftBehaviour,
+        control: &mut libp2p_stream::Control,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
         segment_index: u32,
@@ -777,18 +765,7 @@ impl DataCraftProtocol {
         let result = if let Some(stream_arc) = stream_arc {
             let mut stream = stream_arc.lock().await;
             Self::do_push_piece(&mut *stream, peer_id, content_id, segment_index, piece_id, coefficients, piece_data).await
-        } else if use_pool {
-            let mut control = behaviour.stream_control();
-            let mut stream = tokio::time::timeout(
-                STREAM_OPEN_TIMEOUT,
-                control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
-            )
-            .await
-            .map_err(|_| format!("Timed out opening stream to {}", peer_id))?
-            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
-            Self::do_push_piece(&mut stream, peer_id, content_id, segment_index, piece_id, coefficients, piece_data).await
         } else {
-            let mut control = behaviour.stream_control();
             let mut stream = tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
                 control.open_stream(peer_id, libp2p::StreamProtocol::new(TRANSFER_PROTOCOL)),
@@ -1277,7 +1254,7 @@ impl DataCraftProtocol {
     /// Request inventory from a remote peer.
     pub async fn request_inventory_from_peer(
         &self,
-        behaviour: &mut CraftBehaviour,
+        control: &mut libp2p_stream::Control,
         peer_id: libp2p::PeerId,
         content_id: &ContentId,
     ) -> Result<datacraft_core::InventoryResponse, String> {
@@ -1298,18 +1275,7 @@ impl DataCraftProtocol {
         let result = if let Some(stream_arc) = stream_arc {
             let mut stream = stream_arc.lock().await;
             Self::do_request_inventory(&mut *stream, peer_id, content_id).await
-        } else if use_pool {
-            let mut control = behaviour.stream_control();
-            let mut stream = tokio::time::timeout(
-                STREAM_OPEN_TIMEOUT,
-                control.open_stream(peer_id, libp2p::StreamProtocol::new(datacraft_core::TRANSFER_PROTOCOL)),
-            )
-            .await
-            .map_err(|_| format!("Timed out opening stream to {}", peer_id))?
-            .map_err(|e| format!("Failed to open stream to {}: {}", peer_id, e))?;
-            Self::do_request_inventory(&mut stream, peer_id, content_id).await
         } else {
-            let mut control = behaviour.stream_control();
             let mut stream = tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
                 control.open_stream(peer_id, libp2p::StreamProtocol::new(datacraft_core::TRANSFER_PROTOCOL)),

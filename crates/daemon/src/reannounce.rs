@@ -210,6 +210,8 @@ pub async fn run_initial_push(
         }
     };
 
+    // Push manifest to all peers — only peers that receive it get pieces
+    let mut manifest_ok_peers: Vec<libp2p::PeerId> = Vec::new();
     {
         let mut manifest_futs = Vec::new();
         for &peer in &ranked_peers {
@@ -226,12 +228,22 @@ pub async fn run_initial_push(
         }
         for (peer, result) in futures::future::join_all(manifest_futs).await {
             match result {
-                Ok(Ok(())) => debug!("Pushed manifest for {} to {}", content_id, peer),
+                Ok(Ok(())) => {
+                    debug!("Pushed manifest for {} to {}", content_id, peer);
+                    manifest_ok_peers.push(peer);
+                }
                 Ok(Err(e)) => warn!("Manifest push to {} failed: {}", peer, e),
                 Err(_) => {}
             }
         }
     }
+
+    if manifest_ok_peers.is_empty() {
+        warn!("Initial push for {}: manifest push failed for ALL peers, will retry next cycle", content_id);
+        return;
+    }
+
+    info!("Initial push for {}: manifest accepted by {}/{} peers", content_id, manifest_ok_peers.len(), ranked_peers.len());
 
     // Collect all local pieces
     let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
@@ -255,7 +267,7 @@ pub async fn run_initial_push(
     let cid = *content_id;
     for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
         // Find next available peer (round-robin, skipping failed)
-        let available_peers: Vec<libp2p::PeerId> = ranked_peers.iter()
+        let available_peers: Vec<libp2p::PeerId> = manifest_ok_peers.iter()
             .filter(|p| !failed_peers.contains(p))
             .copied()
             .collect();

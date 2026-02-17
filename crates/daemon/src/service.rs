@@ -303,6 +303,10 @@ pub async fn run_daemon_with_config(
         daemon_config.stream_open_timeout_secs,
     );
 
+    // Capture a stream control handle for use in spawned tasks (avoids deadlock
+    // when opening streams while the swarm event loop is blocked on command handling).
+    let stream_control = swarm.behaviour().stream_control();
+
     let protocol = Arc::new(protocol);
 
     // Payment channel store
@@ -498,7 +502,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), stream_pool.clone(), daemon_config.max_peer_connections) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), stream_pool.clone(), daemon_config.max_peer_connections, stream_control.clone()) => {
             info!("Swarm event loop ended");
         }
         _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
@@ -784,6 +788,7 @@ async fn drive_swarm(
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     stream_pool: Arc<Mutex<crate::stream_manager::StreamPool>>,
     max_peer_connections: usize,
+    stream_control: libp2p_stream::Control,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -969,7 +974,7 @@ async fn drive_swarm(
                             });
                         }
                         other => {
-                            handle_command(swarm, &protocol, other, pending_requests.clone(), &event_tx, &region, &signing_key).await;
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &event_tx, &region, &signing_key, &stream_control).await;
                         }
                     }
                 }
@@ -1017,12 +1022,13 @@ async fn drive_swarm(
 /// Handle a command from the IPC handler.
 async fn handle_command(
     swarm: &mut craftec_network::CraftSwarm,
-    protocol: &DataCraftProtocol,
+    protocol: &Arc<DataCraftProtocol>,
     command: DataCraftCommand,
     pending_requests: PendingRequests,
     event_tx: &EventSender,
     region: &Option<String>,
     signing_key: &Option<ed25519_dalek::SigningKey>,
+    stream_control: &libp2p_stream::Control,
 ) {
     match command {
         DataCraftCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
@@ -1128,12 +1134,14 @@ async fn handle_command(
         
         DataCraftCommand::RequestPiece { peer_id, content_id, segment_index, piece_id, reply_tx } => {
             debug!("Handling request piece command: {}/{} from {}", content_id, segment_index, peer_id);
-            
-            let result = protocol
-                .request_piece_from_peer(swarm.behaviour_mut(), peer_id, &content_id, segment_index, &piece_id)
-                .await;
-            
-            let _ = reply_tx.send(result);
+            let protocol = protocol.clone();
+            let mut control = stream_control.clone();
+            tokio::spawn(async move {
+                let result = protocol
+                    .request_piece_from_peer(&mut control, peer_id, &content_id, segment_index, &piece_id)
+                    .await;
+                let _ = reply_tx.send(result);
+            });
         }
 
         DataCraftCommand::PutReKey { content_id, entry, reply_tx } => {
@@ -1222,28 +1230,38 @@ async fn handle_command(
 
         DataCraftCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
             debug!("Handling push piece command: {}/{} to {}", content_id, segment_index, peer_id);
-            
-            let result = protocol
-                .push_piece_to_peer(swarm.behaviour_mut(), peer_id, &content_id, segment_index, &piece_id, &coefficients, &piece_data)
-                .await;
-            
-            let _ = reply_tx.send(result);
+            let protocol = protocol.clone();
+            let mut control = stream_control.clone();
+            tokio::spawn(async move {
+                let result = protocol
+                    .push_piece_to_peer(&mut control, peer_id, &content_id, segment_index, &piece_id, &coefficients, &piece_data)
+                    .await;
+                let _ = reply_tx.send(result);
+            });
         }
 
         DataCraftCommand::PushManifest { peer_id, content_id, manifest_json, reply_tx } => {
             debug!("Handling push manifest command for {} to {}", content_id, peer_id);
-            let result = protocol
-                .push_manifest_to_peer(swarm.behaviour_mut(), peer_id, &content_id, &manifest_json)
-                .await;
-            let _ = reply_tx.send(result);
+            let protocol = protocol.clone();
+            let mut control = stream_control.clone();
+            tokio::spawn(async move {
+                let result = protocol
+                    .push_manifest_to_peer(&mut control, peer_id, &content_id, &manifest_json)
+                    .await;
+                let _ = reply_tx.send(result);
+            });
         }
 
         DataCraftCommand::RequestInventory { peer_id, content_id, reply_tx } => {
             debug!("Handling inventory request for {} from {}", content_id, peer_id);
-            let result = protocol
-                .request_inventory_from_peer(swarm.behaviour_mut(), peer_id, &content_id)
-                .await;
-            let _ = reply_tx.send(result);
+            let protocol = protocol.clone();
+            let mut control = stream_control.clone();
+            tokio::spawn(async move {
+                let result = protocol
+                    .request_inventory_from_peer(&mut control, peer_id, &content_id)
+                    .await;
+                let _ = reply_tx.send(result);
+            });
         }
 
         DataCraftCommand::CheckRemoval { content_id, reply_tx } => {
