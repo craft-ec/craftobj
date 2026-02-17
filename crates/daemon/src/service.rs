@@ -1058,7 +1058,9 @@ async fn handle_incoming_transfer_request(
     match request {
         DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
             info!("[service.rs] Handling PieceSync from {} for {}/seg{} (they have {} pieces, want max {})", peer, content_id, segment_index, have_pieces.len(), max_pieces);
+            info!("[service.rs] PieceSync handler: acquiring store lock...");
             let store_guard = store.lock().await;
+            info!("[service.rs] PieceSync handler: store lock acquired");
             let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
             info!("[service.rs] We have {} pieces for {}/seg{}", piece_ids.len(), content_id, segment_index);
 
@@ -1092,7 +1094,9 @@ async fn handle_incoming_transfer_request(
         }
         DataCraftRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
             info!("[service.rs] Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
+            info!("[service.rs] PiecePush handler: acquiring store lock...");
             let store_guard = store.lock().await;
+            info!("[service.rs] PiecePush handler: store lock acquired");
 
             // Check if we have the manifest (must receive ManifestPush first)
             if store_guard.get_manifest(&content_id).is_err() {
@@ -1119,7 +1123,9 @@ async fn handle_incoming_transfer_request(
             info!("[service.rs] Handling ManifestPush from {} for {}", peer, content_id);
             match serde_json::from_slice::<datacraft_core::ContentManifest>(&manifest_json) {
                 Ok(manifest) => {
+                    info!("[service.rs] ManifestPush handler: acquiring store lock...");
                     let store_guard = store.lock().await;
+                    info!("[service.rs] ManifestPush handler: store lock acquired");
                     match store_guard.store_manifest(&manifest) {
                         Ok(()) => {
                             info!("[service.rs] Stored manifest for {}", content_id);
@@ -1695,7 +1701,9 @@ async fn handle_gossipsub_repair(
                         "Received repair signal for {}/seg{}: {} pieces needed",
                         signal.content_id, signal.segment_index, signal.pieces_needed
                     );
+                    info!("[service.rs] gossipsub_repair: acquiring store lock...");
                     let store_guard = store.lock().await;
+                    info!("[service.rs] gossipsub_repair: store lock acquired");
                     let mut coord = repair_coordinator.lock().await;
                     if let Some(delay) = coord.handle_repair_signal(&signal, &store_guard) {
                         // Schedule delayed repair
@@ -2102,9 +2110,23 @@ async fn run_challenger_loop(
     let mut interval = tokio::time::interval(crate::challenger::CHALLENGE_INTERVAL);
     loop {
         interval.tick().await;
-        let store_guard = store.lock().await;
+        // Create a temporary FsStore for the challenger to avoid holding the
+        // shared store_for_repair Mutex during network round-trips (PDP challenges
+        // can take tens of seconds, blocking all PieceSync handlers).
+        let tmp_store = {
+            let guard = store.lock().await;
+            let base_dir = guard.base_dir().to_path_buf();
+            drop(guard);
+            match datacraft_store::FsStore::new(&base_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("[service.rs] Challenger: failed to create temp store: {}", e);
+                    continue;
+                }
+            }
+        };
         let mut mgr = challenger.lock().await;
-        let rounds = mgr.periodic_check(&store_guard).await;
+        let rounds = mgr.periodic_check(&tmp_store).await;
         if rounds > 0 {
             info!("[service.rs] Challenger completed {} rounds", rounds);
             let _ = event_tx.send(DaemonEvent::ChallengerRoundCompleted { rounds: rounds as u32 });

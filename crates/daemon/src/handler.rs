@@ -802,10 +802,12 @@ impl DataCraftHandler {
 
                 match piece_result {
                     Ok((coefficients, piece_data)) => {
+                        info!("[handler.rs] Got piece from {}, data_len={}, coeff_len={}", provider, piece_data.len(), coefficients.len());
                         // Check linear independence before storing
                         let mut test_matrix = coeff_matrix.clone();
                         test_matrix.push(coefficients.clone());
                         let new_rank = craftec_erasure::check_independence(&test_matrix);
+                        info!("[handler.rs] Independence check: old_rank={}, new_rank={}, k={}", current_rank, new_rank, k);
 
                         if new_rank > current_rank {
                             // Independent piece — store it
