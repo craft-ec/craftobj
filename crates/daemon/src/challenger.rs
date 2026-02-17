@@ -693,6 +693,7 @@ mod tests {
             storage_used_bytes: 0,
             region: None,
             storage_root: root,
+            piece_counts: std::collections::HashMap::new(),
         };
 
         assert_eq!(announcement.storage_root, root);

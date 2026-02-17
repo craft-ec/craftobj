@@ -263,7 +263,7 @@ impl DataCraftHandler {
                         size: state.size,
                         stage: state.stage.to_string(),
                         local_pieces: state.local_pieces,
-                        remote_pieces: state.remote_pieces,
+                        remote_pieces: 0,
                         total_pieces: state.segment_count * state.k,
                         provider_count: state.provider_count,
                         summary,
@@ -440,7 +440,7 @@ impl DataCraftHandler {
                     obj["stage"] = serde_json::json!(state.stage.to_string());
                     obj["total_pieces"] = serde_json::json!(state.segment_count * state.k);
                     obj["local_pieces"] = serde_json::json!(state.local_pieces);
-                    obj["remote_pieces"] = serde_json::json!(state.remote_pieces);
+                    obj["remote_pieces"] = serde_json::json!(0);
                     obj["provider_count"] = serde_json::json!(state.provider_count);
                     obj["last_announced"] = serde_json::json!(state.last_announced);
                     obj["role"] = serde_json::json!(match state.role {

@@ -59,8 +59,6 @@ pub struct ContentState {
     pub stage: ContentStage,
     /// Total pieces stored locally (across all segments).
     pub local_pieces: usize,
-    /// Estimated remote pieces (from distribution feedback).
-    pub remote_pieces: usize,
     /// Number of segments.
     pub segment_count: usize,
     /// k per full segment (pieces needed for reconstruction).
@@ -97,10 +95,6 @@ impl ContentTracker {
     pub fn with_threshold(data_dir: &std::path::Path, reannounce_threshold_secs: u64) -> Self {
         let path = data_dir.join("content_tracker.json");
         let mut states = Self::load_from(&path).unwrap_or_default();
-        // Reset stale remote state on restart
-        for state in states.values_mut() {
-            state.remote_pieces = 0;
-        }
         debug!("ContentTracker loaded {} entries from {:?}", states.len(), path);
         Self { states, path, reannounce_threshold_secs, providers: HashMap::new() }
     }
@@ -123,7 +117,6 @@ impl ContentTracker {
             content_id,
             stage: ContentStage::Stored,
             local_pieces,
-            remote_pieces: 0,
             segment_count: manifest.segment_count,
             k,
             provider_count: 0,
@@ -168,7 +161,6 @@ impl ContentTracker {
             content_id,
             stage: ContentStage::Distributed,
             local_pieces: 0,
-            remote_pieces: 0,
             segment_count: manifest.segment_count,
             k,
             provider_count: 2, // At minimum: publisher + self
@@ -193,24 +185,18 @@ impl ContentTracker {
         }
     }
 
-    pub fn mark_announced(&mut self, content_id: &ContentId) {
+    /// Decrement local piece count by the given amount (called after pushing pieces out).
+    pub fn decrement_local_pieces(&mut self, content_id: &ContentId, count: usize) {
         if let Some(state) = self.states.get_mut(content_id) {
-            state.stage = ContentStage::Announced;
-            state.last_announced = Some(now_secs());
+            state.local_pieces = state.local_pieces.saturating_sub(count);
             self.save();
         }
     }
 
-    pub fn update_piece_progress(&mut self, content_id: &ContentId, remote_pieces: usize) {
+    pub fn mark_announced(&mut self, content_id: &ContentId) {
         if let Some(state) = self.states.get_mut(content_id) {
-            state.remote_pieces = remote_pieces;
-            let total_needed = state.segment_count * state.k;
-            if remote_pieces >= total_needed {
-                state.stage = ContentStage::Distributed;
-            } else if remote_pieces > 0 && state.stage != ContentStage::Degraded {
-                state.stage = ContentStage::Distributing;
-            }
-            state.last_checked = Some(now_secs());
+            state.stage = ContentStage::Announced;
+            state.last_announced = Some(now_secs());
             self.save();
         }
     }
@@ -321,7 +307,6 @@ impl ContentTracker {
                         content_id: cid,
                         stage: ContentStage::Stored,
                         local_pieces,
-                        remote_pieces: 0,
                         segment_count: manifest.segment_count,
                         k: manifest.k(),
                         provider_count: 0,
@@ -358,14 +343,10 @@ impl ContentTracker {
                 "Stored locally — needs DHT announcement".to_string()
             }
             ContentStage::Announced => {
-                if state.remote_pieces == 0 {
-                    format!("Announced — waiting for distribution ({} local pieces)", state.local_pieces)
-                } else {
-                    format!("Announced — {}/{} pieces distributed", state.remote_pieces, state.segment_count * state.k)
-                }
+                format!("Announced — {} local pieces, {} providers", state.local_pieces, state.provider_count)
             }
             ContentStage::Distributing => {
-                format!("Distributing — {} pieces pushed ({} providers)", state.remote_pieces, state.provider_count)
+                format!("Distributing — {} local pieces ({} providers)", state.local_pieces, state.provider_count)
             }
             ContentStage::Distributed => {
                 format!("Fully distributed — {} providers ✓", state.provider_count)
@@ -399,7 +380,6 @@ impl ContentTracker {
             };
 
             if let Some(state) = self.states.get_mut(&cid) {
-                state.remote_pieces = 0;
                 if state.local_pieces != actual_pieces {
                     info!("Sync: {} local_pieces {} -> {} (disk)", cid, state.local_pieces, actual_pieces);
                     state.local_pieces = actual_pieces;
@@ -524,7 +504,6 @@ mod tests {
         let state = tracker.get(&cid).unwrap();
         assert_eq!(state.stage, ContentStage::Stored);
         assert!(state.local_pieces > 0);
-        assert_eq!(state.remote_pieces, 0);
         assert_eq!(state.name, "test.txt");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -541,24 +520,6 @@ mod tests {
         let state = tracker.get(&cid).unwrap();
         assert_eq!(state.stage, ContentStage::Announced);
         assert!(state.last_announced.is_some());
-    }
-
-    #[test]
-    fn test_piece_progress() {
-        let dir = temp_dir();
-        let mut tracker = ContentTracker::new(&dir);
-        let cid = ContentId::from_bytes(b"progress");
-        tracker.track_published(cid, &test_manifest(cid), "file.bin".into(), false);
-        tracker.mark_announced(&cid);
-
-        tracker.update_piece_progress(&cid, 50);
-        assert_eq!(tracker.get(&cid).unwrap().stage, ContentStage::Distributing);
-
-        // k=102 for default manifest, 1 segment, so 102 needed
-        tracker.update_piece_progress(&cid, 102);
-        assert_eq!(tracker.get(&cid).unwrap().stage, ContentStage::Distributed);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -267,6 +267,27 @@ impl FsStore {
         Ok(result)
     }
 
+    /// Delete a single piece from disk.
+    pub fn delete_piece(
+        &self,
+        content_id: &ContentId,
+        segment_index: u32,
+        piece_id: &[u8; 32],
+    ) -> Result<()> {
+        let dir = self.piece_dir(content_id, segment_index);
+        let id_hex = hex::encode(piece_id);
+        let data_path = dir.join(format!("{id_hex}.data"));
+        let coeff_path = dir.join(format!("{id_hex}.coeff"));
+        if data_path.exists() {
+            std::fs::remove_file(&data_path)?;
+        }
+        if coeff_path.exists() {
+            std::fs::remove_file(&coeff_path)?;
+        }
+        debug!("Deleted piece {}/{}/{}", content_id, segment_index, &id_hex[..8]);
+        Ok(())
+    }
+
     /// Delete all data (pieces + manifest) for a content ID.
     pub fn delete_content(&self, content_id: &ContentId) -> Result<()> {
         let piece_dir = self.data_dir.join("pieces").join(content_id.to_hex());

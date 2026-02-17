@@ -60,6 +60,8 @@ pub struct PeerScore {
     pub storage_used_bytes: u64,
     /// Geographic region from capability announcement (e.g. "us-east", "eu-west").
     pub region: Option<String>,
+    /// Per-CID piece counts from capability announcement (CID hex → count).
+    pub piece_counts: std::collections::HashMap<String, usize>,
 
     // ── Transfer statistics ─────────────────────────────────
     /// Total bytes sent to this peer.
@@ -89,6 +91,7 @@ impl PeerScore {
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
             region: None,
+            piece_counts: std::collections::HashMap::new(),
             bytes_sent: 0,
             bytes_received: 0,
             pieces_sent: 0,
@@ -284,7 +287,7 @@ impl PeerScorer {
         capabilities: Vec<DataCraftCapability>,
         _timestamp: u64,
     ) {
-        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None);
+        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None, std::collections::HashMap::new());
     }
 
     /// Update capabilities and storage info from a gossipsub announcement.
@@ -296,18 +299,18 @@ impl PeerScorer {
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
         region: Option<String>,
+        piece_counts: std::collections::HashMap<String, usize>,
     ) {
         let now = Instant::now();
         let entry = self.scores.entry(*peer).or_insert_with(|| {
             PeerScore::new(capabilities.clone(), now)
         });
-        // Always update capabilities and announcement time on new gossipsub message
-        // (the caller already filters by timestamp freshness)
         entry.capabilities = capabilities;
         entry.last_announcement = now;
         entry.storage_committed_bytes = storage_committed_bytes;
         entry.storage_used_bytes = storage_used_bytes;
         entry.region = region;
+        entry.piece_counts = piece_counts;
     }
 
     /// Get the region for a peer, if known.
@@ -532,6 +535,7 @@ mod tests {
                 storage_committed_bytes: 0,
                 storage_used_bytes: 0,
                 region: None,
+                piece_counts: std::collections::HashMap::new(),
                 bytes_sent: 0,
                 bytes_received: 0,
                 pieces_sent: 0,

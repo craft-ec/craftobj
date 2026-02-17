@@ -318,38 +318,40 @@ pub async fn run_initial_push(
         }
     }
 
-    info!("Initial push for {}: pushed {} pieces to {} peers", content_id, total_pushed, ranked_peers.len());
+    info!("Initial push for {}: pushed {}/{} pieces to {} peers", content_id, total_pushed, total_pieces, ranked_peers.len());
 
     if total_pushed > 0 {
         let _ = event_tx.send(DaemonEvent::ContentDistributed {
             content_id: content_id.to_hex(),
             pieces_pushed: total_pushed,
-            total_pieces: total_pushed,
+            total_pieces,
             target_peers: ranked_peers.len(),
         });
     }
 
-    // Mark initial push as done regardless of push count (fire and forget)
-    {
-        let mut t = tracker.lock().await;
-        t.mark_initial_push_done(content_id);
-        t.update_piece_progress(content_id, total_pushed);
-    }
+    // Only mark initial push done and delete local pieces if ALL pieces were pushed successfully.
+    // If partial, keep retrying next cycle.
+    if total_pushed == total_pieces {
+        {
+            let mut t = tracker.lock().await;
+            t.mark_initial_push_done(content_id);
+        }
 
-    // Publisher is a client, not a storage node. Delete local pieces after distribution.
-    // The publisher only needs the CID to fetch content back from the network.
-    if total_pushed > 0 {
+        // Publisher is a client, not a storage node. Delete local pieces after full distribution.
         let c = client.lock().await;
         if let Err(e) = c.store().delete_content(content_id) {
             warn!("Failed to clean up publisher pieces for {}: {}", content_id, e);
         } else {
-            info!("Publisher cleanup: deleted local pieces for {} after distributing {} pieces", content_id, total_pushed);
+            info!("Publisher cleanup: deleted local pieces for {} after distributing all {} pieces", content_id, total_pushed);
         }
+    } else {
+        info!("Initial push for {}: partial ({}/{}), will retry next cycle", content_id, total_pushed, total_pieces);
     }
 }
 
 /// Pressure equalization (Function 2): for CIDs where local_pieces > 2,
-/// push 1 piece to a storage peer that doesn't already have this CID.
+/// push HALF of local pieces, split equally across ALL non-provider nodes.
+/// After successful push, delete the pushed pieces locally (pieces are UNIQUE).
 async fn equalize_pressure(
     tracker: &Arc<Mutex<ContentTracker>>,
     command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
@@ -393,10 +395,6 @@ async fn equalize_pressure(
             continue;
         }
 
-        // Pick one candidate (deterministic from CID for distribution)
-        let peer_idx = (content_id.0[0] as usize) % candidates.len();
-        let peer = candidates[peer_idx];
-
         let manifest = {
             let c = client.lock().await;
             match c.store().get_manifest(&content_id) {
@@ -405,65 +403,100 @@ async fn equalize_pressure(
             }
         };
 
-        // Push manifest first
-        let manifest_json = match serde_json::to_vec(&manifest) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        let _ = command_tx.send(DataCraftCommand::PushManifest {
-            peer_id: peer,
-            content_id,
-            manifest_json,
-            reply_tx,
-        });
-
-        // Push 2 pieces (minimum for RLNC provider status) from different segments if possible
-        let mut pushed = 0usize;
-        'outer: for seg in 0..manifest.segment_count as u32 {
+        // Collect all local pieces
+        let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
+        for seg in 0..manifest.segment_count as u32 {
             let pieces = {
                 let c = client.lock().await;
                 c.store().list_pieces(&content_id, seg).unwrap_or_default()
             };
-
             for pid in pieces {
-                if pushed >= 2 {
-                    break 'outer;
+                all_pieces.push((seg, pid));
+            }
+        }
+
+        if all_pieces.is_empty() {
+            continue;
+        }
+
+        // Push HALF of local pieces, split equally across ALL non-provider candidates
+        let half = all_pieces.len() / 2;
+        if half == 0 {
+            continue;
+        }
+        let pieces_to_push = &all_pieces[..half];
+        let per_peer = std::cmp::max(half / candidates.len(), 1);
+
+        // Push manifest to all candidates first
+        let manifest_json = match serde_json::to_vec(&manifest) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        for &peer in &candidates {
+            let (reply_tx, _reply_rx) = oneshot::channel();
+            let _ = command_tx.send(DataCraftCommand::PushManifest {
+                peer_id: peer,
+                content_id,
+                manifest_json: manifest_json.clone(),
+                reply_tx,
+            });
+        }
+
+        let mut total_pushed = 0usize;
+        let mut pieces_deleted = Vec::new();
+
+        for (i, (seg, pid)) in pieces_to_push.iter().enumerate() {
+            let peer = candidates[i / per_peer % candidates.len()];
+
+            let (piece_data, coefficients) = {
+                let c = client.lock().await;
+                match c.store().get_piece(&content_id, *seg, pid) {
+                    Ok(d) => d,
+                    Err(_) => continue,
                 }
+            };
 
-                let (piece_data, coefficients) = {
-                    let c = client.lock().await;
-                    match c.store().get_piece(&content_id, seg, &pid) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    }
-                };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = DataCraftCommand::PushPiece {
+                peer_id: peer,
+                content_id,
+                segment_index: *seg,
+                piece_id: *pid,
+                coefficients,
+                piece_data,
+                reply_tx,
+            };
 
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let cmd = DataCraftCommand::PushPiece {
-                    peer_id: peer,
-                    content_id,
-                    segment_index: seg,
-                    piece_id: pid,
-                    coefficients,
-                    piece_data,
-                    reply_tx,
-                };
-
-                if command_tx.send(cmd).is_ok() {
-                    if let Ok(Ok(())) = reply_rx.await {
-                        pushed += 1;
-                    }
+            if command_tx.send(cmd).is_ok() {
+                if let Ok(Ok(())) = reply_rx.await {
+                    total_pushed += 1;
+                    pieces_deleted.push((*seg, *pid));
                 }
             }
         }
-        if pushed > 0 {
-            debug!("Equalization: pushed {} pieces for {} to {}", pushed, content_id, peer);
+
+        // Delete pushed pieces locally — pieces are UNIQUE, only one copy in the network
+        if !pieces_deleted.is_empty() {
+            let c = client.lock().await;
+            for (seg, pid) in &pieces_deleted {
+                if let Err(e) = c.store().delete_piece(&content_id, *seg, pid) {
+                    warn!("Failed to delete pushed piece {}/{}: {}", content_id, seg, e);
+                }
+            }
+            drop(c);
+
+            // Update local_pieces count in tracker
+            let mut t = tracker.lock().await;
+            t.decrement_local_pieces(&content_id, pieces_deleted.len());
+        }
+
+        if total_pushed > 0 {
+            debug!("Equalization: pushed {} pieces for {} to {} peers", total_pushed, content_id, candidates.len());
             let _ = event_tx.send(DaemonEvent::ContentDistributed {
                 content_id: content_id.to_hex(),
-                pieces_pushed: pushed,
-                total_pieces: pushed,
-                target_peers: 1,
+                pieces_pushed: total_pushed,
+                total_pieces: total_pushed,
+                target_peers: candidates.len(),
             });
         }
     }

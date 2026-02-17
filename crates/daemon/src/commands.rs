@@ -41,6 +41,7 @@ pub enum DataCraftCommand {
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
         storage_root: [u8; 32],
+        piece_counts: std::collections::HashMap<String, usize>,
     },
     /// Store a re-encryption key in the DHT for access grant.
     PutReKey {
