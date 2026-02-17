@@ -245,16 +245,12 @@ pub async fn run_initial_push(
         }
     }
 
-    // Assign exactly 2 pieces per peer, round-robin. Stop when we run out of peers.
-    let pieces_per_peer: usize = 2;
-    let max_pieces = pieces_per_peer * ranked_peers.len();
+    // Push ALL pieces round-robin across peers. Publisher uploads everything (1.2x content size).
+    // Each peer gets consecutive pieces to maximize chance of getting pieces from same segment.
     let mut assignments: Vec<(libp2p::PeerId, u32, [u8; 32])> = Vec::new();
 
     for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
-        if i >= max_pieces {
-            break; // Only push 2 per peer, remaining pieces spread via equalization
-        }
-        let peer = ranked_peers[i / pieces_per_peer];
+        let peer = ranked_peers[i % ranked_peers.len()];
         assignments.push((peer, *seg_idx, *piece_id));
     }
 
