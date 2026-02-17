@@ -407,6 +407,7 @@ pub async fn run_daemon_with_config(
 
     // Wire challenger into handler for CID registration on publish/store
     handler.set_challenger(challenger_mgr.clone());
+    handler.set_local_peer_id(local_peer_id);
     let handler = Arc::new(handler);
 
     // Load or generate API key for WebSocket authentication

@@ -53,6 +53,8 @@ pub struct DataCraftHandler {
     eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
     /// Storage Merkle tree for incremental updates on store operations.
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    /// Local peer ID for filtering self from provider lists.
+    pub local_peer_id: Option<libp2p::PeerId>,
     /// Challenger manager for PDP — register CIDs after publish/store.
     challenger: Option<Arc<Mutex<crate::challenger::ChallengerManager>>>,
     /// Start time for uptime calculation.
@@ -85,8 +87,13 @@ impl DataCraftHandler {
             eviction_manager: None,
             merkle_tree: None,
             challenger: None,
+            local_peer_id: None,
             start_time: Instant::now(),
         }
+    }
+
+    pub fn set_local_peer_id(&mut self, peer_id: libp2p::PeerId) {
+        self.local_peer_id = Some(peer_id);
     }
 
     pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
@@ -150,6 +157,7 @@ impl DataCraftHandler {
             eviction_manager: None,
             merkle_tree: None,
             challenger: None,
+            local_peer_id: None,
             start_time: Instant::now(),
         }
     }
@@ -333,6 +341,12 @@ impl DataCraftHandler {
                     for (peer_id, score) in s.iter() {
                         if let Some(&count) = score.piece_counts.get(&cid_hex_key) {
                             if count > 0 {
+                                // Skip self — sending PieceSync to ourselves deadlocks
+                                if self.local_peer_id.as_ref() == Some(peer_id) {
+                                    info!("Skipping self ({}) as provider for {}", peer_id, cid);
+                                    continue;
+                                }
+                                info!("Provider {} has {} pieces for {}", peer_id, count, cid);
                                 providers.push(*peer_id);
                             }
                         }
@@ -340,7 +354,7 @@ impl DataCraftHandler {
                 }
 
                 if !providers.is_empty() {
-                    info!("Found {} local providers for {} via peer scorer", providers.len(), cid);
+                    info!("Found {} remote providers for {} via peer scorer", providers.len(), cid);
                     // Step 3: Fetch missing pieces from these providers
                     match self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
                         Ok(()) => {
@@ -810,7 +824,7 @@ impl DataCraftHandler {
                                     total_fetched += 1;
 
                                     if current_rank >= k {
-                                        debug!("Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
+                                        info!("Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
                                         break; // segment done
                                     }
                                 }
@@ -820,14 +834,14 @@ impl DataCraftHandler {
                             }
                         } else {
                             // Dependent piece — discard, record success anyway (peer was fine)
-                            debug!("Discarded dependent piece for segment {} from {}", seg_idx, provider);
+                            info!("Discarded dependent piece for segment {} from {}", seg_idx, provider);
                             if let Some(ref scorer) = self.peer_scorer {
                                 scorer.lock().await.record_success(&provider, latency);
                             }
                         }
                     }
                     Err(ref e) => {
-                        debug!("Failed to get piece from {}: {}", provider, e);
+                        info!("Failed to get piece from {}: {}", provider, e);
                         let failures = provider_failures.entry(provider).or_insert(0);
                         *failures += 1;
                         if let Some(ref scorer) = self.peer_scorer {
