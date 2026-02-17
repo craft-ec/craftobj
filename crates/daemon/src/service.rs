@@ -185,8 +185,8 @@ pub async fn run_daemon_with_config(
                     let dial_addr: libp2p::Multiaddr = addr.iter()
                         .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
                         .collect();
-                    swarm.behaviour_mut().craft.add_address(&pid, dial_addr.clone());
-                    if let Err(e) = swarm.dial(dial_addr) {
+                    swarm.behaviour_mut().craft.add_address(&pid, dial_addr);
+                    if let Err(e) = swarm.dial(pid) {
                         warn!("Failed to dial boot peer {}: {:?}", addr_str, e);
                     } else {
                         info!("Dialing boot peer: {}", addr_str);
@@ -1427,8 +1427,11 @@ fn handle_mdns_event(
                 address: addr.to_string(),
             });
             swarm.behaviour_mut().craft.add_address(peer_id, addr.clone());
-            if let Err(e) = swarm.dial(addr.clone()) {
-                debug!("Failed to dial mDNS peer {} at {}: {:?}", peer_id, addr, e);
+            // Dial by peer ID — address is already registered via add_address.
+            // Dialing the raw multiaddr (with /p2p/ suffix) causes relay transport
+            // to attempt noise handshake first and fail, adding seconds of delay.
+            if let Err(e) = swarm.dial(*peer_id) {
+                debug!("Failed to dial mDNS peer {}: {:?}", peer_id, e);
             }
         }
         if let Err(e) = swarm.behaviour_mut().craft.bootstrap() {
