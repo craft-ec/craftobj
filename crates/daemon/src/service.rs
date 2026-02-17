@@ -698,14 +698,19 @@ async fn gc_loop(
             all_cids.iter().filter(|cid| c.is_pinned(cid)).cloned().collect()
         };
 
-        // Also treat Publisher-role content as pinned (we published it)
+        // Protect Publisher and StorageProvider content from GC.
+        // Storage providers must keep their pieces — they're serving the network.
+        // Only fetched/temporary content (not tracked or unknown role) gets GC'd.
         let tracker = content_tracker.lock().await;
-        let publisher_cids: std::collections::HashSet<_> = all_cids
+        let protected_cids: std::collections::HashSet<_> = all_cids
             .iter()
             .filter(|cid| {
                 tracker
                     .get(cid)
-                    .map(|state| state.role == crate::content_tracker::ContentRole::Publisher)
+                    .map(|state| {
+                        state.role == crate::content_tracker::ContentRole::Publisher
+                            || state.role == crate::content_tracker::ContentRole::StorageProvider
+                    })
                     .unwrap_or(false)
             })
             .cloned()
@@ -715,11 +720,11 @@ async fn gc_loop(
         let mut deleted_count = 0u64;
 
         for cid in &all_cids {
-            if pinned_cids.contains(cid) || publisher_cids.contains(cid) {
-                continue; // Keep pinned and published content
+            if pinned_cids.contains(cid) || protected_cids.contains(cid) {
+                continue; // Keep pinned, published, and storage provider content
             }
 
-            // Unpinned, non-publisher content -> delete
+            // Unpinned, untracked content (fetched temporarily) -> delete
             if let Ok(()) = s.delete_content(cid) {
                 deleted_count += 1;
                 content_tracker.lock().await.remove(cid);
