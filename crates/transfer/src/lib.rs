@@ -38,52 +38,51 @@ use std::io;
 /// A request in the DataCraft transfer protocol.
 #[derive(Debug, Clone)]
 pub enum DataCraftRequest {
-    /// Request a piece (piece_id all zeros = "any random piece").
-    PieceRequest {
+    /// Fetch pieces for a segment. Peer sends pieces NOT in `have_pieces`.
+    /// Adapted from IPFS Bitswap wantlists for RLNC: any piece works as long
+    /// as it's independent, so we send an exclude-list instead of a want-list.
+    PieceSync {
         content_id: ContentId,
         segment_index: u32,
-        piece_id: [u8; 32],
+        merkle_root: [u8; 32],          // Our storage Merkle root for this CID
+        have_pieces: Vec<[u8; 32]>,      // Piece IDs we already hold (exclude list)
+        max_pieces: u16,                 // Max pieces we want (0 = send all available)
     },
-    /// Push a piece to a peer for storage.
+    /// Push a single piece to a storage peer (used during distribution).
+    /// Sender deletes local copy after receiving Ack { Ok }.
     PiecePush {
         content_id: ContentId,
         segment_index: u32,
-        piece_id: [u8; 32],
+        piece_id: [u8; 32],             // SHA-256(coefficients)
         coefficients: Vec<u8>,
         data: Vec<u8>,
     },
-    /// Push a manifest to a peer.
+    /// Push a manifest to a storage peer. Must arrive before pieces.
     ManifestPush {
         content_id: ContentId,
         manifest_json: Vec<u8>,
     },
-    /// Request inventory of segments/pieces a peer has.
-    InventoryRequest {
-        content_id: ContentId,
-    },
+}
+
+/// A piece within a PieceBatch response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiecePayload {
+    pub segment_index: u32,
+    pub piece_id: [u8; 32],
+    pub coefficients: Vec<u8>,           // k bytes (k=40 for default config)
+    pub data: Vec<u8>,                   // 256 KiB
 }
 
 /// A response in the DataCraft transfer protocol.
 #[derive(Debug, Clone)]
 pub enum DataCraftResponse {
-    /// Piece data response.
-    Piece {
-        status: WireStatus,
-        coefficients: Vec<u8>,
-        data: Vec<u8>,
+    /// Response to PieceSync: batch of pieces the peer has that we don't.
+    PieceBatch {
+        pieces: Vec<PiecePayload>,
     },
-    /// Ack for a piece push.
-    PushAck {
+    /// Ack for PiecePush or ManifestPush.
+    Ack {
         status: WireStatus,
-    },
-    /// Ack for a manifest push.
-    ManifestAck {
-        status: WireStatus,
-    },
-    /// Inventory response.
-    Inventory {
-        status: WireStatus,
-        payload: Vec<u8>, // bincode-encoded InventoryResponse
     },
 }
 

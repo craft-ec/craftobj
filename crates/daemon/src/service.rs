@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use craftec_ipc::IpcServer;
-use craftec_network::{build_swarm, NetworkConfig};
+use craftec_network::NetworkConfig;
 use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, ContentManifest, CapabilityAnnouncement, DataCraftCapability};
+use datacraft_core::{ContentId, ContentManifest, CapabilityAnnouncement, DataCraftCapability, WireStatus};
+use datacraft_transfer::{DataCraftRequest, DataCraftResponse};
 use libp2p::identity::Keypair;
+use libp2p::request_response;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
+use crate::behaviour::{build_datacraft_swarm, DataCraftBehaviour, DataCraftBehaviourEvent, DataCraftSwarm};
 use crate::commands::DataCraftCommand;
 use crate::events::{self, DaemonEvent, EventSender};
 use crate::handler::DataCraftHandler;
@@ -157,13 +160,13 @@ pub async fn run_daemon_with_config(
         Arc::new(Mutex::new(tree))
     };
 
-    // Build swarm
-    let (mut swarm, local_peer_id) = build_swarm(keypair.clone(), network_config).await
+    // Build swarm with DataCraft wrapper behaviour (CraftBehaviour + request_response)
+    let (mut swarm, local_peer_id) = build_datacraft_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
     info!("DataCraft node started: {}", local_peer_id);
 
     // Set Kademlia to server mode so DHT queries work (especially on localhost / LAN)
-    swarm.behaviour_mut().kademlia.set_mode(Some(libp2p::kad::Mode::Server));
+    swarm.behaviour_mut().craft.kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
     // Dial bootstrap peers for reliable discovery beyond mDNS
     for addr_str in &daemon_config.boot_peers {
@@ -181,7 +184,7 @@ pub async fn run_daemon_with_config(
                     let dial_addr: libp2p::Multiaddr = addr.iter()
                         .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
                         .collect();
-                    swarm.behaviour_mut().add_address(&pid, dial_addr.clone());
+                    swarm.behaviour_mut().craft.add_address(&pid, dial_addr.clone());
                     if let Err(e) = swarm.dial(dial_addr) {
                         warn!("Failed to dial boot peer {}: {:?}", addr_str, e);
                     } else {
@@ -207,11 +210,8 @@ pub async fn run_daemon_with_config(
     // Create pending requests tracker for DHT operations
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
 
-    // Create and register DataCraft protocol
-    let mut protocol = DataCraftProtocol::new(store.clone(), protocol_event_tx);
-
-    let incoming_streams = protocol.register(&mut swarm)
-        .map_err(|e| format!("Failed to register DataCraft protocol: {}", e))?;
+    // Create DataCraft protocol handler (DHT operations only)
+    let protocol = DataCraftProtocol::new(protocol_event_tx);
 
     // Subscribe to gossipsub topics
     if let Err(e) = swarm
@@ -270,42 +270,15 @@ pub async fn run_daemon_with_config(
             .expect("failed to open receipt store"),
     ));
 
-    // Wire persistent receipt store into the protocol handler
-    protocol.set_persistent_receipt_store(receipt_store.clone());
-
-    // Wire removal cache into the protocol for pre-serve checks
-    protocol.set_removal_cache(removal_cache.clone());
-
-    // Create demand tracker early so we can wire it into protocol before Arc wrapping
+    // Create demand tracker
     let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::new()));
-    protocol.set_demand_tracker(demand_tracker.clone());
 
-    // Eviction manager (created early to wire into protocol before Arc wrapping)
+    // Eviction manager
     let eviction_config = crate::eviction::EvictionConfig {
         max_storage_bytes: daemon_config.max_storage_bytes,
         enable_eviction: true,
     };
     let eviction_manager = Arc::new(Mutex::new(crate::eviction::EvictionManager::new(&eviction_config)));
-    protocol.set_eviction_manager(eviction_manager.clone());
-    protocol.set_merkle_tree(merkle_tree.clone());
-
-    // Create stream pool for persistent outbound streams
-    let stream_pool = {
-        let control = swarm.behaviour().stream_control();
-        Arc::new(Mutex::new(crate::stream_manager::StreamPool::new(control)))
-    };
-    protocol.set_stream_pool(stream_pool.clone());
-    protocol.set_daemon_event_tx(event_tx.clone());
-    protocol.set_peer_scorer(peer_scorer.clone());
-    protocol.set_limits(
-        daemon_config.max_concurrent_transfers,
-        daemon_config.piece_timeout_secs,
-        daemon_config.stream_open_timeout_secs,
-    );
-
-    // Capture a stream control handle for use in spawned tasks (avoids deadlock
-    // when opening streams while the swarm event loop is blocked on command handling).
-    let stream_control = swarm.behaviour().stream_control();
 
     let protocol = Arc::new(protocol);
 
@@ -502,11 +475,8 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), stream_pool.clone(), daemon_config.max_peer_connections, stream_control.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections) => {
             info!("Swarm event loop ended");
-        }
-        _ = handle_incoming_streams(incoming_streams, protocol.clone()) => {
-            info!("Incoming streams handler ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
             info!("Protocol events handler ended");
