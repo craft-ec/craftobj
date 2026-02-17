@@ -164,6 +164,36 @@ pub async fn run_daemon_with_config(
     // Set Kademlia to server mode so DHT queries work (especially on localhost / LAN)
     swarm.behaviour_mut().kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
+    // Dial bootstrap peers for reliable discovery beyond mDNS
+    for addr_str in &daemon_config.boot_peers {
+        match addr_str.parse::<libp2p::Multiaddr>() {
+            Ok(addr) => {
+                // Extract peer ID if present in multiaddr
+                let peer_id = addr.iter().find_map(|proto| {
+                    if let libp2p::multiaddr::Protocol::P2p(pid) = proto {
+                        Some(pid)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(pid) = peer_id {
+                    let dial_addr: libp2p::Multiaddr = addr.iter()
+                        .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                        .collect();
+                    swarm.behaviour_mut().add_address(&pid, dial_addr.clone());
+                    if let Err(e) = swarm.dial(dial_addr) {
+                        warn!("Failed to dial boot peer {}: {:?}", addr_str, e);
+                    } else {
+                        info!("Dialing boot peer: {}", addr_str);
+                    }
+                } else {
+                    warn!("Boot peer missing /p2p/<peer_id>: {}", addr_str);
+                }
+            }
+            Err(e) => warn!("Invalid boot peer address '{}': {}", addr_str, e),
+        }
+    }
+
     // Create event channel for protocol communication
     let (protocol_event_tx, mut protocol_event_rx) = mpsc::unbounded_channel::<DataCraftEvent>();
     
@@ -1093,6 +1123,11 @@ fn handle_mdns_event(
             if let Err(e) = swarm.dial(addr.clone()) {
                 debug!("Failed to dial mDNS peer {} at {}: {:?}", peer_id, addr, e);
             }
+        }
+        // Bootstrap Kademlia after discovering new peers so late-joining nodes
+        // get integrated into the DHT.
+        if let Err(e) = swarm.behaviour_mut().bootstrap() {
+            debug!("Kademlia bootstrap after mDNS: {:?}", e);
         }
     }
 }

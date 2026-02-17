@@ -55,6 +55,12 @@ pub struct DaemonConfig {
     /// Set to 0 to disable GC.
     pub gc_interval_secs: u64,
 
+    // ── Bootstrap ─────────────────────────────────────────────
+    /// Bootstrap peer multiaddrs (e.g. ["/ip4/1.2.3.4/tcp/9000/p2p/12D3KooW..."]).
+    /// Nodes dial these on startup for reliable discovery beyond mDNS.
+    #[serde(default)]
+    pub boot_peers: Vec<String>,
+
     // ── Geographic ──────────────────────────────────────────
     /// Geographic region of this node (e.g. "us-east", "eu-west").
     /// Included in capability announcements for geographic-aware routing.
@@ -80,6 +86,7 @@ impl Default for DaemonConfig {
             aggregation_epoch_secs: None,
             max_storage_bytes: 0,
             gc_interval_secs: 3600,
+            boot_peers: Vec::new(),
             region: None,
             extra: serde_json::Map::new(),
         }
