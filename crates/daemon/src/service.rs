@@ -522,6 +522,9 @@ pub async fn run_daemon_with_config(
         _ = disk_monitor_loop(data_dir.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
             info!("[service.rs] Disk monitor loop ended");
         }
+        _ = data_retention_loop(receipt_store.clone()) => {
+            info!("[service.rs] Data retention loop ended");
+        }
     }
 
     Ok(())
@@ -1561,7 +1564,7 @@ async fn handle_gossipsub_capability(
                             .map(|_| true) // Always accept since scorer tracks announcement time
                             .unwrap_or(true);
                         if dominated {
-                            scorer.update_capabilities_with_storage(
+                            scorer.update_capabilities_full(
                                 &peer_id,
                                 ann.capabilities,
                                 ann.timestamp,
@@ -1569,6 +1572,7 @@ async fn handle_gossipsub_capability(
                                 ann.storage_used_bytes,
                                 ann.region,
                                 ann.piece_counts,
+                                ann.storage_root,
                             );
                         }
                         return is_new && has_storage;
@@ -2078,6 +2082,35 @@ async fn disk_monitor_loop(
                     total_bytes: ds.total_bytes,
                     percent: ds.percent_used * 100.0,
                 });
+            }
+        }
+    }
+}
+
+/// Prune receipts older than 24 hours (normal node data retention).
+/// Aggregator nodes handle lifetime data separately.
+async fn data_retention_loop(
+    receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
+) {
+    use std::time::Duration;
+
+    // Run every hour
+    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(24 * 3600);
+        let mut store = receipt_store.lock().await;
+        match store.prune_before(cutoff) {
+            Ok(pruned) if pruned > 0 => {
+                info!("[service.rs] Data retention: pruned {} receipts older than 24h", pruned);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("[service.rs] Data retention prune failed: {}", e);
             }
         }
     }

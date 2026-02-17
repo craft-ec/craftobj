@@ -181,6 +181,56 @@ impl PersistentReceiptStore {
     pub fn all_storage_receipts(&self) -> &[StorageReceipt] {
         &self.storage_receipts
     }
+
+    /// Prune all receipts with timestamp older than `cutoff_ts` (unix seconds).
+    /// Rewrites the store file with only retained entries.
+    pub fn prune_before(&mut self, cutoff_ts: u64) -> io::Result<usize> {
+        let before = self.entries.len();
+        let retained: Vec<ReceiptEntry> = self.entries.iter().filter(|e| {
+            let ts = match e {
+                ReceiptEntry::Storage(r) => r.timestamp,
+            };
+            ts >= cutoff_ts
+        }).cloned().collect();
+        let pruned = before - retained.len();
+        if pruned == 0 {
+            return Ok(0);
+        }
+
+        // Rebuild indices
+        self.entries.clear();
+        self.storage_receipts.clear();
+        self.by_cid.clear();
+        self.by_node.clear();
+        self.seen.clear();
+
+        for entry in &retained {
+            self.seen.insert(Self::dedup_hash(entry));
+        }
+        for entry in retained {
+            self.index_entry(entry);
+        }
+
+        // Rewrite file
+        let path = self.path.clone();
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        self.file = BufWriter::new(file);
+        for entry in &self.entries {
+            let payload = bincode::serialize(entry)
+                .map_err(io::Error::other)?;
+            let len = (payload.len() as u32).to_le_bytes();
+            self.file.write_all(&len)?;
+            self.file.write_all(&payload)?;
+        }
+        self.file.flush()?;
+
+        tracing::info!("[receipt_store.rs] Pruned {} receipts older than {}", pruned, cutoff_ts);
+        Ok(pruned)
+    }
 }
 
 #[cfg(test)]

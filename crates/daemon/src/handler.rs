@@ -1762,31 +1762,69 @@ impl DataCraftHandler {
             (String::new(), 0, String::new(), String::new(), 0)
         };
 
-        let health_ratio = min_ratio.unwrap_or(0.0);
+        let local_health_ratio = min_ratio.unwrap_or(0.0);
 
-        // Build provider list with peer scorer info
+        // Build provider list with peer scorer info (network-wide)
+        let cid_hex = cid.to_hex();
         let mut providers_json = Vec::new();
-        if let Some(ref tracker) = self.content_tracker {
-            let t = tracker.lock().await;
-            let providers = t.get_providers(&cid);
-            drop(t);
-            if let Some(ref scorer) = self.peer_scorer {
-                let mut ps = scorer.lock().await;
-                for peer in providers {
-                    let region = ps.get_region(&peer).unwrap_or("unknown").to_string();
-                    let score = ps.score(&peer);
-                    let latency = ps.iter().find(|(p, _)| *p == &peer)
-                        .map(|(_, s)| s.avg_latency_ms)
-                        .unwrap_or(0.0);
-                    providers_json.push(serde_json::json!({
-                        "peer_id": peer.to_string(),
-                        "region": region,
-                        "score": score,
-                        "latency_ms": latency,
-                    }));
+        let mut network_total_pieces: usize = 0;
+
+        // Aggregate from peer_scorer.piece_counts for network-wide view
+        if let Some(ref scorer) = self.peer_scorer {
+            let mut ps = scorer.lock().await;
+            for (peer, peer_score) in ps.iter() {
+                if let Some(&count) = peer_score.piece_counts.get(&cid_hex) {
+                    if count > 0 {
+                        network_total_pieces += count;
+                        providers_json.push(serde_json::json!({
+                            "peer_id": peer.to_string(),
+                            "piece_count": count,
+                            "merkle_root": hex::encode(peer_score.storage_root),
+                            "last_seen": peer_score.last_announcement.elapsed().as_secs(),
+                            "region": peer_score.region.as_deref().unwrap_or("unknown"),
+                            "score": peer_score.score(),
+                            "latency_ms": peer_score.avg_latency_ms,
+                        }));
+                    }
+                }
+            }
+            // Also add known providers from content_tracker that may not have piece_counts
+            if let Some(ref tracker) = self.content_tracker {
+                let t = tracker.lock().await;
+                let tracked_providers = t.get_providers(&cid);
+                for peer in tracked_providers {
+                    if !providers_json.iter().any(|p| p["peer_id"].as_str() == Some(&peer.to_string())) {
+                        let region = ps.get_region(&peer).unwrap_or("unknown").to_string();
+                        let score = ps.score_readonly(&peer);
+                        let latency = ps.get(&peer).map(|s| s.avg_latency_ms).unwrap_or(0.0);
+                        let merkle_root = ps.get(&peer).map(|s| hex::encode(s.storage_root)).unwrap_or_default();
+                        providers_json.push(serde_json::json!({
+                            "peer_id": peer.to_string(),
+                            "piece_count": 0,
+                            "merkle_root": merkle_root,
+                            "last_seen": ps.get(&peer).map(|s| s.last_announcement.elapsed().as_secs()).unwrap_or(0),
+                            "region": region,
+                            "score": score,
+                            "latency_ms": latency,
+                        }));
+                    }
                 }
             }
         }
+
+        // Network rank: use per-segment aggregation from all providers if available
+        // For now, use network_total_pieces as a proxy for network health
+        let network_health_ratio = if k > 0 && manifest.segment_count > 0 {
+            // Average pieces per provider per segment gives network rank estimate
+            let avg_pieces_per_segment = if providers_json.is_empty() {
+                min_rank.unwrap_or(0) as f64 // fall back to local
+            } else {
+                network_total_pieces as f64 / manifest.segment_count as f64
+            };
+            avg_pieces_per_segment / k as f64
+        } else {
+            local_health_ratio
+        };
 
         Ok(serde_json::json!({
             "content_id": cid.to_hex(),
@@ -1796,8 +1834,10 @@ impl DataCraftHandler {
             "k": k,
             "segments": segments_json,
             "min_rank": min_rank_val,
-            "health_ratio": health_ratio,
-            "provider_count": provider_count,
+            "health_ratio": network_health_ratio,
+            "local_health_ratio": local_health_ratio,
+            "network_total_pieces": network_total_pieces,
+            "provider_count": providers_json.len(),
             "providers": providers_json,
             "pinned": pinned,
             "role": role,
@@ -1883,18 +1923,25 @@ impl DataCraftHandler {
     /// `network.health` — Network-wide health statistics.
     async fn handle_network_health(&self) -> Result<Value, String> {
         // Network storage from peer scorer
-        let (storage_summary, storage_node_count, unique_providers) = if let Some(ref scorer) = self.peer_scorer {
+        let (storage_summary, storage_node_count, unique_providers, network_piece_counts) = if let Some(ref scorer) = self.peer_scorer {
             let ps = scorer.lock().await;
             let summary = ps.network_storage_summary();
             let node_count = summary.storage_node_count;
             let unique = ps.iter().count();
-            (Some(summary), node_count, unique)
+            // Aggregate piece counts across all peers per CID
+            let mut cid_pieces: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (_, peer_score) in ps.iter() {
+                for (cid_hex, &count) in &peer_score.piece_counts {
+                    *cid_pieces.entry(cid_hex.clone()).or_default() += count;
+                }
+            }
+            (Some(summary), node_count, unique, cid_pieces)
         } else {
-            (None, 0, 0)
+            (None, 0, 0, std::collections::HashMap::new())
         };
 
         let mut total_content = 0usize;
-        let mut total_stored_bytes = 0u64;
+        let mut total_local_bytes = 0u64;
         let mut healthy = 0usize;
         let mut degraded = 0usize;
         let mut health_sum = 0.0f64;
@@ -1908,34 +1955,45 @@ impl DataCraftHandler {
         };
 
         if !states.is_empty() {
-            // Single client lock for all CID health computations.
             let client = self.client.lock().await;
             total_content = states.len();
             for state in &states {
-                let manifest = client.store().get_manifest(&state.content_id).ok();
-                let segments = client.store().list_segments(&state.content_id).unwrap_or_default();
-                let mut min_ratio: Option<f64> = None;
-                let mut all_reconstructable = true;
-                for &seg in &segments {
-                    let pieces = client.store().list_pieces(&state.content_id, seg).unwrap_or_default();
-                    let rank = pieces.len();
-                    let seg_k = manifest.as_ref()
-                        .map(|m| m.k_for_segment(seg as usize))
-                        .unwrap_or(state.k);
-                    if seg_k > 0 {
-                        let ratio = rank as f64 / seg_k as f64;
-                        min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
-                        if rank < seg_k { all_reconstructable = false; }
-                    }
-                }
+                let cid_hex = state.content_id.to_hex();
                 let disk_usage = client.store().cid_disk_usage(&state.content_id);
-                total_stored_bytes += disk_usage;
-                let health_ratio = min_ratio.unwrap_or(0.0);
-                health_sum += health_ratio;
-                if all_reconstructable {
-                    healthy += 1;
+                total_local_bytes += disk_usage;
+
+                // Use network-wide piece counts for health assessment
+                let network_pieces = network_piece_counts.get(&cid_hex).copied().unwrap_or(0);
+                let k = state.k;
+                let seg_count = state.segment_count.max(1);
+
+                if k > 0 {
+                    // Network pieces spread across segments — estimate per-segment availability
+                    let avg_per_segment = network_pieces as f64 / seg_count as f64;
+                    let ratio = avg_per_segment / k as f64;
+                    health_sum += ratio;
+                    if avg_per_segment >= k as f64 {
+                        healthy += 1;
+                    } else {
+                        degraded += 1;
+                    }
                 } else {
-                    degraded += 1;
+                    // Fallback to local assessment
+                    let segments = client.store().list_segments(&state.content_id).unwrap_or_default();
+                    let mut all_ok = true;
+                    let mut min_ratio: Option<f64> = None;
+                    for &seg in &segments {
+                        let pieces = client.store().list_pieces(&state.content_id, seg).unwrap_or_default();
+                        let manifest = client.store().get_manifest(&state.content_id).ok();
+                        let seg_k = manifest.as_ref().map(|m| m.k_for_segment(seg as usize)).unwrap_or(0);
+                        if seg_k > 0 {
+                            let ratio = pieces.len() as f64 / seg_k as f64;
+                            min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+                            if pieces.len() < seg_k { all_ok = false; }
+                        }
+                    }
+                    health_sum += min_ratio.unwrap_or(0.0);
+                    if all_ok { healthy += 1; } else { degraded += 1; }
                 }
             }
         }
@@ -1949,11 +2007,15 @@ impl DataCraftHandler {
             0
         };
 
+        // total_stored_bytes now reflects network-wide storage from peer_scorer
+        let total_network_used = storage_summary.as_ref().map(|s| s.total_used).unwrap_or(0);
+
         Ok(serde_json::json!({
             "total_content_count": total_content,
-            "total_stored_bytes": total_stored_bytes,
+            "total_stored_bytes": total_network_used,
+            "total_local_bytes": total_local_bytes,
             "total_network_storage_committed": storage_summary.as_ref().map(|s| s.total_committed).unwrap_or(0),
-            "total_network_storage_used": storage_summary.as_ref().map(|s| s.total_used).unwrap_or(0),
+            "total_network_storage_used": total_network_used,
             "storage_node_count": storage_node_count,
             "healthy_content_count": healthy,
             "degraded_content_count": degraded,

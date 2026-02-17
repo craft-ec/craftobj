@@ -62,6 +62,8 @@ pub struct PeerScore {
     pub region: Option<String>,
     /// Per-CID piece counts from capability announcement (CID hex → count).
     pub piece_counts: std::collections::HashMap<String, usize>,
+    /// Root hash of the node's storage Merkle tree.
+    pub storage_root: [u8; 32],
 
     // ── Transfer statistics ─────────────────────────────────
     /// Total bytes sent to this peer.
@@ -92,6 +94,7 @@ impl PeerScore {
             storage_used_bytes: 0,
             region: None,
             piece_counts: std::collections::HashMap::new(),
+            storage_root: [0u8; 32],
             bytes_sent: 0,
             bytes_received: 0,
             pieces_sent: 0,
@@ -301,6 +304,21 @@ impl PeerScorer {
         region: Option<String>,
         piece_counts: std::collections::HashMap<String, usize>,
     ) {
+        self.update_capabilities_full(peer, capabilities, _timestamp, storage_committed_bytes, storage_used_bytes, region, piece_counts, [0u8; 32]);
+    }
+
+    /// Update capabilities, storage info, and merkle root from a gossipsub announcement.
+    pub fn update_capabilities_full(
+        &mut self,
+        peer: &PeerId,
+        capabilities: Vec<DataCraftCapability>,
+        _timestamp: u64,
+        storage_committed_bytes: u64,
+        storage_used_bytes: u64,
+        region: Option<String>,
+        piece_counts: std::collections::HashMap<String, usize>,
+        storage_root: [u8; 32],
+    ) {
         let now = Instant::now();
         let entry = self.scores.entry(*peer).or_insert_with(|| {
             PeerScore::new(capabilities.clone(), now)
@@ -311,6 +329,7 @@ impl PeerScorer {
         entry.storage_used_bytes = storage_used_bytes;
         entry.region = region;
         entry.piece_counts = piece_counts;
+        entry.storage_root = storage_root;
     }
 
     /// Get the region for a peer, if known.
@@ -536,6 +555,7 @@ mod tests {
                 storage_used_bytes: 0,
                 region: None,
                 piece_counts: std::collections::HashMap::new(),
+                storage_root: [0u8; 32],
                 bytes_sent: 0,
                 bytes_received: 0,
                 pieces_sent: 0,
