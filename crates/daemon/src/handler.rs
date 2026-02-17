@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::channel_store::ChannelStore;
+use datacraft_transfer;
 use crate::commands::DataCraftCommand;
 use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
@@ -743,20 +744,29 @@ impl DataCraftHandler {
                 let cid = *content_id;
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    let command = DataCraftCommand::RequestPiece {
+                    let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
+                    let command = DataCraftCommand::PieceSync {
                         peer_id: provider,
                         content_id: cid,
                         segment_index: seg_idx,
-                        piece_id: [0u8; 32], // "any piece"
+                        merkle_root: [0u8; 32],
+                        have_pieces: vec![],
+                        max_pieces: 1,
                         reply_tx,
                     };
                     if cmd_tx.send(command).is_err() {
-                        return (provider, Err("command channel closed".into()), start.elapsed());
+                        return (provider, Err::<(Vec<u8>, Vec<u8>), String>("command channel closed".into()), start.elapsed());
                     }
                     match reply_rx.await {
-                        Ok(Ok((coeff, data))) => (provider, Ok((coeff, data)), start.elapsed()),
-                        Ok(Err(e)) => (provider, Err(e.to_string()), start.elapsed()),
+                        Ok(Ok(datacraft_transfer::DataCraftResponse::PieceBatch { pieces })) => {
+                            if let Some(piece) = pieces.into_iter().next() {
+                                (provider, Ok((piece.coefficients, piece.data)), start.elapsed())
+                            } else {
+                                (provider, Err("no pieces returned".into()), start.elapsed())
+                            }
+                        }
+                        Ok(Ok(_)) => (provider, Err("unexpected response type".into()), start.elapsed()),
+                        Ok(Err(e)) => (provider, Err(e), start.elapsed()),
                         Err(e) => (provider, Err(e.to_string()), start.elapsed()),
                     }
                 });
@@ -838,20 +848,29 @@ impl DataCraftHandler {
                             let cid = *content_id;
                             join_set.spawn(async move {
                                 let start = std::time::Instant::now();
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                let command = DataCraftCommand::RequestPiece {
+                                let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
+                                let command = DataCraftCommand::PieceSync {
                                     peer_id: next_provider,
                                     content_id: cid,
                                     segment_index: seg_idx,
-                                    piece_id: [0u8; 32],
+                                    merkle_root: [0u8; 32],
+                                    have_pieces: vec![],
+                                    max_pieces: 1,
                                     reply_tx,
                                 };
                                 if cmd_tx.send(command).is_err() {
-                                    return (next_provider, Err("command channel closed".into()), start.elapsed());
+                                    return (next_provider, Err::<(Vec<u8>, Vec<u8>), String>("command channel closed".into()), start.elapsed());
                                 }
                                 match reply_rx.await {
-                                    Ok(Ok((coeff, data))) => (next_provider, Ok((coeff, data)), start.elapsed()),
-                                    Ok(Err(e)) => (next_provider, Err(e.to_string()), start.elapsed()),
+                                    Ok(Ok(datacraft_transfer::DataCraftResponse::PieceBatch { pieces })) => {
+                                        if let Some(piece) = pieces.into_iter().next() {
+                                            (next_provider, Ok((piece.coefficients, piece.data)), start.elapsed())
+                                        } else {
+                                            (next_provider, Err("no pieces returned".into()), start.elapsed())
+                                        }
+                                    }
+                                    Ok(Ok(_)) => (next_provider, Err("unexpected response type".into()), start.elapsed()),
+                                    Ok(Err(e)) => (next_provider, Err(e), start.elapsed()),
                                     Err(e) => (next_provider, Err(e.to_string()), start.elapsed()),
                                 }
                             });

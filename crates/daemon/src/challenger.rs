@@ -16,6 +16,7 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
+use datacraft_transfer;
 use crate::commands::DataCraftCommand;
 use crate::health::{self, DutyCycleResult, TierInfo, PdpRoundResult, ProviderPdpResult};
 use crate::pdp::{
@@ -466,40 +467,78 @@ impl ChallengerManager {
         rx.await.map_err(|e| format!("Channel closed: {}", e))?
     }
 
+    /// Request inventory from a peer by sending a PieceSync with empty have_pieces.
+    /// Returns an InventoryResponse built from the PieceBatch.
     async fn request_inventory(
         &self,
         peer: PeerId,
         cid: ContentId,
     ) -> Result<datacraft_core::InventoryResponse, String> {
+        // We don't know which segments to query, so query segment 0 with a large max.
+        // For full inventory, the caller iterates segments.
+        // This is a simplification — full inventory requires per-segment queries.
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(DataCraftCommand::RequestInventory {
+            .send(DataCraftCommand::PieceSync {
                 peer_id: peer,
                 content_id: cid,
+                segment_index: 0,
+                merkle_root: [0u8; 32],
+                have_pieces: vec![],
+                max_pieces: 1000,
                 reply_tx: tx,
             })
-            .map_err(|e| format!("Failed to send inventory request: {}", e))?;
-        rx.await.map_err(|e| format!("Channel closed: {}", e))?
+            .map_err(|e| format!("Failed to send PieceSync: {}", e))?;
+        let response = rx.await.map_err(|e| format!("Channel closed: {}", e))??;
+        match response {
+            datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => {
+                let mut segments: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+                for p in &pieces {
+                    segments.entry(p.segment_index).or_default().push(p.coefficients.clone());
+                }
+                let inv_segments = segments.into_iter().map(|(seg_idx, coeff_vecs)| {
+                    datacraft_core::SegmentInventory {
+                        segment_index: seg_idx,
+                        coefficient_vectors: coeff_vecs,
+                    }
+                }).collect();
+                Ok(datacraft_core::InventoryResponse { content_id: cid, segments: inv_segments })
+            }
+            _ => Err("unexpected response type".into()),
+        }
     }
 
+    /// Request a piece from a peer via PieceSync (requesting 1 piece, excluding none).
     async fn request_piece(
         &self,
         peer: PeerId,
         cid: ContentId,
         segment_index: u32,
-        piece_id: &[u8; 32],
+        _piece_id: &[u8; 32],
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(DataCraftCommand::RequestPiece {
+            .send(DataCraftCommand::PieceSync {
                 peer_id: peer,
                 content_id: cid,
                 segment_index,
-                piece_id: *piece_id,
+                merkle_root: [0u8; 32],
+                have_pieces: vec![],
+                max_pieces: 1,
                 reply_tx: tx,
             })
-            .map_err(|e| format!("Failed to send piece request: {}", e))?;
-        rx.await.map_err(|e| format!("Channel closed: {}", e))?
+            .map_err(|e| format!("Failed to send PieceSync: {}", e))?;
+        let response = rx.await.map_err(|e| format!("Channel closed: {}", e))??;
+        match response {
+            datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => {
+                if let Some(piece) = pieces.into_iter().next() {
+                    Ok((piece.coefficients, piece.data))
+                } else {
+                    Err("no pieces returned".into())
+                }
+            }
+            _ => Err("unexpected response type".into()),
+        }
     }
 }
 

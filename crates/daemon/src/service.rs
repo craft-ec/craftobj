@@ -972,16 +972,12 @@ async fn drive_swarm(
                             });
                         }
                         other => {
-                            handle_command(swarm, &protocol, other, pending_requests.clone(), &event_tx, &region, &signing_key, &stream_control).await;
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &mut pending_transfers, &event_tx, &region, &signing_key).await;
                         }
                     }
                 }
             }
-            // Poll stream pool for completed background opens
-            _ = pool_poll_interval.tick() => {
-                let mut pool = stream_pool.lock().await;
-                pool.poll();
-            }
+            // (stream pool removed — using request_response)
             // Peer reconnection with exponential backoff
             _ = reconnect_interval.tick() => {
                 let due = peer_reconnector.peers_due_for_reconnect();
@@ -1017,16 +1013,114 @@ async fn drive_swarm(
     }
 }
 
+/// Handle an incoming transfer request from a peer via request_response.
+async fn handle_incoming_transfer_request(
+    peer: &libp2p::PeerId,
+    request: DataCraftRequest,
+    store: &Arc<Mutex<datacraft_store::FsStore>>,
+    content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    protocol: &Arc<DataCraftProtocol>,
+) -> DataCraftResponse {
+    match request {
+        DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
+            debug!("Handling PieceSync from {} for {}/seg{}", peer, content_id, segment_index);
+            let store_guard = store.lock().await;
+            let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
+
+            let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
+            let mut pieces = Vec::new();
+
+            for pid in piece_ids {
+                if have_set.contains(&pid) {
+                    continue;
+                }
+                if pieces.len() >= max_pieces as usize {
+                    break;
+                }
+                match store_guard.get_piece(&content_id, segment_index, &pid) {
+                    Ok((data, coefficients)) => {
+                        pieces.push(datacraft_transfer::PiecePayload {
+                            segment_index,
+                            piece_id: pid,
+                            coefficients,
+                            data,
+                        });
+                    }
+                    Err(e) => {
+                        debug!("Failed to read piece {}: {}", hex::encode(&pid[..4]), e);
+                    }
+                }
+            }
+
+            debug!("Responding with {} pieces for {}/seg{}", pieces.len(), content_id, segment_index);
+            DataCraftResponse::PieceBatch { pieces }
+        }
+        DataCraftRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
+            debug!("Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
+            let store_guard = store.lock().await;
+
+            // Check if we have the manifest (must receive ManifestPush first)
+            if store_guard.get_manifest(&content_id).is_err() {
+                warn!("Received piece push for {} but no manifest — rejecting", content_id);
+                return DataCraftResponse::Ack { status: WireStatus::Error };
+            }
+
+            match store_guard.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
+                Ok(()) => {
+                    debug!("Stored pushed piece for {}/seg{}", content_id, segment_index);
+                    // Notify protocol of piece push for tracker update
+                    if let Err(e) = protocol.event_tx.send(DataCraftEvent::PiecePushReceived { content_id }) {
+                        debug!("Failed to send piece push event: {}", e);
+                    }
+                    DataCraftResponse::Ack { status: WireStatus::Ok }
+                }
+                Err(e) => {
+                    warn!("Failed to store pushed piece: {}", e);
+                    DataCraftResponse::Ack { status: WireStatus::Error }
+                }
+            }
+        }
+        DataCraftRequest::ManifestPush { content_id, manifest_json } => {
+            debug!("Handling ManifestPush from {} for {}", peer, content_id);
+            match serde_json::from_slice::<datacraft_core::ContentManifest>(&manifest_json) {
+                Ok(manifest) => {
+                    let store_guard = store.lock().await;
+                    match store_guard.store_manifest(&manifest) {
+                        Ok(()) => {
+                            debug!("Stored manifest for {}", content_id);
+                            if let Err(e) = protocol.event_tx.send(DataCraftEvent::ManifestPushReceived {
+                                content_id,
+                                manifest,
+                            }) {
+                                debug!("Failed to send manifest push event: {}", e);
+                            }
+                            DataCraftResponse::Ack { status: WireStatus::Ok }
+                        }
+                        Err(e) => {
+                            warn!("Failed to store manifest: {}", e);
+                            DataCraftResponse::Ack { status: WireStatus::Error }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to parse manifest JSON: {}", e);
+                    DataCraftResponse::Ack { status: WireStatus::Error }
+                }
+            }
+        }
+    }
+}
+
 /// Handle a command from the IPC handler.
 async fn handle_command(
-    swarm: &mut craftec_network::CraftSwarm,
+    swarm: &mut DataCraftSwarm,
     protocol: &Arc<DataCraftProtocol>,
     command: DataCraftCommand,
     pending_requests: PendingRequests,
+    pending_transfers: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<DataCraftResponse>>,
     event_tx: &EventSender,
     region: &Option<String>,
     signing_key: &Option<ed25519_dalek::SigningKey>,
-    stream_control: &libp2p_stream::Control,
 ) {
     match command {
         DataCraftCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
@@ -1037,11 +1131,11 @@ async fn handle_command(
             
             let result = async {
                 // First announce as provider
-                protocol.announce_provider(swarm.behaviour_mut(), &content_id).await
+                protocol.announce_provider(&mut swarm.behaviour_mut().craft, &content_id).await
                     .map_err(|e| format!("Failed to announce provider: {}", e))?;
                 
                 // Then publish the manifest
-                protocol.publish_manifest(swarm.behaviour_mut(), &manifest, &local_peer_id).await
+                protocol.publish_manifest(&mut swarm.behaviour_mut().craft, &manifest, &local_peer_id).await
                     .map_err(|e| format!("Failed to publish manifest: {}", e))?;
                 
                 let _ = event_tx.send(DaemonEvent::ProviderAnnounced { content_id: content_id.to_hex() });
@@ -1055,7 +1149,7 @@ async fn handle_command(
         DataCraftCommand::ResolveProviders { content_id, reply_tx } => {
             debug!("Handling resolve providers command for {}", content_id);
             
-            match protocol.resolve_providers(swarm.behaviour_mut(), &content_id).await {
+            match protocol.resolve_providers(&mut swarm.behaviour_mut().craft, &content_id).await {
                 Ok(()) => {
                     // Store the reply channel to respond when DHT query completes
                     let mut pending = pending_requests.lock().await;
@@ -1071,7 +1165,7 @@ async fn handle_command(
         DataCraftCommand::GetManifest { content_id, reply_tx } => {
             debug!("Handling get manifest command for {}", content_id);
             
-            match protocol.get_manifest(swarm.behaviour_mut(), &content_id).await {
+            match protocol.get_manifest(&mut swarm.behaviour_mut().craft, &content_id).await {
                 Ok(()) => {
                     // Store the reply channel to respond when DHT query completes
                     let mut pending = pending_requests.lock().await;
@@ -1130,15 +1224,24 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::RequestPiece { peer_id, content_id, segment_index, piece_id, reply_tx } => {
-            debug!("Handling request piece command: {}/{} from {}", content_id, segment_index, peer_id);
-            let protocol = protocol.clone();
-            let mut control = stream_control.clone();
+        DataCraftCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
+            debug!("Handling PieceSync command: {}/{} from {}", content_id, segment_index, peer_id);
+            let request = DataCraftRequest::PieceSync {
+                content_id,
+                segment_index,
+                merkle_root,
+                have_pieces,
+                max_pieces,
+            };
+            let request_id = swarm.behaviour_mut().transfer.send_request(&peer_id, request);
+            // Store a oneshot that converts DataCraftResponse → Result<DataCraftResponse, String>
+            let (tx, rx) = oneshot::channel();
+            pending_transfers.insert(request_id, tx);
             tokio::spawn(async move {
-                let result = protocol
-                    .request_piece_from_peer(&mut control, peer_id, &content_id, segment_index, &piece_id)
-                    .await;
-                let _ = reply_tx.send(result);
+                match rx.await {
+                    Ok(response) => { let _ = reply_tx.send(Ok(response)); }
+                    Err(_) => { let _ = reply_tx.send(Err("channel closed".into())); }
+                }
             });
         }
 
@@ -1146,7 +1249,7 @@ async fn handle_command(
             debug!("Handling put re-key command for {} → {}", content_id, hex::encode(entry.recipient_did));
             let local_peer_id = *swarm.local_peer_id();
             let result = datacraft_routing::ContentRouter::put_re_key(
-                swarm.behaviour_mut(), &content_id, &entry, &local_peer_id,
+                &mut swarm.behaviour_mut().craft, &content_id, &entry, &local_peer_id,
             ).map(|_| ()).map_err(|e| e.to_string());
             let _ = reply_tx.send(result);
         }
@@ -1155,7 +1258,7 @@ async fn handle_command(
             debug!("Handling remove re-key command for {} → {}", content_id, hex::encode(recipient_did));
             let local_peer_id = *swarm.local_peer_id();
             let result = datacraft_routing::ContentRouter::remove_re_key(
-                swarm.behaviour_mut(), &content_id, &recipient_did, &local_peer_id,
+                &mut swarm.behaviour_mut().craft, &content_id, &recipient_did, &local_peer_id,
             ).map(|_| ()).map_err(|e| e.to_string());
             let _ = reply_tx.send(result);
         }
@@ -1164,14 +1267,14 @@ async fn handle_command(
             debug!("Handling put access list command for {}", access_list.content_id);
             let local_peer_id = *swarm.local_peer_id();
             let result = datacraft_routing::ContentRouter::put_access_list(
-                swarm.behaviour_mut(), &access_list, &local_peer_id,
+                &mut swarm.behaviour_mut().craft, &access_list, &local_peer_id,
             ).map(|_| ()).map_err(|e| e.to_string());
             let _ = reply_tx.send(result);
         }
 
         DataCraftCommand::GetAccessList { content_id, reply_tx } => {
             debug!("Handling get access list command for {}", content_id);
-            match protocol.get_access_list_dht(swarm.behaviour_mut(), &content_id).await {
+            match protocol.get_access_list_dht(&mut swarm.behaviour_mut().craft, &content_id).await {
                 Ok(()) => {
                     let mut pending = pending_requests.lock().await;
                     pending.insert(content_id, PendingRequest::GetAccessList { reply_tx });
@@ -1188,7 +1291,7 @@ async fn handle_command(
 
             // Store in DHT
             let dht_result = datacraft_routing::ContentRouter::put_removal_notice(
-                swarm.behaviour_mut(), &content_id, &notice, &local_peer_id,
+                &mut swarm.behaviour_mut().craft, &content_id, &notice, &local_peer_id,
             ).map(|_| ()).map_err(|e| e.to_string());
 
             // Broadcast via gossipsub
@@ -1228,46 +1331,63 @@ async fn handle_command(
 
         DataCraftCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
             debug!("Handling push piece command: {}/{} to {}", content_id, segment_index, peer_id);
-            let protocol = protocol.clone();
-            let mut control = stream_control.clone();
+            let request = DataCraftRequest::PiecePush {
+                content_id,
+                segment_index,
+                piece_id,
+                coefficients,
+                data: piece_data,
+            };
+            let request_id = swarm.behaviour_mut().transfer.send_request(&peer_id, request);
+            let (tx, rx) = oneshot::channel();
+            pending_transfers.insert(request_id, tx);
             tokio::spawn(async move {
-                let result = protocol
-                    .push_piece_to_peer(&mut control, peer_id, &content_id, segment_index, &piece_id, &coefficients, &piece_data)
-                    .await;
-                let _ = reply_tx.send(result);
+                match rx.await {
+                    Ok(DataCraftResponse::Ack { status }) => {
+                        if status == datacraft_core::WireStatus::Ok {
+                            let _ = reply_tx.send(Ok(()));
+                        } else {
+                            let _ = reply_tx.send(Err(format!("PushPiece ack: {:?}", status)));
+                        }
+                    }
+                    Ok(_) => { let _ = reply_tx.send(Err("unexpected response type".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("channel closed".into())); }
+                }
             });
         }
 
         DataCraftCommand::PushManifest { peer_id, content_id, manifest_json, reply_tx } => {
             debug!("Handling push manifest command for {} to {}", content_id, peer_id);
-            let protocol = protocol.clone();
-            let mut control = stream_control.clone();
+            let request = DataCraftRequest::ManifestPush {
+                content_id,
+                manifest_json,
+            };
+            let request_id = swarm.behaviour_mut().transfer.send_request(&peer_id, request);
+            let (tx, rx) = oneshot::channel();
+            pending_transfers.insert(request_id, tx);
             tokio::spawn(async move {
-                let result = protocol
-                    .push_manifest_to_peer(&mut control, peer_id, &content_id, &manifest_json)
-                    .await;
-                let _ = reply_tx.send(result);
+                match rx.await {
+                    Ok(DataCraftResponse::Ack { status }) => {
+                        if status == datacraft_core::WireStatus::Ok {
+                            let _ = reply_tx.send(Ok(()));
+                        } else {
+                            let _ = reply_tx.send(Err(format!("ManifestPush ack: {:?}", status)));
+                        }
+                    }
+                    Ok(_) => { let _ = reply_tx.send(Err("unexpected response type".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("channel closed".into())); }
+                }
             });
         }
 
-        DataCraftCommand::RequestInventory { peer_id, content_id, reply_tx } => {
-            debug!("Handling inventory request for {} from {}", content_id, peer_id);
-            let protocol = protocol.clone();
-            let mut control = stream_control.clone();
-            tokio::spawn(async move {
-                let result = protocol
-                    .request_inventory_from_peer(&mut control, peer_id, &content_id)
-                    .await;
-                let _ = reply_tx.send(result);
-            });
-        }
+        // RequestInventory removed — challenger now uses PieceSync
 
         DataCraftCommand::CheckRemoval { content_id, reply_tx } => {
             debug!("Handling check removal command for {}", content_id);
             // For now, just start a DHT query. Full async response would need pending request tracking.
             // This is a simplified version — the RemovalCache handles most checks locally.
             let _ = datacraft_routing::ContentRouter::get_removal_notice(
-                swarm.behaviour_mut(), &content_id,
+                &mut swarm.behaviour_mut().craft, &content_id,
             );
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
@@ -1289,7 +1409,7 @@ async fn handle_command(
 
 /// Handle mDNS discovery events: add peers to Kademlia and dial them.
 fn handle_mdns_event(
-    swarm: &mut craftec_network::CraftSwarm,
+    swarm: &mut DataCraftSwarm,
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     event_tx: &EventSender,
 ) {
@@ -1304,13 +1424,10 @@ fn handle_mdns_event(
                 address: addr.to_string(),
             });
             swarm.behaviour_mut().craft.add_address(peer_id, addr.clone());
-            // Dial the peer to establish a connection
             if let Err(e) = swarm.dial(addr.clone()) {
                 debug!("Failed to dial mDNS peer {} at {}: {:?}", peer_id, addr, e);
             }
         }
-        // Bootstrap Kademlia after discovering new peers so late-joining nodes
-        // get integrated into the DHT.
         if let Err(e) = swarm.behaviour_mut().craft.bootstrap() {
             debug!("Kademlia bootstrap after mDNS: {:?}", e);
         }
@@ -1649,25 +1766,7 @@ async fn announce_capabilities_periodically(
     }
 }
 
-/// Handle incoming transfer streams from peers.
-async fn handle_incoming_streams(
-    mut incoming_streams: libp2p_stream::IncomingStreams,
-    protocol: Arc<DataCraftProtocol>,
-) {
-    use futures::StreamExt;
-
-    info!("Starting incoming streams handler");
-    
-    while let Some((peer, stream)) = incoming_streams.next().await {
-        debug!("Received incoming stream from peer: {}", peer);
-        
-        // Spawn a task to handle this stream
-        let protocol_clone = protocol.clone();
-        tokio::spawn(async move {
-            protocol_clone.handle_incoming_stream(stream).await;
-        });
-    }
-}
+// Incoming streams handled by request_response in drive_swarm.
 
 /// Handle protocol events (DHT query results, etc.).
 async fn handle_protocol_events(

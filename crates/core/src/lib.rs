@@ -825,7 +825,7 @@ mod tests {
             creator: String::new(),
             signature: vec![],
         };
-        assert_eq!(manifest.k(), 100);
+        assert_eq!(manifest.k(), 40);
     }
 
     #[test]

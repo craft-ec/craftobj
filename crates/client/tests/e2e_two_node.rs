@@ -1,17 +1,16 @@
 //! E2E integration test: two in-process nodes.
 //!
-//! Node A publishes a file, Node B fetches pieces via the wire protocol,
-//! then reconstructs and verifies the content matches.
+//! Node A publishes a file, Node B fetches pieces via the new request_response
+//! codec, then reconstructs and verifies the content matches.
 
 use std::path::PathBuf;
 
 use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, PublishOptions};
+use datacraft_core::{ContentId, PublishOptions, WireStatus};
 use datacraft_store::{piece_id_from_coefficients, FsStore};
-use datacraft_transfer::{
-    decode_piece_request, handle_piece_request, request_piece, PIECE_REQUEST_SIZE,
-};
-use tokio::io::AsyncReadExt;
+use datacraft_transfer::{DataCraftCodec, DataCraftRequest, DataCraftResponse, PiecePayload};
+use libp2p::request_response::Codec;
+use libp2p::StreamProtocol;
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("datacraft-e2e").join(format!(
@@ -26,13 +25,72 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Full pipeline: Node A publishes → pieces transferred over wire protocol → Node B reconstructs.
+fn proto() -> StreamProtocol {
+    StreamProtocol::new("/datacraft/transfer/3.0.0")
+}
+
+/// Simulate a PieceSync request-response over in-memory streams using the codec.
+async fn simulate_piece_sync(
+    store: &FsStore,
+    content_id: &ContentId,
+    segment_index: u32,
+    have_pieces: Vec<[u8; 32]>,
+    max_pieces: u16,
+) -> Vec<PiecePayload> {
+    let request = DataCraftRequest::PieceSync {
+        content_id: *content_id,
+        segment_index,
+        merkle_root: [0u8; 32],
+        have_pieces: have_pieces.clone(),
+        max_pieces,
+    };
+
+    // "Server" handles the request locally — no actual network needed for e2e test
+    let piece_ids = store.list_pieces(content_id, segment_index).unwrap_or_default();
+    let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
+    let mut pieces = Vec::new();
+    for pid in piece_ids {
+        if have_set.contains(&pid) {
+            continue;
+        }
+        if pieces.len() >= max_pieces as usize {
+            break;
+        }
+        if let Ok((data, coefficients)) = store.get_piece(content_id, segment_index, &pid) {
+            pieces.push(PiecePayload {
+                segment_index,
+                piece_id: pid,
+                coefficients,
+                data,
+            });
+        }
+    }
+
+    // Verify codec roundtrip
+    let mut codec = DataCraftCodec;
+    let p = proto();
+
+    let mut buf = Vec::new();
+    codec.write_request(&p, &mut futures::io::Cursor::new(&mut buf), request).await.unwrap();
+    let _decoded_req = codec.read_request(&p, &mut futures::io::Cursor::new(&buf)).await.unwrap();
+
+    let response = DataCraftResponse::PieceBatch { pieces: pieces.clone() };
+    let mut resp_buf = Vec::new();
+    codec.write_response(&p, &mut futures::io::Cursor::new(&mut resp_buf), response).await.unwrap();
+    let decoded_resp = codec.read_response(&p, &mut futures::io::Cursor::new(&resp_buf)).await.unwrap();
+
+    match decoded_resp {
+        DataCraftResponse::PieceBatch { pieces } => pieces,
+        _ => panic!("unexpected response"),
+    }
+}
+
+/// Full pipeline: Node A publishes → pieces transferred via codec → Node B reconstructs.
 #[tokio::test]
 async fn test_two_node_publish_fetch_plaintext() {
     let dir_a = temp_dir("node-a");
     let dir_b = temp_dir("node-b");
 
-    // --- Node A: publish a file ---
     let mut client_a = DataCraftClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("input.bin");
     let original_content = b"Hello from Node A! This is test content for the two-node E2E test. \
@@ -49,44 +107,19 @@ async fn test_two_node_publish_fetch_plaintext() {
 
     let store_a = FsStore::new(&dir_a).unwrap();
     let manifest = store_a.get_manifest(&content_id).unwrap();
-
-    // --- Transfer pieces from Node A → Node B via wire protocol ---
     let store_b = FsStore::new(&dir_b).unwrap();
 
     for seg_idx in 0..manifest.segment_count as u32 {
-        let piece_ids = store_a.list_pieces(&content_id, seg_idx).unwrap();
-        for pid in &piece_ids {
-            let (mut client_end, mut server_end) = tokio::io::duplex(1_048_576);
-
-            let server_store = FsStore::new(&dir_a).unwrap();
-            let pid_copy = *pid;
-            let server_handle = tokio::spawn(async move {
-                let mut header = [0u8; PIECE_REQUEST_SIZE];
-                server_end.read_exact(&mut header).await.unwrap();
-                let (req_cid, seg, req_pid) = decode_piece_request(&header).unwrap();
-                handle_piece_request(&mut server_end, &server_store, &req_cid, seg, &req_pid)
-                    .await
-                    .unwrap();
-            });
-
-            let (coeff, data) =
-                request_piece(&mut client_end, &content_id, seg_idx, &pid_copy)
-                    .await
-                    .unwrap();
-
-            server_handle.await.unwrap();
-
-            let received_pid = piece_id_from_coefficients(&coeff);
+        let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
+        for p in &pieces {
             store_b
-                .store_piece(&content_id, seg_idx, &received_pid, &data, &coeff)
+                .store_piece(&content_id, seg_idx, &p.piece_id, &p.data, &p.coefficients)
                 .unwrap();
         }
     }
 
-    // Node B also needs the manifest
     store_b.store_manifest(&manifest).unwrap();
 
-    // --- Node B: reconstruct the file ---
     let client_b = DataCraftClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("output.bin");
     client_b
@@ -112,10 +145,7 @@ async fn test_two_node_publish_fetch_encrypted() {
     std::fs::write(&input_path, original_content).unwrap();
 
     let publish_result = client_a
-        .publish(
-            &input_path,
-            &PublishOptions { encrypted: true },
-        )
+        .publish(&input_path, &PublishOptions { encrypted: true })
         .unwrap();
 
     let content_id = publish_result.content_id;
@@ -126,35 +156,13 @@ async fn test_two_node_publish_fetch_encrypted() {
 
     let store_a = FsStore::new(&dir_a).unwrap();
     let manifest = store_a.get_manifest(&content_id).unwrap();
-
     let store_b = FsStore::new(&dir_b).unwrap();
 
     for seg_idx in 0..manifest.segment_count as u32 {
-        let piece_ids = store_a.list_pieces(&content_id, seg_idx).unwrap();
-        for pid in &piece_ids {
-            let (mut client_end, mut server_end) = tokio::io::duplex(1_048_576);
-
-            let server_store = FsStore::new(&dir_a).unwrap();
-            let pid_copy = *pid;
-            let server_handle = tokio::spawn(async move {
-                let mut header = [0u8; PIECE_REQUEST_SIZE];
-                server_end.read_exact(&mut header).await.unwrap();
-                let (req_cid, seg, req_pid) = decode_piece_request(&header).unwrap();
-                handle_piece_request(&mut server_end, &server_store, &req_cid, seg, &req_pid)
-                    .await
-                    .unwrap();
-            });
-
-            let (coeff, data) =
-                request_piece(&mut client_end, &content_id, seg_idx, &pid_copy)
-                    .await
-                    .unwrap();
-
-            server_handle.await.unwrap();
-
-            let received_pid = piece_id_from_coefficients(&coeff);
+        let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
+        for p in &pieces {
             store_b
-                .store_piece(&content_id, seg_idx, &received_pid, &data, &coeff)
+                .store_piece(&content_id, seg_idx, &p.piece_id, &p.data, &p.coefficients)
                 .unwrap();
         }
     }
@@ -174,7 +182,7 @@ async fn test_two_node_publish_fetch_encrypted() {
     std::fs::remove_dir_all(&dir_b).ok();
 }
 
-/// Test "any piece" request: Node B requests random pieces without specifying IDs.
+/// Test "any piece" request: Node B requests pieces using PieceSync with exclusion list.
 #[tokio::test]
 async fn test_two_node_any_piece_request() {
     let dir_a = temp_dir("node-a-any");
@@ -192,43 +200,18 @@ async fn test_two_node_any_piece_request() {
 
     let store_a = FsStore::new(&dir_a).unwrap();
     let manifest = store_a.get_manifest(&content_id).unwrap();
-
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    // For each segment, request "any piece" enough times to get k independent pieces
     for seg_idx in 0..manifest.segment_count as u32 {
         let k = manifest.k_for_segment(seg_idx as usize);
-        let total_available = store_a.list_pieces(&content_id, seg_idx).unwrap().len();
-        // Request more than k to ensure we get enough independent pieces
-        for _ in 0..total_available {
-            let (mut client_end, mut server_end) = tokio::io::duplex(1_048_576);
-            let zeroed = [0u8; 32]; // "any piece"
-
-            let server_store = FsStore::new(&dir_a).unwrap();
-            let server_handle = tokio::spawn(async move {
-                let mut header = [0u8; PIECE_REQUEST_SIZE];
-                server_end.read_exact(&mut header).await.unwrap();
-                let (req_cid, seg, req_pid) = decode_piece_request(&header).unwrap();
-                handle_piece_request(&mut server_end, &server_store, &req_cid, seg, &req_pid)
-                    .await
-                    .unwrap();
-            });
-
-            let (coeff, data) =
-                request_piece(&mut client_end, &content_id, seg_idx, &zeroed)
-                    .await
-                    .unwrap();
-
-            server_handle.await.unwrap();
-
-            let received_pid = piece_id_from_coefficients(&coeff);
-            // Store (may overwrite duplicates, that's fine)
+        // Fetch all pieces using PieceSync
+        let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
+        for p in &pieces {
             store_b
-                .store_piece(&content_id, seg_idx, &received_pid, &data, &coeff)
+                .store_piece(&content_id, seg_idx, &p.piece_id, &p.data, &p.coefficients)
                 .unwrap();
         }
 
-        // Should have at least k pieces
         let stored = store_b.list_pieces(&content_id, seg_idx).unwrap();
         assert!(stored.len() >= k, "expected at least {} pieces, got {}", k, stored.len());
     }

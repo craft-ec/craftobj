@@ -101,7 +101,7 @@ fn push_with_mid_transfer_failure() {
     let dir_s2 = temp_dir("midfail-s2");
 
     let mut client = DataCraftClient::new(&dir_pub).unwrap();
-    let content = random_data(500_000);
+    let content = random_data(2_000_000);
     let file_path = dir_pub.join("test.bin");
     std::fs::write(&file_path, &content).unwrap();
 
@@ -364,7 +364,7 @@ fn exact_one_segment_file() {
 
     let manifest = client.store().get_manifest(&result.content_id).unwrap();
     let k = manifest.k_for_segment(0);
-    assert_eq!(k, 100, "full segment should have k=100");
+    assert_eq!(k, 40, "full segment should have k=40 (10MB/256KiB)");
 
     let output = dir.join("output.bin");
     client.reconstruct(&result.content_id, &output, None).unwrap();
@@ -389,8 +389,8 @@ fn multi_segment_with_partial_last() {
     let manifest = client.store().get_manifest(&result.content_id).unwrap();
     let k0 = manifest.k_for_segment(0);
     let k1 = manifest.k_for_segment(1);
-    assert_eq!(k0, 100, "full segment k=100");
-    assert!(k1 < 100 && k1 > 0, "partial segment k={} should be < 100", k1);
+    assert_eq!(k0, 40, "full segment k=40 (10MB/256KiB)");
+    assert!(k1 < 40 && k1 > 0, "partial segment k={} should be < 40", k1);
 
     let output = dir.join("output.bin");
     client.reconstruct(&result.content_id, &output, None).unwrap();
@@ -457,7 +457,7 @@ fn equalization_one_non_provider() {
     let store_s2 = FsStore::new(&dir_s2).unwrap();
     let store_s3 = FsStore::new(&dir_s3).unwrap();
 
-    let (cid, seg_count, _content) = publish_and_distribute(500_000, &[&store_s1, &store_s2]);
+    let (cid, seg_count, _content) = publish_and_distribute(2_000_000, &[&store_s1, &store_s2]);
 
     // s3 is non-provider
     let manifest = store_s1.get_manifest(&cid).unwrap();
@@ -508,7 +508,7 @@ fn equalization_three_non_providers() {
     let store_n3 = FsStore::new(&dir_n3).unwrap();
 
     // All pieces on s1
-    let (cid, seg_count, _) = publish_and_distribute(500_000, &[&store_s1]);
+    let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1]);
 
     let manifest = store_s1.get_manifest(&cid).unwrap();
     store_n1.store_manifest(&manifest).unwrap();
@@ -554,7 +554,7 @@ fn equalization_stops_when_all_are_providers() {
     let store_s1 = FsStore::new(&dir_s1).unwrap();
     let store_s2 = FsStore::new(&dir_s2).unwrap();
 
-    let (cid, seg_count, _) = publish_and_distribute(500_000, &[&store_s1, &store_s2]);
+    let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1, &store_s2]);
 
     // Both already have pieces — both are providers
     let s1_before = total_piece_count(&store_s1, &cid, seg_count);
@@ -595,7 +595,7 @@ fn equalization_multiple_rounds_converge() {
     let store_s2 = FsStore::new(&dir_s2).unwrap();
 
     // All pieces on s1
-    let (cid, seg_count, _) = publish_and_distribute(500_000, &[&store_s1]);
+    let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1]);
     let manifest = store_s1.get_manifest(&cid).unwrap();
     store_s2.store_manifest(&manifest).unwrap();
 
@@ -641,7 +641,7 @@ fn piece_uniqueness_after_equalization() {
     let store_s2 = FsStore::new(&dir_s2).unwrap();
     let store_s3 = FsStore::new(&dir_s3).unwrap();
 
-    let (cid, seg_count, _) = publish_and_distribute(500_000, &[&store_s1, &store_s2]);
+    let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1, &store_s2]);
     let manifest = store_s1.get_manifest(&cid).unwrap();
     store_s3.store_manifest(&manifest).unwrap();
 
@@ -689,7 +689,7 @@ fn fetch_from_distributed_network() {
     let store_s1 = FsStore::new(&dir_s1).unwrap();
     let store_s2 = FsStore::new(&dir_s2).unwrap();
 
-    let (cid, seg_count, content) = publish_and_distribute(500_000, &[&store_s1, &store_s2]);
+    let (cid, seg_count, content) = publish_and_distribute(2_000_000, &[&store_s1, &store_s2]);
 
     // Client fetches k pieces per segment
     let store_client = FsStore::new(&dir_client).unwrap();
@@ -818,8 +818,8 @@ fn fetch_with_redundant_pieces_discards_extras() {
     let dir = temp_dir("fetch-redundant");
     let mut client = DataCraftClient::new(&dir).unwrap();
 
-    // Use 1MB so k=10, parity=2 → 12 pieces total > k
-    let content = random_data(1_000_000);
+    // Use 5MB so k=20 (256KiB pieces), parity 1.2 → 24 pieces total > k
+    let content = random_data(5_000_000);
     let file = dir.join("test.bin");
     std::fs::write(&file, &content).unwrap();
 

@@ -54,7 +54,7 @@ pub enum DataCraftEvent {
 /// `request_response::Behaviour<DataCraftCodec>` in the swarm event loop.
 pub struct DataCraftProtocol {
     /// Event sender to the daemon.
-    event_tx: mpsc::UnboundedSender<DataCraftEvent>,
+    pub(crate) event_tx: mpsc::UnboundedSender<DataCraftEvent>,
     /// Pending DHT queries waiting for completion.
     pending_queries: Arc<Mutex<HashMap<kad::QueryId, PendingQuery>>>,
 }
