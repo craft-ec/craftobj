@@ -506,20 +506,9 @@ async fn equalize_pressure(
             }
         }
 
-        // Delete pushed pieces locally — pieces are UNIQUE, only one copy in the network
-        if !pieces_deleted.is_empty() {
-            let c = client.lock().await;
-            for (seg, pid) in &pieces_deleted {
-                if let Err(e) = c.store().delete_piece(&content_id, *seg, pid) {
-                    warn!("[reannounce.rs] Failed to delete pushed piece {}/{}: {}", content_id, seg, e);
-                }
-            }
-            drop(c);
-
-            // Update local_pieces count in tracker
-            let mut t = tracker.lock().await;
-            t.decrement_local_pieces(&content_id, pieces_deleted.len());
-        }
+        // Storage providers keep their pieces after equalization — they need them for serving.
+        // Only the initial publisher push deletes local copies (publisher is not a storage node).
+        // Equalization COPIES pieces to new nodes, it does NOT move them.
 
         if total_pushed > 0 {
             debug!("Equalization: pushed {} pieces for {} to {} peers", total_pushed, content_id, candidates.len());
