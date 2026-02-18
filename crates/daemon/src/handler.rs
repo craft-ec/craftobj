@@ -1826,12 +1826,50 @@ impl DataCraftHandler {
             }
         }
 
+        // Include local node as a provider if it holds pieces for this CID
+        {
+            let local_total: usize = segments_json.iter()
+                .map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize)
+                .sum();
+            if local_total > 0 {
+                let local_seg_pieces: Vec<usize> = segments_json.iter()
+                    .map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize)
+                    .collect();
+                // Add local pieces to network totals
+                network_total_pieces += local_total;
+                for (i, &c) in local_seg_pieces.iter().enumerate() {
+                    if i < network_seg_pieces.len() {
+                        network_seg_pieces[i] += c;
+                    }
+                }
+                let local_merkle = if let Some(ref tree) = self.merkle_tree {
+                    let t = tree.lock().await;
+                    hex::encode(t.root())
+                } else {
+                    String::new()
+                };
+                let local_pid = self.local_peer_id
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "local".to_string());
+                providers_json.push(serde_json::json!({
+                    "peer_id": local_pid,
+                    "piece_count": local_total,
+                    "segment_pieces": local_seg_pieces,
+                    "merkle_root": local_merkle,
+                    "last_seen": 0,
+                    "region": "local",
+                    "score": 1.0,
+                    "latency_ms": 0.0,
+                    "is_local": true,
+                }));
+            }
+        }
+
         // Enrich segments with actual network-wide piece counts (not estimates)
         for seg in segments_json.iter_mut() {
             let idx = seg["index"].as_u64().unwrap_or(0) as usize;
             let seg_k = seg["k"].as_u64().unwrap_or(k as u64) as usize;
-            let local = seg["local_pieces"].as_u64().unwrap_or(0) as usize;
-            let network = network_seg_pieces.get(idx).copied().unwrap_or(0) + local;
+            let network = network_seg_pieces.get(idx).copied().unwrap_or(0);
             seg.as_object_mut().map(|o| {
                 o.insert("network_pieces".to_string(), serde_json::json!(network));
                 o.insert("network_reconstructable".to_string(), serde_json::json!(network >= seg_k));
@@ -1842,10 +1880,7 @@ impl DataCraftHandler {
         let network_health_ratio = if k > 0 && seg_count > 0 {
             let min_network_ratio = (0..seg_count).map(|i| {
                 let seg_k = manifest.k_for_segment(i);
-                let local = segments_json.get(i)
-                    .and_then(|s| s["local_pieces"].as_u64())
-                    .unwrap_or(0) as usize;
-                let network = network_seg_pieces.get(i).copied().unwrap_or(0) + local;
+                let network = network_seg_pieces.get(i).copied().unwrap_or(0);
                 if seg_k > 0 { network as f64 / seg_k as f64 } else { 1.0 }
             }).fold(f64::MAX, f64::min);
             if min_network_ratio == f64::MAX { 0.0 } else { min_network_ratio }
