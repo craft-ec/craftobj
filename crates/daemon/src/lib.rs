@@ -29,7 +29,6 @@ pub mod protocol;
 pub mod reannounce;
 pub mod push_target;
 pub mod degradation;
-pub mod repair;
 pub mod receipt_store;
 pub mod scaling;
 pub mod removal_cache;

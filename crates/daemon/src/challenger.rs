@@ -360,28 +360,10 @@ impl ChallengerManager {
             ranks.insert(cid, (k, rank_map.clone()));
         }
 
-        // Heal if needed — challenger heals locally AND publishes repair signal
+        // Heal if needed — HealthScan handles network-wide repair via PieceMap,
+        // but challenger still heals locally for its own pieces.
         let healing = if health.needs_healing && health.pieces_needed > 0 {
-            info!("Healing {} — generating {} new pieces (local + broadcasting repair signal)", cid, health.pieces_needed);
-
-            // Publish repair signal for each under-replicated segment
-            for (&seg_idx, &seg_rank) in &rank_map {
-                let k_seg = manifest.k_for_segment(seg_idx as usize);
-                let required = tier_info.as_ref()
-                    .map(|t| (t.min_piece_ratio * k_seg as f64).ceil() as usize)
-                    .unwrap_or(0);
-                if seg_rank < required {
-                    let signal = crate::repair::create_repair_signal(
-                        cid, seg_idx, required - seg_rank, seg_rank, k_seg, &self.local_peer_id,
-                    );
-                    let msg = datacraft_core::RepairMessage::Signal(signal);
-                    if let Ok(data) = bincode::serialize(&msg) {
-                        let _ = self.command_tx.send(
-                            DataCraftCommand::BroadcastRepairMessage { repair_data: data }
-                        );
-                    }
-                }
-            }
+            info!("Healing {} — generating {} new pieces locally", cid, health.pieces_needed);
 
             let result = health::heal_content(store, &manifest, health.pieces_needed);
             // Rebuild Merkle tree after healing added new pieces
@@ -397,36 +379,7 @@ impl ChallengerManager {
             None
         };
 
-        // Check for over-replication → emit degradation signals (skip if network-wide demand signal seen)
-        let has_demand = if let Some(ref dst) = self.demand_signal_tracker {
-            let dst = dst.lock().await;
-            dst.has_recent_signal(&cid)
-        } else {
-            false
-        };
-
-        for (&seg_idx, &seg_rank) in &rank_map {
-            let k_seg = manifest.k_for_segment(seg_idx as usize);
-            let required = tier_info.as_ref()
-                .map(|t| (t.min_piece_ratio * k_seg as f64).ceil() as usize)
-                .unwrap_or(k_seg);
-            if seg_rank > required && !has_demand {
-                let excess = seg_rank - required;
-                info!(
-                    "Over-replication detected for {}/seg{}: rank {} > required {}, excess={} (no active demand)",
-                    cid, seg_idx, seg_rank, required, excess
-                );
-                let signal = crate::degradation::create_degradation_signal(
-                    cid, seg_idx, excess, seg_rank, required, k_seg, &self.local_peer_id,
-                );
-                let msg = datacraft_core::DegradationMessage::Signal(signal);
-                if let Ok(data) = bincode::serialize(&msg) {
-                    let _ = self.command_tx.send(
-                        DataCraftCommand::BroadcastDegradationMessage { degradation_data: data }
-                    );
-                }
-            }
-        }
+        // Over-replication is now handled by HealthScan via PieceMap — no degradation signals needed.
 
         // Sign and persist receipts
         let mut signed_receipts: Vec<StorageReceipt> = Vec::new();

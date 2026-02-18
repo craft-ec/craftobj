@@ -89,10 +89,6 @@ pub enum DataCraftCommand {
     BroadcastStorageReceipt {
         receipt_data: Vec<u8>,
     },
-    /// Broadcast a repair message (signal or announcement) via gossipsub.
-    BroadcastRepairMessage {
-        repair_data: Vec<u8>,
-    },
     /// Broadcast a demand signal via gossipsub (scaling).
     BroadcastDemandSignal {
         signal_data: Vec<u8>,

@@ -246,12 +246,6 @@ pub async fn run_daemon_with_config(
     }
     if let Err(e) = swarm
         .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::REPAIR_TOPIC)
-    {
-        error!("Failed to subscribe to repair topic: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::DEGRADATION_TOPIC)
     {
         error!("Failed to subscribe to degradation topic: {:?}", e);
@@ -506,12 +500,6 @@ pub async fn run_daemon_with_config(
         });
     }
 
-    // Repair coordinator for network-wide self-healing
-    let repair_command_tx = command_tx.clone();
-    let mut repair_coord = crate::repair::RepairCoordinator::new(local_peer_id, repair_command_tx);
-    repair_coord.set_peer_scorer(peer_scorer.clone());
-    let repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>> = Arc::new(Mutex::new(repair_coord));
-
     // Degradation coordinator for over-replication reduction
     let degradation_command_tx = command_tx.clone();
     let degradation_coord = crate::degradation::DegradationCoordinator::new(local_peer_id, degradation_command_tx);
@@ -560,7 +548,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone(), piece_map.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone(), piece_map.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
@@ -919,7 +907,6 @@ async fn drive_swarm(
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
     client: Arc<Mutex<datacraft_client::DataCraftClient>>,
     max_storage_bytes: u64,
-    repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>>,
     store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
     scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
@@ -1100,7 +1087,6 @@ async fn drive_swarm(
                                 }
                                 handle_gossipsub_removal(craft_event, &removal_cache, &event_tx).await;
                                 handle_gossipsub_storage_receipt(craft_event, &event_tx, &receipt_store).await;
-                                handle_gossipsub_repair(craft_event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
                                 handle_gossipsub_degradation(craft_event, &degradation_coordinator, &store_for_repair, &event_tx, &merkle_tree, &piece_map, &command_tx).await;
                                 handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker, &demand_signal_tracker).await;
                                 handle_gossipsub_piece_event(craft_event, &piece_map).await;
@@ -1662,14 +1648,6 @@ async fn handle_command(
             }
         }
 
-        DataCraftCommand::BroadcastRepairMessage { repair_data } => {
-            debug!("Broadcasting repair message via gossipsub ({} bytes)", repair_data.len());
-            if let Err(e) = swarm.behaviour_mut().craft
-                .publish_to_topic(datacraft_core::REPAIR_TOPIC, repair_data) {
-                warn!("[service.rs] Failed to broadcast repair message via gossipsub: {:?}", e);
-            }
-        }
-
         DataCraftCommand::BroadcastDegradationMessage { degradation_data } => {
             debug!("Broadcasting degradation message via gossipsub ({} bytes)", degradation_data.len());
             if let Err(e) = swarm.behaviour_mut().craft
@@ -1982,71 +1960,6 @@ async fn handle_gossipsub_storage_receipt(
                 }
                 Err(e) => {
                     debug!("Failed to parse StorageReceipt from gossipsub: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Handle gossipsub repair messages (signals and announcements).
-async fn handle_gossipsub_repair(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    repair_coordinator: &Arc<Mutex<crate::repair::RepairCoordinator>>,
-    store: &Arc<Mutex<datacraft_store::FsStore>>,
-    _event_tx: &EventSender,
-    content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
-) {
-    use libp2p::gossipsub;
-
-    use craftec_network::behaviour::CraftBehaviourEvent;
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::REPAIR_TOPIC {
-            match bincode::deserialize::<datacraft_core::RepairMessage>(&message.data) {
-                Ok(datacraft_core::RepairMessage::Signal(signal)) => {
-                    debug!(
-                        "Received repair signal for {}/seg{}: {} pieces needed",
-                        signal.content_id, signal.segment_index, signal.pieces_needed
-                    );
-                    info!("[service.rs] gossipsub_repair: acquiring store lock...");
-                    let store_guard = store.lock().await;
-                    info!("[service.rs] gossipsub_repair: store lock acquired");
-                    let mut coord = repair_coordinator.lock().await;
-                    if let Some(delay) = coord.handle_repair_signal(&signal, &store_guard) {
-                        // Schedule delayed repair
-                        let rc = repair_coordinator.clone();
-                        let st = store.clone();
-                        let ct = content_tracker.clone();
-                        let cid = signal.content_id;
-                        let seg = signal.segment_index;
-                        drop(store_guard);
-                        drop(coord);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            let store_guard = st.lock().await;
-                            let manifest = match store_guard.get_manifest(&cid) {
-                                Ok(m) => m,
-                                Err(_) => return,
-                            };
-                            let providers = ct.lock().await.get_providers(&cid);
-                            let mut coord = rc.lock().await;
-                            coord.execute_repair(&store_guard, &manifest, cid, seg, &providers);
-                        });
-                    }
-                }
-                Ok(datacraft_core::RepairMessage::Announcement(announcement)) => {
-                    debug!(
-                        "Received repair announcement for {}/seg{} from repairer",
-                        announcement.content_id, announcement.segment_index
-                    );
-                    let mut coord = repair_coordinator.lock().await;
-                    coord.handle_repair_announcement(&announcement);
-                }
-                Err(e) => {
-                    debug!("Failed to parse repair message from gossipsub: {}", e);
                 }
             }
         }
