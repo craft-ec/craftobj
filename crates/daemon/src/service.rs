@@ -1034,7 +1034,7 @@ async fn drive_swarm(
                                 // Handle mDNS discovery
                                 handle_mdns_event(swarm, craft_event, &event_tx);
                                 // Try to extract gossipsub capability announcements
-                                let new_storage_peer = handle_gossipsub_capability(craft_event, &peer_scorer, &event_tx).await;
+                                let new_storage_peer = handle_gossipsub_capability(craft_event, &peer_scorer, &event_tx, &piece_map).await;
                                 {
                                     let mut scorer = peer_scorer.lock().await;
                                     scorer.evict_stale(std::time::Duration::from_secs(900));
@@ -1190,6 +1190,12 @@ async fn drive_swarm(
                         if now.duration_since(*last) > timeout {
                             warn!("[service.rs] Peer {} heartbeat timeout (no activity for >30s)", peer_id);
                             peer_scorer.lock().await.record_timeout(&peer_id);
+                            // Mark node offline in PieceMap
+                            {
+                                let node_bytes = peer_id.to_bytes();
+                                let mut map = piece_map.lock().await;
+                                map.set_node_online(&node_bytes, false);
+                            }
                             let _ = event_tx.send(DaemonEvent::PeerHeartbeatTimeout {
                                 peer_id: peer_id.to_string(),
                             });
@@ -1774,6 +1780,7 @@ async fn handle_gossipsub_capability(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     peer_scorer: &SharedPeerScorer,
     event_tx: &EventSender,
+    piece_map: &Arc<tokio::sync::Mutex<crate::piece_map::PieceMap>>,
 ) -> bool {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -1818,6 +1825,14 @@ async fn handle_gossipsub_capability(
                                 ann.storage_root,
                             );
                         }
+                        // Update PieceMap node online status from capability announcement
+                        {
+                            let node_bytes = peer_id.to_bytes();
+                            let mut map = piece_map.lock().await;
+                            map.set_node_online(&node_bytes, true);
+                            map.update_last_seen(&node_bytes);
+                        }
+
                         return is_new && has_storage;
                     }
                 }
