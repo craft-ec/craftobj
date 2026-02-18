@@ -780,8 +780,8 @@ pub struct HealthSnapshot {
     pub provider_count: usize,
     /// Minimum health ratio across all segments (pieces/k).
     pub health_ratio: f64,
-    /// Action taken by HealthScan during this cycle, if any.
-    pub action: Option<HealthAction>,
+    /// Actions taken by HealthScan during this cycle (per segment).
+    pub actions: Vec<HealthAction>,
 }
 
 /// Per-segment health snapshot.
@@ -797,11 +797,11 @@ pub struct SegmentSnapshot {
     pub provider_count: usize,
 }
 
-/// Action taken by HealthScan during a scan cycle.
+/// Action taken by HealthScan on a specific segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HealthAction {
     /// A segment was repaired (new piece generated).
-    Repaired { segment: u32 },
+    Repaired { segment: u32, offset: usize },
     /// A segment was degraded (excess piece dropped).
     Degraded { segment: u32 },
 }
@@ -1185,13 +1185,14 @@ mod tests {
             ],
             provider_count: 2,
             health_ratio: 0.667,
-            action: Some(HealthAction::Repaired { segment: 1 }),
+            actions: vec![HealthAction::Repaired { segment: 1, offset: 0 }],
         };
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: HealthSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.timestamp, 1234567890);
         assert_eq!(parsed.segments.len(), 2);
-        assert!(matches!(parsed.action, Some(HealthAction::Repaired { segment: 1 })));
+        assert_eq!(parsed.actions.len(), 1);
+        assert!(matches!(parsed.actions[0], HealthAction::Repaired { segment: 1, .. }));
     }
 
     #[test]

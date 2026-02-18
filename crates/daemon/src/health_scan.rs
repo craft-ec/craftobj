@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datacraft_core::{ContentId, HealthAction, HealthSnapshot, SegmentSnapshot};
+use std::io::{BufRead, Write};
 use datacraft_store::FsStore;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, Mutex};
@@ -116,8 +117,63 @@ impl HealthScan {
 
         debug!("HealthScan: scanning {} owned segments", owned_segments.len());
 
-        for (cid, segment) in owned_segments {
-            self.scan_segment(cid, segment).await;
+        // Group segments by CID for snapshot generation
+        let mut cid_segments: std::collections::HashMap<ContentId, Vec<u32>> = std::collections::HashMap::new();
+        for (cid, seg) in &owned_segments {
+            cid_segments.entry(*cid).or_default().push(*seg);
+        }
+
+        // Collect actions per CID during scan
+        let mut actions_by_cid: std::collections::HashMap<ContentId, Vec<HealthAction>> = std::collections::HashMap::new();
+
+        for (cid, segment) in &owned_segments {
+            let action = self.scan_segment(*cid, *segment).await;
+            if let Some(a) = action {
+                actions_by_cid.entry(*cid).or_default().push(a);
+            }
+        }
+
+        // Persist snapshots
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        for (cid, segments) in &cid_segments {
+            let map = self.piece_map.lock().await;
+            let mut seg_snapshots = Vec::new();
+            let mut min_ratio = f64::MAX;
+
+            for &seg in segments {
+                let rank = map.compute_rank(cid, seg, true);
+                let total_pieces = map.segment_pieces(cid, seg);
+                // Estimate k from segment pieces and rank (k is the reconstruction threshold)
+                // In practice k comes from the manifest, but PieceMap doesn't store it.
+                // Use rank as a lower bound; for snapshots this is informational.
+                let k = 40_usize; // default k for 10MiB segments with 256KiB pieces
+                let providers = map.pieces_for_segment(cid, seg).iter()
+                    .map(|(node, _, _)| node.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                let ratio = if k > 0 { rank as f64 / k as f64 } else { 0.0 };
+                if ratio < min_ratio { min_ratio = ratio; }
+                seg_snapshots.push(SegmentSnapshot { index: seg, rank, k, provider_count: providers });
+            }
+
+            let provider_count = map.provider_count(cid, true);
+            drop(map);
+
+            let snapshot = HealthSnapshot {
+                timestamp: now,
+                content_id: *cid,
+                segment_count: segments.len(),
+                segments: seg_snapshots,
+                provider_count,
+                health_ratio: if min_ratio == f64::MAX { 0.0 } else { min_ratio },
+                actions: actions_by_cid.remove(cid).unwrap_or_default(),
+            };
+
+            self.persist_snapshot(&snapshot);
         }
     }
 
@@ -126,7 +182,7 @@ impl HealthScan {
     /// Uses deterministic provider ranking for repair assignment:
     /// all nodes compute the same ranking of providers by piece count,
     /// top N providers each create 1 orthogonal piece (N = deficit).
-    async fn scan_segment(&self, cid: ContentId, segment: u32) {
+    async fn scan_segment(&self, cid: ContentId, segment: u32) -> Option<HealthAction> {
         let (rank, local_count, local_node, provider_counts, non_providers) = {
             let map = self.piece_map.lock().await;
             let rank = map.compute_rank(&cid, segment, true);
@@ -184,13 +240,14 @@ impl HealthScan {
                     cid, segment, rank, target_rank, pos, deficit
                 );
                 self.attempt_repair(cid, segment, &local_node, pos).await;
+                return Some(HealthAction::Repaired { segment, offset: pos });
             } else {
                 debug!(
                     "HealthScan: {}/seg{} under-replicated but local node not a provider",
                     cid, segment
                 );
             }
-            return;
+            return None;
         }
 
         // Check for over-replication → degradation
@@ -205,8 +262,11 @@ impl HealthScan {
                     cid, segment, rank, self.tier_target, local_count
                 );
                 self.attempt_degradation(cid, segment, &local_node).await;
+                return Some(HealthAction::Degraded { segment });
             }
         }
+
+        None
     }
 
     /// Attempt to repair a segment by creating a new orthogonal RLNC piece.
@@ -294,6 +354,62 @@ impl HealthScan {
                 let _ = self.command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
             }
         }
+    }
+
+    /// Persist a health snapshot to JSONL file.
+    fn persist_snapshot(&self, snapshot: &HealthSnapshot) {
+        let Some(ref data_dir) = self.data_dir else { return };
+        let dir = data_dir.join("health_history");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("Failed to create health_history dir: {}", e);
+            return;
+        }
+        let path = dir.join(format!("{}.jsonl", snapshot.content_id));
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => { warn!("Failed to open snapshot file: {}", e); return; }
+        };
+        if let Ok(json) = serde_json::to_string(snapshot) {
+            let _ = writeln!(file, "{}", json);
+        }
+
+        // Prune old entries (>24h)
+        self.prune_snapshots(&path, snapshot.timestamp);
+    }
+
+    /// Remove snapshot entries older than SNAPSHOT_MAX_AGE_MS.
+    fn prune_snapshots(&self, path: &std::path::Path, now: u64) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let cutoff = now.saturating_sub(SNAPSHOT_MAX_AGE_MS);
+        let kept: Vec<&str> = content.lines().filter(|line| {
+            serde_json::from_str::<HealthSnapshot>(line)
+                .map(|s| s.timestamp >= cutoff)
+                .unwrap_or(false)
+        }).collect();
+
+        if kept.len() < content.lines().count() {
+            let _ = std::fs::write(path, kept.join("\n") + "\n");
+        }
+    }
+
+    /// Load health snapshots for a CID, optionally filtered by `since` (unix millis).
+    pub fn load_snapshots(&self, cid: &ContentId, since: Option<u64>) -> Vec<HealthSnapshot> {
+        let Some(ref data_dir) = self.data_dir else { return vec![] };
+        let path = data_dir.join("health_history").join(format!("{}.jsonl", cid));
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return vec![],
+        };
+        let reader = std::io::BufReader::new(file);
+        let cutoff = since.unwrap_or(0);
+        reader.lines()
+            .filter_map(|line| line.ok())
+            .filter_map(|line| serde_json::from_str::<HealthSnapshot>(&line).ok())
+            .filter(|s| s.timestamp >= cutoff)
+            .collect()
     }
 }
 

@@ -2047,6 +2047,38 @@ impl DataCraftHandler {
     }
 
     /// `content.list_detailed` — Enhanced list with health info per CID.
+    /// `content.health_history` — Load health timeline snapshots for a CID.
+    async fn handle_content_health_history(&self, params: Option<Value>) -> Result<Value, String> {
+        let cid = extract_cid(params.clone())?;
+        let since = params
+            .and_then(|p| p.get("since").and_then(|v| v.as_u64()));
+
+        let data_dir = self.data_dir.as_ref()
+            .ok_or_else(|| "No data directory configured".to_string())?;
+
+        let path = data_dir.join("health_history").join(format!("{}.jsonl", cid));
+        let file = std::fs::File::open(&path)
+            .map_err(|_| "No health history available for this content".to_string())?;
+
+        let reader = std::io::BufReader::new(file);
+        let cutoff = since.unwrap_or_else(|| {
+            // Default: last 1 hour
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64 - 3_600_000
+        });
+
+        let snapshots: Vec<datacraft_core::HealthSnapshot> = std::io::BufRead::lines(reader)
+            .filter_map(|line| line.ok())
+            .filter_map(|line| serde_json::from_str(&line).ok())
+            .filter(|s: &datacraft_core::HealthSnapshot| s.timestamp >= cutoff)
+            .collect();
+
+        serde_json::to_value(&serde_json::json!({ "snapshots": snapshots }))
+            .map_err(|e| e.to_string())
+    }
+
     async fn handle_content_list_detailed(&self) -> Result<Value, String> {
         let client = self.client.lock().await;
         let items = client.list().map_err(|e| e.to_string())?;
@@ -2401,6 +2433,7 @@ impl IpcHandler for DataCraftHandler {
                 "get-config" => self.handle_get_config().await,
                 "set-config" => self.handle_set_config(params).await,
                 "content.health" => self.handle_content_health(params).await,
+                "content.health_history" => self.handle_content_health_history(params).await,
                 "content.list_detailed" => self.handle_content_list_detailed().await,
                 "content.segments" => self.handle_content_segments(params).await,
                 "network.health" => self.handle_network_health().await,
