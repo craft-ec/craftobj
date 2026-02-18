@@ -26,6 +26,7 @@ pub mod peer_scorer;
 pub mod protocol;
 pub mod reannounce;
 pub mod push_target;
+pub mod degradation;
 pub mod repair;
 pub mod receipt_store;
 pub mod scaling;

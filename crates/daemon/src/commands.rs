@@ -90,6 +90,10 @@ pub enum DataCraftCommand {
     BroadcastDemandSignal {
         signal_data: Vec<u8>,
     },
+    /// Broadcast a degradation message (signal or announcement) via gossipsub.
+    BroadcastDegradationMessage {
+        degradation_data: Vec<u8>,
+    },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
     /// Push a manifest to a remote storage peer via persistent stream.

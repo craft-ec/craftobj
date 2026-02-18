@@ -390,6 +390,30 @@ impl ChallengerManager {
             None
         };
 
+        // Check for over-replication → emit degradation signals
+        for (&seg_idx, &seg_rank) in &rank_map {
+            let k_seg = manifest.k_for_segment(seg_idx as usize);
+            let required = tier_info.as_ref()
+                .map(|t| (t.min_piece_ratio * k_seg as f64).ceil() as usize)
+                .unwrap_or(k_seg);
+            if seg_rank > required {
+                let excess = seg_rank - required;
+                info!(
+                    "Over-replication detected for {}/seg{}: rank {} > required {}, excess={}",
+                    cid, seg_idx, seg_rank, required, excess
+                );
+                let signal = crate::degradation::create_degradation_signal(
+                    cid, seg_idx, excess, seg_rank, required, k_seg, &self.local_peer_id,
+                );
+                let msg = datacraft_core::DegradationMessage::Signal(signal);
+                if let Ok(data) = bincode::serialize(&msg) {
+                    let _ = self.command_tx.send(
+                        DataCraftCommand::BroadcastDegradationMessage { degradation_data: data }
+                    );
+                }
+            }
+        }
+
         // Sign and persist receipts
         let mut signed_receipts: Vec<StorageReceipt> = Vec::new();
         for mut receipt in round_result.receipts() {
