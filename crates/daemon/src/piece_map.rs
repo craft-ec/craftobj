@@ -262,8 +262,13 @@ impl PieceMap {
         &self.local_node
     }
 
-    fn is_node_online(&self, node: &[u8]) -> bool {
+    /// Check if a node is marked as online.
+    pub fn is_node_online_pub(&self, node: &[u8]) -> bool {
         self.node_online.get(node).copied().unwrap_or(false)
+    }
+
+    fn is_node_online(&self, node: &[u8]) -> bool {
+        self.is_node_online_pub(node)
     }
 }
 
