@@ -361,6 +361,145 @@ pub const CAPABILITIES_TOPIC: &str = "datacraft/capabilities/1.0.0";
 /// Gossipsub topic for content removal notices (fast propagation).
 pub const REMOVAL_TOPIC: &str = "datacraft/removal/1.0.0";
 
+/// Gossipsub topic for piece events (event-sourced tracking).
+pub const PIECE_EVENTS_TOPIC: &str = "datacraft/pieces/1.0.0";
+
+/// Event-sourced piece tracking event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PieceEvent {
+    Stored(PieceStored),
+    Dropped(PieceDropped),
+}
+
+/// A node stored a coded piece.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PieceStored {
+    /// PeerId bytes of the node that stored the piece.
+    pub node: Vec<u8>,
+    /// Content ID.
+    pub cid: ContentId,
+    /// Segment index.
+    pub segment: u32,
+    /// Piece identity: SHA-256 of coefficient vector.
+    pub piece_id: [u8; 32],
+    /// Coefficient vector (k bytes over GF(2^8)).
+    pub coefficients: Vec<u8>,
+    /// Per-node monotonic sequence number.
+    pub seq: u64,
+    /// Unix timestamp (seconds).
+    pub timestamp: u64,
+    /// Ed25519 signature over the event data.
+    pub signature: Vec<u8>,
+}
+
+/// A node dropped a coded piece.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PieceDropped {
+    /// PeerId bytes of the node that dropped the piece.
+    pub node: Vec<u8>,
+    /// Content ID.
+    pub cid: ContentId,
+    /// Segment index.
+    pub segment: u32,
+    /// Piece identity: SHA-256 of coefficient vector.
+    pub piece_id: [u8; 32],
+    /// Per-node monotonic sequence number.
+    pub seq: u64,
+    /// Unix timestamp (seconds).
+    pub timestamp: u64,
+    /// Ed25519 signature over the event data.
+    pub signature: Vec<u8>,
+}
+
+impl PieceEvent {
+    /// Get the node bytes from the event.
+    pub fn node(&self) -> &[u8] {
+        match self {
+            PieceEvent::Stored(s) => &s.node,
+            PieceEvent::Dropped(d) => &d.node,
+        }
+    }
+
+    /// Get the sequence number from the event.
+    pub fn seq(&self) -> u64 {
+        match self {
+            PieceEvent::Stored(s) => s.seq,
+            PieceEvent::Dropped(d) => d.seq,
+        }
+    }
+
+    /// Data to sign/verify (everything except the signature field).
+    pub fn signable_data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        match self {
+            PieceEvent::Stored(s) => {
+                data.push(0u8); // tag
+                data.extend_from_slice(&s.node);
+                data.extend_from_slice(&s.cid.0);
+                data.extend_from_slice(&s.segment.to_le_bytes());
+                data.extend_from_slice(&s.piece_id);
+                data.extend_from_slice(&s.coefficients);
+                data.extend_from_slice(&s.seq.to_le_bytes());
+                data.extend_from_slice(&s.timestamp.to_le_bytes());
+            }
+            PieceEvent::Dropped(d) => {
+                data.push(1u8); // tag
+                data.extend_from_slice(&d.node);
+                data.extend_from_slice(&d.cid.0);
+                data.extend_from_slice(&d.segment.to_le_bytes());
+                data.extend_from_slice(&d.piece_id);
+                data.extend_from_slice(&d.seq.to_le_bytes());
+                data.extend_from_slice(&d.timestamp.to_le_bytes());
+            }
+        }
+        data
+    }
+
+    /// Get the signature from the event.
+    pub fn signature(&self) -> &[u8] {
+        match self {
+            PieceEvent::Stored(s) => &s.signature,
+            PieceEvent::Dropped(d) => &d.signature,
+        }
+    }
+
+    /// Verify the ed25519 signature on this event.
+    /// The signer's public key is derived from the node's PeerId bytes.
+    /// Returns true if signature is valid.
+    pub fn verify_signature(&self, pubkey: &ed25519_dalek::VerifyingKey) -> bool {
+        if self.signature().len() != 64 {
+            return false;
+        }
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(self.signature());
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let data = self.signable_data();
+        pubkey.verify_strict(&data, &sig).is_ok()
+    }
+}
+
+impl PieceStored {
+    /// Sign this event with the given signing key. Sets the signature field.
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let event = PieceEvent::Stored(self.clone());
+        let data = event.signable_data();
+        let sig = key.sign(&data);
+        self.signature = sig.to_bytes().to_vec();
+    }
+}
+
+impl PieceDropped {
+    /// Sign this event with the given signing key. Sets the signature field.
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let event = PieceEvent::Dropped(self.clone());
+        let data = event.signable_data();
+        let sig = key.sign(&data);
+        self.signature = sig.to_bytes().to_vec();
+    }
+}
+
 /// Gossipsub topic for StorageReceipt broadcast (aggregator collection).
 pub const STORAGE_RECEIPT_TOPIC: &str = "datacraft/storage-receipts/1.0.0";
 
