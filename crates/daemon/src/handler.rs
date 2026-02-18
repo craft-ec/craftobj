@@ -899,6 +899,15 @@ impl CraftObjHandler {
         Ok(Value::Object(result))
     }
 
+    async fn handle_connected_peers(&self) -> Result<Value, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let tx = self.command_tx.as_ref().ok_or("no command channel")?;
+        tx.send(crate::commands::CraftObjCommand::ConnectedPeers { reply_tx })
+            .map_err(|_| "command channel closed".to_string())?;
+        let peers = reply_rx.await.map_err(|_| "reply channel closed".to_string())?;
+        Ok(serde_json::json!({ "peers": peers }))
+    }
+
     async fn handle_network_storage(&self) -> Result<Value, String> {
         let scorer = match &self.peer_scorer {
             Some(ps) => ps.lock().await,
@@ -2426,6 +2435,7 @@ impl IpcHandler for CraftObjHandler {
                 "list" => self.handle_list().await,
                 "status" => self.handle_status().await,
                 "peers" => self.handle_peers().await,
+                "connected_peers" => self.handle_connected_peers().await,
                 "node.capabilities" => self.handle_node_capabilities().await,
                 "network.storage" => self.handle_network_storage().await,
                 "extend" => self.handle_extend(params).await,

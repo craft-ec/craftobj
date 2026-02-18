@@ -128,6 +128,10 @@ pub enum CraftObjCommand {
         since_root: [u8; 32],
         reply_tx: oneshot::Sender<Option<MerkleDiffResult>>,
     },
+    /// Return list of currently connected peer IDs (swarm-level).
+    ConnectedPeers {
+        reply_tx: oneshot::Sender<Vec<String>>,
+    },
     /// Send PDP challenge to a peer for proof of data possession.
     PdpChallenge {
         peer_id: PeerId,

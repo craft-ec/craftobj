@@ -210,13 +210,21 @@ impl TestNode {
         self.rpc("list", None).await
     }
     
-    /// Get list of connected peers
+    /// Get list of connected peers (from peer_scorer / gossipsub)
     async fn peers(&self) -> Result<Vec<Value>, String> {
         let response = self.rpc("peers", None).await?;
         let peers = response["peers"].as_array()
             .ok_or("No peers array in response")?
             .clone();
         Ok(peers)
+    }
+
+    /// Get list of connected peers at swarm level (raw libp2p connections)
+    async fn connected_peers(&self) -> Result<Vec<String>, String> {
+        let response = self.rpc("connected_peers", None).await?;
+        let peers = response["peers"].as_array()
+            .ok_or("No peers array in connected_peers response")?;
+        Ok(peers.iter().filter_map(|v| v.as_str().map(String::from)).collect())
     }
     
     /// Get the listen addresses of this node
@@ -264,14 +272,11 @@ async fn wait_for_connection(node_a: &TestNode, node_b: &TestNode, timeout_secs:
     info!("Waiting for connection between node {} and node {}", node_a.index, node_b.index);
     
     while start.elapsed() < timeout_duration {
-        if let (Ok(peers_a), Ok(peers_b)) = (node_a.peers().await, node_b.peers().await) {
-            let a_connected = peers_a.iter().any(|p| {
-                p["peer_id"].as_str().map_or(false, |id| id == node_b.peer_id.to_string())
-            });
-            
-            let b_connected = peers_b.iter().any(|p| {
-                p["peer_id"].as_str().map_or(false, |id| id == node_a.peer_id.to_string())
-            });
+        if let (Ok(peers_a), Ok(peers_b)) = (node_a.connected_peers().await, node_b.connected_peers().await) {
+            let b_id = node_b.peer_id.to_string();
+            let a_id = node_a.peer_id.to_string();
+            let a_connected = peers_a.iter().any(|id| id == &b_id);
+            let b_connected = peers_b.iter().any(|id| id == &a_id);
             
             if a_connected && b_connected {
                 info!("Connection established between node {} and node {}", node_a.index, node_b.index);
@@ -398,8 +403,8 @@ async fn test_two_nodes_connect() -> Result<(), String> {
         wait_for_connection(&node_a, &node_b, 30).await?;
         
         // Verify both nodes see each other
-        let peers_a = node_a.peers().await?;
-        let peers_b = node_b.peers().await?;
+        let peers_a = node_a.connected_peers().await?;
+        let peers_b = node_b.connected_peers().await?;
         
         if peers_a.is_empty() {
             return Err("Node A should have peers".to_string());

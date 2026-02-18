@@ -965,6 +965,10 @@ async fn drive_swarm(
                                 });
                             }
                         }
+                        CraftObjCommand::ConnectedPeers { reply_tx } => {
+                            let peers: Vec<String> = swarm.connected_peers().map(|p| p.to_string()).collect();
+                            let _ = reply_tx.send(peers);
+                        }
                         CraftObjCommand::TriggerDistribution => {
                             info!("[service.rs] Received TriggerDistribution command — running initial push");
                             let ct = content_tracker.clone();
@@ -1706,13 +1710,15 @@ async fn handle_command(
         }
 
         CraftObjCommand::SyncPieceMap { .. } => {
-            // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("SyncPieceMap should be intercepted in drive_swarm");
         }
 
         CraftObjCommand::TriggerDistribution => {
-            // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("TriggerDistribution should be intercepted in drive_swarm");
+        }
+
+        CraftObjCommand::ConnectedPeers { .. } => {
+            unreachable!("ConnectedPeers should be intercepted in drive_swarm");
         }
 
         CraftObjCommand::MerkleRoot { peer_id, content_id, segment_index, reply_tx } => {
