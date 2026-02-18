@@ -17,6 +17,7 @@ use datacraft_core::{
 };
 use craftec_network::CraftBehaviour;
 use libp2p::{kad, PeerId};
+use sha2::{Sha256, Digest};
 use tracing::debug;
 
 /// TTL for content provider records (10 minutes).
@@ -54,6 +55,20 @@ pub fn rekey_dht_key(content_id: &ContentId, recipient_did: &[u8; 32]) -> Vec<u8
 /// Build DHT key for a removal notice.
 pub fn removal_dht_key(content_id: &ContentId) -> Vec<u8> {
     format!("{}{}", REMOVAL_DHT_PREFIX, content_id.to_hex()).into_bytes()
+}
+
+/// Build a deterministic DHT provider key for a specific CID + segment.
+///
+/// This is used for per-segment provider records so that fetchers can discover
+/// which nodes hold pieces for a given segment.
+///
+/// Key = SHA-256("datacraft/provider/" || content_id_bytes || segment_index_be)
+pub fn provider_key(content_id: &ContentId, segment_index: u32) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"datacraft/provider/");
+    hasher.update(&content_id.0);
+    hasher.update(segment_index.to_be_bytes());
+    hasher.finalize().to_vec()
 }
 
 /// Content router — wraps CraftBehaviour's generic DHT methods
