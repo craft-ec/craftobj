@@ -147,7 +147,7 @@ impl HealthScan {
         let tracked_segments = {
             let map = self.piece_map.lock().await;
             let mut segments = Vec::new();
-            for (tracked_cid, segment) in map.tracked_segments.iter() {
+            for (tracked_cid, segment) in map.tracked_segments().iter() {
                 if *tracked_cid == cid {
                     segments.push(*segment);
                 }
@@ -237,7 +237,7 @@ impl HealthScan {
         let tracked_segments = {
             let map = self.piece_map.lock().await;
             let mut segments = Vec::new();
-            for (cid, segment) in map.tracked_segments.iter() {
+            for (cid, segment) in map.tracked_segments().iter() {
                 if *cid == content_id {
                     segments.push(*segment);
                 }
@@ -1122,16 +1122,26 @@ mod tests {
         let key1 = MerkleCacheKey {
             peer_id: peer,
             content_id: cid,
+            segment_index: 0,
         };
         let key2 = MerkleCacheKey {
             peer_id: peer,
             content_id: cid,
+            segment_index: 0,
+        };
+        let key3 = MerkleCacheKey {
+            peer_id: peer,
+            content_id: cid,
+            segment_index: 1,
         };
         assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
 
         let mut cache: HashMap<MerkleCacheKey, [u8; 32]> = HashMap::new();
         cache.insert(key1, [0xFF; 32]);
+        cache.insert(key3.clone(), [0xAA; 32]);
         assert_eq!(cache.get(&key2), Some(&[0xFF; 32]));
+        assert_eq!(cache.get(&key3), Some(&[0xAA; 32]));
     }
 
     #[tokio::test]
@@ -1259,6 +1269,7 @@ mod tests {
         let cache_key = MerkleCacheKey {
             peer_id: peer,
             content_id: cid,
+            segment_index: 0,
         };
         
         // Initially empty cache
