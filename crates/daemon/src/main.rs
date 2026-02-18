@@ -79,7 +79,7 @@ fn parse_args() -> (String, std::path::PathBuf, String, String, u16, Option<std:
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (listen, data_dir, socket_path, log_level, ws_port, config_path) = parse_args();
 
     // Initialize logging

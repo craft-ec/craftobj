@@ -98,7 +98,7 @@ pub async fn run_daemon(
     socket_path: String,
     network_config: NetworkConfig,
     ws_port: u16,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None, None).await
 }
 
@@ -111,7 +111,7 @@ pub async fn run_daemon_with_config(
     ws_port: u16,
     config_path: Option<std::path::PathBuf>,
     node_signing_key: Option<ed25519_dalek::SigningKey>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load daemon config (writes defaults if no config file exists yet)
     let daemon_config = match config_path {
         Some(ref path) => {
