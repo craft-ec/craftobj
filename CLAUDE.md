@@ -92,7 +92,7 @@ The existing codebase is built on Reed-Solomon erasure coding. The design has mo
 - **`tests/e2e.rs`, `tests/e2e_two_node.rs`**: Reference RS concepts. Update tests.
 
 ### craftobj/crates/daemon/ (many files)
-- **`src/commands.rs`**: `CraftOBJCommand` variants use `ChunkManifest`, `shard_index`. Update.
+- **`src/commands.rs`**: `CraftObjCommand` variants use `ChunkManifest`, `shard_index`. Update.
 - **`src/service.rs`**: References `ChunkManifest`, `shard_index` in command handling. Update.
 - **`src/protocol.rs`**: Uses `ChunkManifest`, `shard_index`, `TransferReceipt`. Update wire protocol.
 - **`src/handler.rs`**: Publish handler uses `data_shards`/`parity_shards`. Update to RLNC.
