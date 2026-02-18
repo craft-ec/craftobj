@@ -25,6 +25,8 @@ pub mod health;
 pub mod pdp;
 pub mod peer_reconnect;
 pub mod peer_scorer;
+pub mod pex;
+pub mod pex_wire;
 pub mod protocol;
 pub mod reannounce;
 pub mod push_target;

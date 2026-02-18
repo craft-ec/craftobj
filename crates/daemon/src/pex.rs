@@ -93,7 +93,7 @@ impl PexManager {
     /// that we should attempt to connect to.
     pub fn receive_pex(
         &mut self, 
-        from: &PeerId, 
+        _from: &PeerId, 
         peers: Vec<(PeerId, Vec<Multiaddr>)>
     ) -> Vec<(PeerId, Vec<Multiaddr>)> {
         let mut new_peers = Vec::new();
