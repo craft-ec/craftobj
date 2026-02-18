@@ -59,6 +59,8 @@ pub struct ChallengerManager {
     pdp_ranks: Option<Arc<Mutex<PdpRankData>>>,
     /// Storage Merkle tree for updating after healing.
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    /// Demand tracker for checking if content has active demand (skip degradation if so).
+    demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
 }
 
 /// Shared PDP rank data: maps CID → (k, segment_index → rank).
@@ -82,7 +84,12 @@ impl ChallengerManager {
             peer_scorer: None,
             pdp_ranks: None,
             merkle_tree: None,
+            demand_tracker: None,
         }
+    }
+
+    pub fn set_demand_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandTracker>>) {
+        self.demand_tracker = Some(tracker);
     }
 
     pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
@@ -390,16 +397,23 @@ impl ChallengerManager {
             None
         };
 
-        // Check for over-replication → emit degradation signals
+        // Check for over-replication → emit degradation signals (skip if content has active demand)
+        let has_demand = if let Some(ref dt) = self.demand_tracker {
+            let mut dt = dt.lock().await;
+            dt.has_active_demand(&cid)
+        } else {
+            false
+        };
+
         for (&seg_idx, &seg_rank) in &rank_map {
             let k_seg = manifest.k_for_segment(seg_idx as usize);
             let required = tier_info.as_ref()
                 .map(|t| (t.min_piece_ratio * k_seg as f64).ceil() as usize)
                 .unwrap_or(k_seg);
-            if seg_rank > required {
+            if seg_rank > required && !has_demand {
                 let excess = seg_rank - required;
                 info!(
-                    "Over-replication detected for {}/seg{}: rank {} > required {}, excess={}",
+                    "Over-replication detected for {}/seg{}: rank {} > required {}, excess={} (no active demand)",
                     cid, seg_idx, seg_rank, required, excess
                 );
                 let signal = crate::degradation::create_degradation_signal(

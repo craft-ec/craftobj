@@ -408,6 +408,7 @@ pub async fn run_daemon_with_config(
     let pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>> = Arc::new(Mutex::new(HashMap::new()));
     challenger_mgr.set_pdp_ranks(pdp_ranks.clone());
     challenger_mgr.set_merkle_tree(merkle_tree.clone());
+    challenger_mgr.set_demand_tracker(demand_tracker.clone());
 
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
@@ -777,7 +778,7 @@ async fn drive_swarm(
     repair_coordinator: Arc<Mutex<crate::repair::RepairCoordinator>>,
     store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
     scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
-    _demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
+    demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
@@ -1013,12 +1014,13 @@ async fn drive_swarm(
                 let store_clone = store_for_repair.clone();
                 let ct_clone = content_tracker.clone();
                 let proto_clone = protocol.clone();
+                let dt_clone = demand_tracker.clone();
                 let peer = msg.peer;
                 let seq_id = msg.seq_id;
                 let mut stream = msg.stream;
                 tokio::spawn(async move {
                     let response = handle_incoming_transfer_request(
-                        &peer, msg.request, &store_clone, &ct_clone, &proto_clone,
+                        &peer, msg.request, &store_clone, &ct_clone, &proto_clone, &dt_clone,
                     ).await;
                     info!("[service.rs] Spawned handler done for {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
                     // Write response back on the SAME stream the request came from
@@ -1073,6 +1075,7 @@ async fn handle_incoming_transfer_request(
     store: &Arc<Mutex<datacraft_store::FsStore>>,
     _content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
     protocol: &Arc<DataCraftProtocol>,
+    demand_tracker: &Arc<Mutex<crate::scaling::DemandTracker>>,
 ) -> DataCraftResponse {
     match request {
         DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
@@ -1109,6 +1112,11 @@ async fn handle_incoming_transfer_request(
             }
 
             info!("[service.rs] Responding with {} pieces for {}/seg{}", pieces.len(), content_id, segment_index);
+            // Record demand for scaling decisions
+            if !pieces.is_empty() {
+                let mut dt = demand_tracker.lock().await;
+                dt.record_fetch(content_id);
+            }
             DataCraftResponse::PieceBatch { pieces }
         }
         DataCraftRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {

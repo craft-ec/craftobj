@@ -53,6 +53,18 @@ impl DemandTracker {
         self.fetches.entry(content_id).or_default().push(Instant::now());
     }
 
+    /// Check if a CID has any recent fetches (within the demand window).
+    /// Used by degradation to skip over-replication reduction for active content.
+    pub fn has_active_demand(&mut self, content_id: &ContentId) -> bool {
+        let cutoff = Instant::now() - Duration::from_secs(DEMAND_WINDOW_SECS);
+        if let Some(timestamps) = self.fetches.get_mut(content_id) {
+            timestamps.retain(|t| *t > cutoff);
+            !timestamps.is_empty()
+        } else {
+            false
+        }
+    }
+
     /// Return CIDs with demand above threshold in the current window.
     pub fn check_demand(&mut self) -> Vec<(ContentId, u32)> {
         let cutoff = Instant::now() - Duration::from_secs(DEMAND_WINDOW_SECS);
