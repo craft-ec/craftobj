@@ -458,6 +458,8 @@ pub async fn run_daemon_with_config(
     };
 
     handler.set_piece_map(piece_map.clone());
+    // Wire PieceMap into challenger for coefficient vector reads (replaces inventory requests)
+    challenger_mgr.lock().await.set_piece_map(piece_map.clone());
     let handler = Arc::new(handler);
 
     // Load or generate API key for WebSocket authentication

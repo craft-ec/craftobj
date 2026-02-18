@@ -61,6 +61,8 @@ pub struct ChallengerManager {
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
     /// Demand signal tracker for checking if content has network-wide demand (skip degradation if so).
     demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
+    /// PieceMap for reading coefficient vectors (replaces inventory requests).
+    piece_map: Option<Arc<Mutex<crate::piece_map::PieceMap>>>,
 }
 
 /// Shared PDP rank data: maps CID → (k, segment_index → rank).
@@ -85,11 +87,16 @@ impl ChallengerManager {
             pdp_ranks: None,
             merkle_tree: None,
             demand_signal_tracker: None,
+            piece_map: None,
         }
     }
 
     pub fn set_demand_signal_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>) {
         self.demand_signal_tracker = Some(tracker);
+    }
+
+    pub fn set_piece_map(&mut self, pm: Arc<Mutex<crate::piece_map::PieceMap>>) {
+        self.piece_map = Some(pm);
     }
 
     pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
@@ -224,32 +231,27 @@ impl ChallengerManager {
             other_providers.truncate(MAX_PROVIDERS_PER_CID);
         }
 
-        // Step 1: Query full inventory from all providers to get ALL coefficient vectors
-        // for accurate network rank computation.
+        // Step 1: Read coefficient vectors from PieceMap (replaces inventory requests).
+        // PieceMap contains all known coefficient vectors from gossipsub events.
         let mut all_inventory_vectors: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
-        for &peer in &other_providers {
-            match self.request_inventory(peer, cid).await {
-                Ok(inventory) => {
-                    for seg_inv in &inventory.segments {
-                        let vectors = all_inventory_vectors.entry(seg_inv.segment_index).or_default();
-                        for cv in &seg_inv.coefficient_vectors {
-                            vectors.push(cv.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("Inventory request to {} failed: {} — will use PDP vectors only", peer, e);
+        if let Some(ref pm) = self.piece_map {
+            let map = pm.lock().await;
+            for &seg_idx in &segments_to_check {
+                let pieces = map.pieces_for_segment(&cid, seg_idx);
+                let vectors = all_inventory_vectors.entry(seg_idx).or_default();
+                for (_node, _pid, coeff) in pieces {
+                    vectors.push(coeff.clone());
                 }
             }
-        }
-
-        // Also include our own local pieces in the inventory
-        for &seg_idx in &segments_to_check {
-            if let Ok(piece_ids) = store.list_pieces(&cid, seg_idx) {
-                let vectors = all_inventory_vectors.entry(seg_idx).or_default();
-                for pid in &piece_ids {
-                    if let Ok((_data, coeff)) = store.get_piece(&cid, seg_idx, pid) {
-                        vectors.push(coeff);
+        } else {
+            // Fallback: read local pieces from store
+            for &seg_idx in &segments_to_check {
+                if let Ok(piece_ids) = store.list_pieces(&cid, seg_idx) {
+                    let vectors = all_inventory_vectors.entry(seg_idx).or_default();
+                    for pid in &piece_ids {
+                        if let Ok((_data, coeff)) = store.get_piece(&cid, seg_idx, pid) {
+                            vectors.push(coeff);
+                        }
                     }
                 }
             }
@@ -456,47 +458,6 @@ impl ChallengerManager {
             .send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
             .map_err(|e| format!("Failed to send resolve command: {}", e))?;
         rx.await.map_err(|e| format!("Channel closed: {}", e))?
-    }
-
-    /// Request inventory from a peer by sending a PieceSync with empty have_pieces.
-    /// Returns an InventoryResponse built from the PieceBatch.
-    async fn request_inventory(
-        &self,
-        peer: PeerId,
-        cid: ContentId,
-    ) -> Result<datacraft_core::InventoryResponse, String> {
-        // We don't know which segments to query, so query segment 0 with a large max.
-        // For full inventory, the caller iterates segments.
-        // This is a simplification — full inventory requires per-segment queries.
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(DataCraftCommand::PieceSync {
-                peer_id: peer,
-                content_id: cid,
-                segment_index: 0,
-                merkle_root: [0u8; 32],
-                have_pieces: vec![],
-                max_pieces: 1000,
-                reply_tx: tx,
-            })
-            .map_err(|e| format!("Failed to send PieceSync: {}", e))?;
-        let response = rx.await.map_err(|e| format!("Channel closed: {}", e))??;
-        match response {
-            datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => {
-                let mut segments: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
-                for p in &pieces {
-                    segments.entry(p.segment_index).or_default().push(p.coefficients.clone());
-                }
-                let inv_segments = segments.into_iter().map(|(seg_idx, coeff_vecs)| {
-                    datacraft_core::SegmentInventory {
-                        segment_index: seg_idx,
-                        coefficient_vectors: coeff_vecs,
-                    }
-                }).collect();
-                Ok(datacraft_core::InventoryResponse { content_id: cid, segments: inv_segments })
-            }
-            _ => Err("unexpected response type".into()),
-        }
     }
 
     /// Request a piece from a peer via PieceSync (requesting 1 piece, excluding none).

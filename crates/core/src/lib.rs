@@ -603,10 +603,6 @@ pub enum WireMessageType {
     PiecePush = 5,
     /// Push a manifest to a storage peer (sent before piece pushes).
     ManifestPush = 6,
-    /// Request inventory (segments + coefficient vectors) for a CID.
-    InventoryRequest = 7,
-    /// Response with inventory data.
-    InventoryResponse = 8,
 }
 
 impl WireMessageType {
@@ -618,8 +614,6 @@ impl WireMessageType {
             3 => Some(Self::ManifestResponse),
             5 => Some(Self::PiecePush),
             6 => Some(Self::ManifestPush),
-            7 => Some(Self::InventoryRequest),
-            8 => Some(Self::InventoryResponse),
             _ => None,
         }
     }
@@ -643,21 +637,6 @@ impl WireStatus {
             _ => None,
         }
     }
-}
-
-/// Inventory entry for a single segment: list of coefficient vectors (piece identities).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SegmentInventory {
-    pub segment_index: u32,
-    /// Coefficient vectors for each piece held in this segment.
-    pub coefficient_vectors: Vec<Vec<u8>>,
-}
-
-/// Response to an inventory request: all segments and their coefficient vectors for a CID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InventoryResponse {
-    pub content_id: ContentId,
-    pub segments: Vec<SegmentInventory>,
 }
 
 #[derive(Error, Debug)]
