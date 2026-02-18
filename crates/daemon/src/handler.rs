@@ -33,6 +33,150 @@ use crate::peer_scorer::PeerScorer;
 /// Shared peer scorer type alias.
 type SharedPeerScorer = Arc<Mutex<PeerScorer>>;
 
+/// Network health summary for a single CID.
+struct CidNetworkHealth {
+    /// Per-segment network piece counts (local + remote).
+    seg_pieces: Vec<usize>,
+    /// Total pieces across all segments (local + remote).
+    total_pieces: usize,
+    /// Network health ratio (min across segments of pieces/k).
+    health_ratio: f64,
+    /// Number of providers (remote peers with pieces + local if applicable).
+    provider_count: usize,
+    /// Provider details as JSON values.
+    providers: Vec<Value>,
+}
+
+impl DataCraftHandler {
+    /// Compute network health for a CID by aggregating local + remote pieces.
+    /// `local_seg_pieces` should contain per-segment local piece counts.
+    /// `manifest` provides segment count and per-segment k values.
+    async fn compute_network_health(
+        &self,
+        cid_hex: &str,
+        local_seg_pieces: &[usize],
+        manifest: &datacraft_core::ContentManifest,
+        include_provider_details: bool,
+    ) -> CidNetworkHealth {
+        let seg_count = manifest.segment_count;
+        let mut network_seg_pieces = vec![0usize; seg_count];
+        let mut providers: Vec<Value> = Vec::new();
+        let mut network_total: usize = 0;
+        let mut provider_count: usize = 0;
+
+        // Add local pieces
+        let local_total: usize = local_seg_pieces.iter().sum();
+        network_total += local_total;
+        for (i, &c) in local_seg_pieces.iter().enumerate() {
+            if i < seg_count { network_seg_pieces[i] += c; }
+        }
+
+        // Add remote pieces from peer_scorer
+        if let Some(ref scorer) = self.peer_scorer {
+            let ps = scorer.lock().await;
+            for (peer, peer_score) in ps.iter() {
+                if let Some(seg_counts) = peer_score.piece_counts.get(cid_hex) {
+                    let total: usize = seg_counts.iter().sum();
+                    if total > 0 {
+                        network_total += total;
+                        provider_count += 1;
+                        for (i, &c) in seg_counts.iter().enumerate() {
+                            if i < seg_count { network_seg_pieces[i] += c; }
+                        }
+                        if include_provider_details {
+                            providers.push(serde_json::json!({
+                                "peer_id": peer.to_string(),
+                                "piece_count": total,
+                                "segment_pieces": seg_counts,
+                                "merkle_root": hex::encode(peer_score.storage_root),
+                                "last_seen": peer_score.last_announcement.elapsed().as_secs(),
+                                "region": peer_score.region.as_deref().unwrap_or("unknown"),
+                                "score": peer_score.score(),
+                                "latency_ms": peer_score.avg_latency_ms,
+                            }));
+                        }
+                    }
+                }
+            }
+            // Add tracked providers without piece_counts (if detailed)
+            if include_provider_details {
+                if let Some(ref tracker) = self.content_tracker {
+                    if let Ok(cid) = datacraft_core::ContentId::from_hex(cid_hex) {
+                        let t = tracker.lock().await;
+                        let tracked = t.get_providers(&cid);
+                        for peer in tracked {
+                            if !providers.iter().any(|p| p["peer_id"].as_str() == Some(&peer.to_string())) {
+                                let region = ps.get_region(&peer).unwrap_or("unknown").to_string();
+                                let score = ps.score_readonly(&peer);
+                                let latency = ps.get(&peer).map(|s| s.avg_latency_ms).unwrap_or(0.0);
+                                let merkle_root = ps.get(&peer).map(|s| hex::encode(s.storage_root)).unwrap_or_default();
+                                provider_count += 1;
+                                providers.push(serde_json::json!({
+                                    "peer_id": peer.to_string(),
+                                    "piece_count": 0,
+                                    "segment_pieces": [],
+                                    "merkle_root": merkle_root,
+                                    "last_seen": ps.get(&peer).map(|s| s.last_announcement.elapsed().as_secs()).unwrap_or(0),
+                                    "region": region,
+                                    "score": score,
+                                    "latency_ms": latency,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add local node as provider
+        if local_total > 0 {
+            provider_count += 1;
+            if include_provider_details {
+                let local_merkle = if let Some(ref tree) = self.merkle_tree {
+                    let t = tree.lock().await;
+                    hex::encode(t.root())
+                } else {
+                    String::new()
+                };
+                let local_pid = self.local_peer_id
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "local".to_string());
+                providers.push(serde_json::json!({
+                    "peer_id": local_pid,
+                    "piece_count": local_total,
+                    "segment_pieces": local_seg_pieces,
+                    "merkle_root": local_merkle,
+                    "last_seen": 0,
+                    "region": "local",
+                    "score": 1.0,
+                    "latency_ms": 0.0,
+                    "is_local": true,
+                }));
+            }
+        }
+
+        // Compute health ratio
+        let health_ratio = if seg_count > 0 {
+            let min_ratio = (0..seg_count).map(|i| {
+                let seg_k = manifest.k_for_segment(i);
+                let pieces = network_seg_pieces.get(i).copied().unwrap_or(0);
+                if seg_k > 0 { pieces as f64 / seg_k as f64 } else { 1.0 }
+            }).fold(f64::MAX, f64::min);
+            if min_ratio == f64::MAX { 0.0 } else { min_ratio }
+        } else {
+            0.0
+        };
+
+        CidNetworkHealth {
+            seg_pieces: network_seg_pieces,
+            total_pieces: network_total,
+            health_ratio,
+            provider_count,
+            providers,
+        }
+    }
+}
+
 /// DataCraft IPC handler wrapping a DataCraftClient and protocol.
 pub struct DataCraftHandler {
     client: Arc<Mutex<DataCraftClient>>,
@@ -1718,33 +1862,22 @@ impl DataCraftHandler {
         let manifest = store.get_manifest(&cid).map_err(|e| e.to_string())?;
         let pinned = client.is_pinned(&cid);
 
+        // Collect local per-segment piece counts
+        let seg_count = manifest.segment_count;
+        let mut local_seg_pieces = vec![0usize; seg_count];
         let segments_list = store.list_segments(&cid).unwrap_or_default();
-        let mut segments_json = Vec::new();
-        let mut min_rank: Option<usize> = None;
-        let mut min_ratio: Option<f64> = None;
-
         for &seg in &segments_list {
             let pieces = store.list_pieces(&cid, seg).unwrap_or_default();
-            let rank = pieces.len();
-            min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
-            let seg_k = manifest.k_for_segment(seg as usize);
-            if seg_k > 0 {
-                let ratio = rank as f64 / seg_k as f64;
-                min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+            if (seg as usize) < seg_count {
+                local_seg_pieces[seg as usize] = pieces.len();
             }
-            segments_json.push(serde_json::json!({
-                "index": seg,
-                "local_pieces": rank,
-                "rank": rank,
-                "k": seg_k,
-            }));
         }
-        let min_rank_val = min_rank.unwrap_or(0);
+        let min_rank = local_seg_pieces.iter().copied().min().unwrap_or(0);
         let disk_usage = store.cid_disk_usage(&cid);
         drop(client);
 
         // Get tracker state
-        let (name, k, stage, role, provider_count) = if let Some(ref tracker) = self.content_tracker {
+        let (name, k, stage, role) = if let Some(ref tracker) = self.content_tracker {
             let t = tracker.lock().await;
             if let Some(state) = t.get(&cid) {
                 (
@@ -1755,152 +1888,46 @@ impl DataCraftHandler {
                         crate::content_tracker::ContentRole::Publisher => "publisher",
                         crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
                     }.to_string(),
-                    state.provider_count,
                 )
             } else {
-                (String::new(), 0, String::new(), String::new(), 0)
+                (String::new(), 0, String::new(), String::new())
             }
         } else {
-            (String::new(), 0, String::new(), String::new(), 0)
+            (String::new(), 0, String::new(), String::new())
         };
 
-        let local_health_ratio = min_ratio.unwrap_or(0.0);
-
-        // Build provider list with peer scorer info (network-wide)
         let cid_hex = cid.to_hex();
-        let mut providers_json = Vec::new();
-        let mut network_total_pieces: usize = 0;
-        // Per-segment network piece counts (aggregated from all peers)
-        let seg_count = manifest.segment_count;
-        let mut network_seg_pieces: Vec<usize> = vec![0; seg_count];
+        let health = self.compute_network_health(&cid_hex, &local_seg_pieces, &manifest, true).await;
 
-        // Aggregate from peer_scorer.piece_counts for network-wide view
-        if let Some(ref scorer) = self.peer_scorer {
-            let mut ps = scorer.lock().await;
-            for (peer, peer_score) in ps.iter() {
-                if let Some(seg_counts) = peer_score.piece_counts.get(&cid_hex) {
-                    let total: usize = seg_counts.iter().sum();
-                    if total > 0 {
-                        network_total_pieces += total;
-                        // Accumulate per-segment
-                        for (i, &c) in seg_counts.iter().enumerate() {
-                            if i < network_seg_pieces.len() {
-                                network_seg_pieces[i] += c;
-                            }
-                        }
-                        providers_json.push(serde_json::json!({
-                            "peer_id": peer.to_string(),
-                            "piece_count": total,
-                            "segment_pieces": seg_counts,
-                            "merkle_root": hex::encode(peer_score.storage_root),
-                            "last_seen": peer_score.last_announcement.elapsed().as_secs(),
-                            "region": peer_score.region.as_deref().unwrap_or("unknown"),
-                            "score": peer_score.score(),
-                            "latency_ms": peer_score.avg_latency_ms,
-                        }));
-                    }
-                }
-            }
-            // Also add known providers from content_tracker that may not have piece_counts
-            if let Some(ref tracker) = self.content_tracker {
-                let t = tracker.lock().await;
-                let tracked_providers = t.get_providers(&cid);
-                for peer in tracked_providers {
-                    if !providers_json.iter().any(|p| p["peer_id"].as_str() == Some(&peer.to_string())) {
-                        let region = ps.get_region(&peer).unwrap_or("unknown").to_string();
-                        let score = ps.score_readonly(&peer);
-                        let latency = ps.get(&peer).map(|s| s.avg_latency_ms).unwrap_or(0.0);
-                        let merkle_root = ps.get(&peer).map(|s| hex::encode(s.storage_root)).unwrap_or_default();
-                        providers_json.push(serde_json::json!({
-                            "peer_id": peer.to_string(),
-                            "piece_count": 0,
-                            "segment_pieces": [],
-                            "merkle_root": merkle_root,
-                            "last_seen": ps.get(&peer).map(|s| s.last_announcement.elapsed().as_secs()).unwrap_or(0),
-                            "region": region,
-                            "score": score,
-                            "latency_ms": latency,
-                        }));
-                    }
-                }
-            }
+        // Build per-segment JSON with network data
+        let mut segments_json: Vec<Value> = Vec::new();
+        for seg_idx in 0..seg_count {
+            let seg_k = manifest.k_for_segment(seg_idx);
+            let local = local_seg_pieces.get(seg_idx).copied().unwrap_or(0);
+            let network = health.seg_pieces.get(seg_idx).copied().unwrap_or(0);
+            segments_json.push(serde_json::json!({
+                "index": seg_idx,
+                "local_pieces": local,
+                "rank": local,
+                "k": seg_k,
+                "network_pieces": network,
+                "network_reconstructable": network >= seg_k,
+            }));
         }
-
-        // Include local node as a provider if it holds pieces for this CID
-        {
-            let local_total: usize = segments_json.iter()
-                .map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize)
-                .sum();
-            if local_total > 0 {
-                let local_seg_pieces: Vec<usize> = segments_json.iter()
-                    .map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize)
-                    .collect();
-                // Add local pieces to network totals
-                network_total_pieces += local_total;
-                for (i, &c) in local_seg_pieces.iter().enumerate() {
-                    if i < network_seg_pieces.len() {
-                        network_seg_pieces[i] += c;
-                    }
-                }
-                let local_merkle = if let Some(ref tree) = self.merkle_tree {
-                    let t = tree.lock().await;
-                    hex::encode(t.root())
-                } else {
-                    String::new()
-                };
-                let local_pid = self.local_peer_id
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "local".to_string());
-                providers_json.push(serde_json::json!({
-                    "peer_id": local_pid,
-                    "piece_count": local_total,
-                    "segment_pieces": local_seg_pieces,
-                    "merkle_root": local_merkle,
-                    "last_seen": 0,
-                    "region": "local",
-                    "score": 1.0,
-                    "latency_ms": 0.0,
-                    "is_local": true,
-                }));
-            }
-        }
-
-        // Enrich segments with actual network-wide piece counts (not estimates)
-        for seg in segments_json.iter_mut() {
-            let idx = seg["index"].as_u64().unwrap_or(0) as usize;
-            let seg_k = seg["k"].as_u64().unwrap_or(k as u64) as usize;
-            let network = network_seg_pieces.get(idx).copied().unwrap_or(0);
-            seg.as_object_mut().map(|o| {
-                o.insert("network_pieces".to_string(), serde_json::json!(network));
-                o.insert("network_reconstructable".to_string(), serde_json::json!(network >= seg_k));
-            });
-        }
-
-        // Network health ratio based on actual per-segment data
-        let network_health_ratio = if k > 0 && seg_count > 0 {
-            let min_network_ratio = (0..seg_count).map(|i| {
-                let seg_k = manifest.k_for_segment(i);
-                let network = network_seg_pieces.get(i).copied().unwrap_or(0);
-                if seg_k > 0 { network as f64 / seg_k as f64 } else { 1.0 }
-            }).fold(f64::MAX, f64::min);
-            if min_network_ratio == f64::MAX { 0.0 } else { min_network_ratio }
-        } else {
-            local_health_ratio
-        };
 
         Ok(serde_json::json!({
-            "content_id": cid.to_hex(),
+            "content_id": cid_hex,
             "name": name,
             "original_size": manifest.total_size,
-            "segment_count": manifest.segment_count,
+            "segment_count": seg_count,
             "k": k,
             "segments": segments_json,
-            "min_rank": min_rank_val,
-            "health_ratio": network_health_ratio,
-            "local_health_ratio": local_health_ratio,
-            "network_total_pieces": network_total_pieces,
-            "provider_count": providers_json.len(),
-            "providers": providers_json,
+            "min_rank": min_rank,
+            "health_ratio": health.health_ratio,
+            "local_health_ratio": if k > 0 { min_rank as f64 / k as f64 } else { 0.0 },
+            "network_total_pieces": health.total_pieces,
+            "provider_count": health.provider_count,
+            "providers": health.providers,
             "pinned": pinned,
             "role": role,
             "stage": stage,
@@ -1931,24 +1958,6 @@ impl DataCraftHandler {
         }
         drop(client);
 
-        // Aggregate network piece counts from peer_scorer (remote peers)
-        let network_pieces_map: std::collections::HashMap<String, Vec<usize>> = if let Some(ref scorer) = self.peer_scorer {
-            let ps = scorer.lock().await;
-            let mut map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
-            for (_, peer_score) in ps.iter() {
-                for (cid_hex, seg_counts) in &peer_score.piece_counts {
-                    let entry = map.entry(cid_hex.clone()).or_default();
-                    for (i, &c) in seg_counts.iter().enumerate() {
-                        if i >= entry.len() { entry.resize(i + 1, 0); }
-                        entry[i] += c;
-                    }
-                }
-            }
-            map
-        } else {
-            std::collections::HashMap::new()
-        };
-
         // Tracker data
         let tracker_data: Option<Vec<_>> = if let Some(ref tracker) = self.content_tracker {
             let t = tracker.lock().await;
@@ -1961,45 +1970,19 @@ impl DataCraftHandler {
         for (i, item) in items.iter().enumerate() {
             let (_, ref local_seg_pieces, ref manifest, disk_usage) = cid_data[i];
             let cid_hex = item.content_id.to_hex();
-            let seg_count = manifest.as_ref().map(|m| m.segment_count).unwrap_or(0);
 
-            // Compute network health (local + remote pieces)
-            let remote_seg = network_pieces_map.get(&cid_hex);
-            let mut network_total: usize = 0;
-            let mut min_health: Option<f64> = None;
-            let local_total: usize = local_seg_pieces.iter().sum();
-            network_total += local_total;
-            if let Some(rs) = remote_seg {
-                network_total += rs.iter().sum::<usize>();
-            }
-
-            for seg_idx in 0..seg_count {
-                let seg_k = manifest.as_ref().map(|m| m.k_for_segment(seg_idx)).unwrap_or(0);
-                if seg_k == 0 { continue; }
-                let local = local_seg_pieces.get(seg_idx).copied().unwrap_or(0);
-                let remote = remote_seg.and_then(|r| r.get(seg_idx).copied()).unwrap_or(0);
-                let total = local + remote;
-                let ratio = total as f64 / seg_k as f64;
-                min_health = Some(min_health.map_or(ratio, |r: f64| r.min(ratio)));
-            }
-
-            let health_ratio = min_health.unwrap_or(0.0);
-
-            // Provider count: remote peers with pieces + self if local_total > 0
-            let mut provider_count = 0usize;
-            if let Some(ref scorer) = self.peer_scorer {
-                let ps = scorer.lock().await;
-                for (_, peer_score) in ps.iter() {
-                    if let Some(seg_counts) = peer_score.piece_counts.get(&cid_hex) {
-                        if seg_counts.iter().sum::<usize>() > 0 {
-                            provider_count += 1;
-                        }
-                    }
+            // Use shared helper (no provider details needed for list view)
+            let health = if let Some(ref m) = manifest {
+                self.compute_network_health(&cid_hex, local_seg_pieces, m, false).await
+            } else {
+                CidNetworkHealth {
+                    seg_pieces: vec![],
+                    total_pieces: 0,
+                    health_ratio: 0.0,
+                    provider_count: 0,
+                    providers: vec![],
                 }
-            }
-            if local_total > 0 {
-                provider_count += 1;
-            }
+            };
 
             let mut obj = serde_json::json!({
                 "content_id": cid_hex,
@@ -2007,9 +1990,9 @@ impl DataCraftHandler {
                 "segment_count": item.segment_count,
                 "pinned": item.pinned,
                 "min_rank": local_seg_pieces.iter().copied().min().unwrap_or(0),
-                "health_ratio": health_ratio,
-                "provider_count": provider_count,
-                "network_total_pieces": network_total,
+                "health_ratio": health.health_ratio,
+                "provider_count": health.provider_count,
+                "network_total_pieces": health.total_pieces,
                 "local_disk_usage": disk_usage,
             });
 
@@ -2023,7 +2006,7 @@ impl DataCraftHandler {
                         crate::content_tracker::ContentRole::Publisher => "publisher",
                         crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
                     });
-                    obj["hot"] = serde_json::json!(provider_count > state.segment_count * 2);
+                    obj["hot"] = serde_json::json!(health.provider_count > state.segment_count * 2);
                 }
             }
 
