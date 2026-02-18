@@ -2,7 +2,7 @@
 
 ## Overview
 
-Replaces the previous event-sourced gossipsub model with a **DHT-primary architecture**. Piece provider records live in the DHT (Kademlia). Each node's PieceMap is populated via **Merkle diff pulls** from providers during periodic HealthScan, not gossipsub events. PieceStored/PieceDropped are **local internal events only** — they update the local PieceMap and DHT records but are not broadcast on gossipsub.
+**DHT-primary architecture.** Piece provider records live in the DHT (Kademlia). Each node's PieceMap is populated via **Merkle diff pulls** from providers during periodic HealthScan. PieceStored/PieceDropped are **local internal events only** — they update the local PieceMap and DHT records. Node discovery uses **bootstrap nodes → PEX (Peer Exchange) → DHT routing table**. No gossipsub — CraftDB eliminates the need for broadcast discovery entirely.
 
 **Key insight**: Push cost scales with network activity (O(N × network_activity)). Pull cost scales with local scope (O(local_scope)). At 1M+ users with frequent uploads, push piece events = ~1.75 MB/s per node (unsustainable for home users). Pull: only query providers for YOUR segments during HealthScan.
 
@@ -22,7 +22,7 @@ ProviderRecord {
 
 ## Local Internal Events
 
-PieceStored and PieceDropped are internal events within a node — they trigger local PieceMap updates and DHT record writes/removals, but are **never broadcast on gossipsub**.
+PieceStored and PieceDropped are internal events within a node — they trigger local PieceMap updates and DHT record writes/removals.
 
 ```rust
 // Local event only — not broadcast
@@ -60,7 +60,7 @@ struct PieceMap {
 // Stored on disk. Loaded per-segment for rank computation.
 ```
 
-**Population**: PieceMap is populated via Merkle diff pulls from providers during HealthScan (every 5 min). NOT via gossipsub events.
+**Population**: PieceMap is populated via Merkle diff pulls from providers during HealthScan (every 5 min).
 
 ### Derived Computations (from PieceMap, anytime)
 
@@ -100,9 +100,9 @@ Each node's PieceMap only tracks segments it holds pieces in — not all network
 
 ### Detection
 
-- **Online**: capability announcement received on gossipsub within expected interval (~2 hours, given ~1 hour announcement frequency)
-- **Offline (graceful)**: `GoingOffline` broadcast received
-- **Offline (crash/disconnect)**: no capability announcement for timeout period
+- **Online**: responds to direct P2P queries within timeout
+- **Offline (graceful)**: node disconnects from peers
+- **Offline (crash/disconnect)**: P2P request timeout — no response within expected interval
 - **Liveness verification**: P2P request timeout via DHT relay path (no separate mechanism needed). DHT nodes naturally act as relays for NAT traversal.
 
 ### Health Impact
@@ -115,15 +115,15 @@ effective_rank(cid, segment) = independence_check(
 )
 ```
 
-### Capability Announcements (Single Gossipsub Topic)
+### Capability Discovery (Direct P2P Query)
 
-The **only gossipsub topic**: `datacraft/capabilities/1.0.0`. ~170 bytes per message, every ~1 hour. Only storage nodes subscribe. Carries:
+Capabilities are discovered via **direct P2P query** when needed — not broadcast. Nodes query peers from their DHT routing table + PEX connections. Response includes:
 - Capabilities (storage, aggregator, relay, etc.)
 - Region
 - Max storage bytes
 - Used storage bytes
 
-Scales to 15M+ nodes at <1 MB/s. Provides node enumeration (DHT can't do "find all storage nodes").
+Node discovery: bootstrap nodes → PEX (peers share known peer lists, BitTorrent-proven) → DHT routing table. No node enumeration needed — repair targets and distribution targets are selected from known connected peers.
 
 ## HealthScan — Periodic Repair & Degradation via Merkle Diff Pulls
 
@@ -166,7 +166,7 @@ every 5 minutes:
 
 - **Scales with local scope**: Pull cost = O(local_scope). Push cost = O(N × network_activity). At 1M+ users, pull wins.
 - **No feedback loops**: repair doesn't trigger degradation, and vice versa
-- **Less bandwidth**: no gossipsub piece events flooding the network
+- **Less bandwidth**: no broadcast piece events flooding the network
 - **NAT is not a differentiator**: same libp2p transport. Only difference is push vs pull bandwidth.
 - **Simple**: easy to reason about, test, and debug
 
@@ -180,7 +180,7 @@ With the full coefficient matrix from PieceMap, repairing nodes compute a vector
 
 ### Demand Awareness
 
-Demand tracking is **local fetch count only** — each node tracks how often it serves pieces for a CID. No global gossipsub demand signal. Degradation checks local demand before scheduling drops. This is sufficient for per-node degradation decisions.
+Demand tracking is **local fetch count only** — each node tracks how often it serves pieces for a CID. Degradation checks local demand before scheduling drops. This is sufficient for per-node degradation decisions.
 
 ### What This Eliminates
 
@@ -190,9 +190,7 @@ Demand tracking is **local fetch count only** — each node tracks how often it 
 - Challenger emitting repair/degradation signals
 - Random delay coordination
 - Event-driven health checking
-- `DemandSignalTracker` (gossipsub-based) — replaced by local fetch count
-- `datacraft/pieces/1.0.0` gossipsub topic — piece tracking via DHT + Merkle diffs
-- `datacraft/demand/1.0.0` gossipsub topic — demand is local
+- `DemandSignalTracker` — replaced by local fetch count
 - `capability_announce_interval_secs` and `reannounce_interval_secs` config references
 
 ## PDP Integration
@@ -208,7 +206,7 @@ Flow:
 ## Aggregator Role
 
 The aggregator is **NOT integral** to the network. Any node can build a global view from:
-- Gossipsub capability announcements (node enumeration — the single gossipsub topic)
+- DHT routing table + PEX (peer discovery)
 - Merkle diff pulls from providers (piece-level inventory)
 
 Settlement can be done by anyone willing to pull all Merkle trees. The aggregator is a convenience for analytics and long-term history, not a required component.
@@ -224,13 +222,13 @@ Settlement can be done by anyone willing to pull all Merkle trees. The aggregato
 
 | Previous System | New System |
 |---|---|
-| PieceStored/PieceDropped gossipsub events | Local internal events + DHT provider records |
-| Gossipsub-populated PieceMap | Merkle diff pull-populated PieceMap |
+| PieceStored/PieceDropped broadcast events | Local internal events + DHT provider records |
+| Broadcast-populated PieceMap | Merkle diff pull-populated PieceMap |
 | `datacraft/pieces/1.0.0` topic | DHT provider records + Merkle diff pulls |
 | `datacraft/demand/1.0.0` topic | Local fetch count |
-| `DemandSignalTracker` (gossipsub) | Local fetch count tracking |
+| `DemandSignalTracker` | Local fetch count tracking |
 | Event-sourced sync protocol | Merkle tree diff protocol |
-| Multiple gossipsub topics | Single topic: `datacraft/capabilities/1.0.0` |
+| Multiple broadcast topics | DHT + PEX + direct P2P queries |
 | Capability announcements with `piece_counts` | Slim capability announcements (~170 bytes) |
 | RepairSignal/Announcement + RepairCoordinator | Periodic HealthScan with deterministic assignment |
 | DegradationSignal/Announcement + DegradationCoordinator | Periodic HealthScan |
@@ -249,4 +247,4 @@ Settlement can be done by anyone willing to pull all Merkle trees. The aggregato
 7. Implement orthogonal piece creation in craftec-erasure
 8. Update health computation to use PieceMap with independence checking
 9. Update handler/challenger to read from PieceMap
-10. Remove old systems: RepairCoordinator, DegradationCoordinator, HealthReactor, peer_scorer.piece_counts, inventory requests, gossipsub piece/demand topics, DemandSignalTracker
+10. Remove old systems: RepairCoordinator, DegradationCoordinator, HealthReactor, peer_scorer.piece_counts, inventory requests, DemandSignalTracker
