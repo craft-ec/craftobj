@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
-use crate::{CraftOBJError, Result};
+use crate::{CraftObjError, Result};
 
 /// Re-encryption key that transforms a ciphertext from creator to recipient.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ fn ed25519_verifying_to_x25519_public(verifying_key: &ed25519_dalek::VerifyingKe
     let compressed = CompressedEdwardsY(verifying_key.to_bytes());
     let edwards = compressed
         .decompress()
-        .ok_or_else(|| CraftOBJError::EncryptionError("invalid ed25519 public key".into()))?;
+        .ok_or_else(|| CraftObjError::EncryptionError("invalid ed25519 public key".into()))?;
     let montgomery = edwards.to_montgomery();
     Ok(X25519PublicKey::from(montgomery.to_bytes()))
 }
@@ -112,7 +112,7 @@ pub fn encrypt_content_key(
 
     let sym_key = Sha256::digest(shared.as_bytes());
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
@@ -120,7 +120,7 @@ pub fn encrypt_content_key(
 
     let ciphertext = cipher
         .encrypt(nonce, content_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
 
     Ok(EncryptedContentKey {
         ephemeral_public: *ephemeral_public.as_bytes(),
@@ -140,12 +140,12 @@ pub fn decrypt_content_key(
 
     let sym_key = Sha256::digest(shared.as_bytes());
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
     let nonce = Nonce::from_slice(&encrypted.nonce);
 
     cipher
         .decrypt(nonce, encrypted.ciphertext.as_slice())
-        .map_err(|e| CraftOBJError::EncryptionError(format!("decryption failed: {e}")))
+        .map_err(|e| CraftObjError::EncryptionError(format!("decryption failed: {e}")))
 }
 
 /// Generate a re-encryption key from creator to recipient.
@@ -205,7 +205,7 @@ pub fn re_encrypt(
     // secret key. Use re_encrypt_with_content_key instead.
     let _ = (encrypted_content_key, re_key, creator_pubkey);
 
-    Err(CraftOBJError::EncryptionError(
+    Err(CraftObjError::EncryptionError(
         "use re_encrypt_with_content_key for client-side PRE".into(),
     ))
 }
@@ -226,7 +226,7 @@ pub fn re_encrypt_with_content_key(
     // as the symmetric key. Recipient can derive the same shared secret.
     let sym_key = Sha256::digest(re_key.transform_key);
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
@@ -234,7 +234,7 @@ pub fn re_encrypt_with_content_key(
 
     let ciphertext = cipher
         .encrypt(nonce, content_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
 
     Ok(ReEncryptedKey {
         ephemeral_public: re_key.recipient_x25519_public,
@@ -261,12 +261,12 @@ pub fn decrypt_re_encrypted(
     let sym_key = Sha256::digest(shared.as_bytes());
 
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
     let nonce = Nonce::from_slice(&re_encrypted.nonce);
 
     cipher
         .decrypt(nonce, re_encrypted.ciphertext.as_slice())
-        .map_err(|e| CraftOBJError::EncryptionError(format!("re-encrypted decryption failed: {e}")))
+        .map_err(|e| CraftObjError::EncryptionError(format!("re-encrypted decryption failed: {e}")))
 }
 
 /// Full PRE flow convenience: encrypt → generate re-key → re-encrypt → ready for recipient.

@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use craftobj_transfer;
-use crate::commands::CraftOBJCommand;
+use crate::commands::CraftObjCommand;
 use crate::health::{self, DutyCycleResult, TierInfo, PdpRoundResult, ProviderPdpResult};
 use crate::pdp::{
     ChallengerRotation, OnlineTimeTracker,
@@ -51,7 +51,7 @@ pub struct ChallengerManager {
     provided_cids: HashMap<ContentId, ProvidedCid>,
     rotation: ChallengerRotation,
     online_tracker: OnlineTimeTracker,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     signing_key: Option<SigningKey>,
     persistent_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
@@ -72,7 +72,7 @@ impl ChallengerManager {
     pub fn new(
         local_peer_id: PeerId,
         local_pubkey: [u8; 32],
-        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+        command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Self {
         Self {
             local_peer_id,
@@ -449,7 +449,7 @@ impl ChallengerManager {
     async fn resolve_providers(&self, cid: ContentId) -> Result<Vec<PeerId>, String> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(CraftOBJCommand::ResolveProviders { content_id: cid, reply_tx: tx })
+            .send(CraftObjCommand::ResolveProviders { content_id: cid, reply_tx: tx })
             .map_err(|e| format!("Failed to send resolve command: {}", e))?;
         rx.await.map_err(|e| format!("Channel closed: {}", e))?
     }
@@ -464,7 +464,7 @@ impl ChallengerManager {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(CraftOBJCommand::PieceSync {
+            .send(CraftObjCommand::PieceSync {
                 peer_id: peer,
                 content_id: cid,
                 segment_index,
@@ -476,7 +476,7 @@ impl ChallengerManager {
             .map_err(|e| format!("Failed to send PieceSync: {}", e))?;
         let response = rx.await.map_err(|e| format!("Channel closed: {}", e))??;
         match response {
-            craftobj_transfer::CraftOBJResponse::PieceBatch { pieces } => {
+            craftobj_transfer::CraftObjResponse::PieceBatch { pieces } => {
                 if let Some(piece) = pieces.into_iter().next() {
                     Ok((piece.coefficients, piece.data))
                 } else {

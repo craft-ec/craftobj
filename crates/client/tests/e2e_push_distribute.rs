@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use craftobj_client::CraftOBJClient;
+use craftobj_client::CraftObjClient;
 use craftobj_core::PublishOptions;
 use craftobj_store::FsStore;
 
@@ -30,7 +30,7 @@ async fn test_push_distribute_and_reconstruct() {
     let dir_b = temp_dir("push-b");
 
     // Node A publishes
-    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
+    let mut client_a = CraftObjClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("input.bin");
     let original = b"Push distribution test content. Needs to be long enough for RLNC encoding to produce multiple pieces per segment.";
     std::fs::write(&input_path, original).unwrap();
@@ -68,7 +68,7 @@ async fn test_push_distribute_and_reconstruct() {
     }
 
     // Node B reconstructs
-    let client_b = CraftOBJClient::new(&dir_b).unwrap();
+    let client_b = CraftObjClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("output.bin");
     client_b.reconstruct(&content_id, &output_path, None).unwrap();
 
@@ -87,7 +87,7 @@ async fn test_three_node_distribute_and_reconstruct() {
     let dir_b = temp_dir("3n-b");
     let dir_c = temp_dir("3n-c");
 
-    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
+    let mut client_a = CraftObjClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("input.bin");
     let original = b"Three-node distribution test. Each storage node gets different pieces.";
     std::fs::write(&input_path, original).unwrap();
@@ -146,7 +146,7 @@ async fn test_three_node_distribute_and_reconstruct() {
         assert!(collected >= k, "Segment {}: need {} pieces, collected {}", seg_idx, k, collected);
     }
 
-    let client_d = CraftOBJClient::new(&dir_d).unwrap();
+    let client_d = CraftObjClient::new(&dir_d).unwrap();
     let output_path = dir_d.join("output.bin");
     client_d.reconstruct(&content_id, &output_path, None).unwrap();
 

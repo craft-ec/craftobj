@@ -1,7 +1,7 @@
-//! CraftOBJ wrapper behaviour
+//! CraftObj wrapper behaviour
 //!
 //! Combines CraftBehaviour (generic networking) with libp2p_stream
-//! for CraftOBJ-specific piece transfer via persistent streams.
+//! for CraftObj-specific piece transfer via persistent streams.
 
 use craftec_network::CraftBehaviour;
 use craftec_network::behaviour::CraftBehaviourEvent;
@@ -12,37 +12,37 @@ use libp2p::swarm::NetworkBehaviour;
 use std::time::Duration;
 use tracing::info;
 
-/// Type alias for the CraftOBJ swarm.
-pub type CraftOBJSwarm = libp2p::Swarm<CraftOBJBehaviour>;
+/// Type alias for the CraftObj swarm.
+pub type CraftObjSwarm = libp2p::Swarm<CraftObjBehaviour>;
 
-/// Combined behaviour for CraftOBJ nodes.
+/// Combined behaviour for CraftObj nodes.
 #[derive(NetworkBehaviour)]
-#[behaviour(to_swarm = "CraftOBJBehaviourEvent")]
-pub struct CraftOBJBehaviour {
+#[behaviour(to_swarm = "CraftObjBehaviourEvent")]
+pub struct CraftObjBehaviour {
     /// Generic Craftec networking (Kademlia, mDNS, etc.)
     pub craft: CraftBehaviour,
     /// Persistent stream transport for piece transfer
     pub stream: libp2p_stream::Behaviour,
 }
 
-/// Events emitted by CraftOBJBehaviour.
+/// Events emitted by CraftObjBehaviour.
 #[derive(Debug)]
-pub enum CraftOBJBehaviourEvent {
+pub enum CraftObjBehaviourEvent {
     Craft(CraftBehaviourEvent),
     // libp2p_stream::Behaviour produces no events (streams are accepted via Control)
     #[allow(dead_code)]
     Stream(()),
 }
 
-impl From<CraftBehaviourEvent> for CraftOBJBehaviourEvent {
+impl From<CraftBehaviourEvent> for CraftObjBehaviourEvent {
     fn from(e: CraftBehaviourEvent) -> Self {
-        CraftOBJBehaviourEvent::Craft(e)
+        CraftObjBehaviourEvent::Craft(e)
     }
 }
 
-impl From<()> for CraftOBJBehaviourEvent {
+impl From<()> for CraftObjBehaviourEvent {
     fn from(_: ()) -> Self {
-        CraftOBJBehaviourEvent::Stream(())
+        CraftObjBehaviourEvent::Stream(())
     }
 }
 
@@ -55,11 +55,11 @@ fn yamux_config() -> yamux::Config {
     cfg
 }
 
-/// Build a CraftOBJ swarm with CraftBehaviour + libp2p_stream.
+/// Build a CraftObj swarm with CraftBehaviour + libp2p_stream.
 pub async fn build_craftobj_swarm(
     keypair: Keypair,
     config: NetworkConfig,
-) -> Result<(CraftOBJSwarm, PeerId), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(CraftObjSwarm, PeerId), Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = PeerId::from(keypair.public());
     info!("Local peer ID: {}", local_peer_id);
 
@@ -78,7 +78,7 @@ pub async fn build_craftobj_swarm(
             let craft = CraftBehaviour::build(&protocol_prefix, peer_id, key, relay_behaviour)?;
             let stream = libp2p_stream::Behaviour::new();
 
-            Ok(CraftOBJBehaviour { craft, stream })
+            Ok(CraftObjBehaviour { craft, stream })
         })?
         .with_swarm_config(|c| {
             c.with_idle_connection_timeout(Duration::from_secs(300))

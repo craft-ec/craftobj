@@ -1,4 +1,4 @@
-//! End-to-end integration tests for CraftOBJ.
+//! End-to-end integration tests for CraftObj.
 //!
 //! Covers the full content lifecycle: publish, fetch, encrypt, access control (PRE),
 //! revocation with key rotation, payment channels, and storage receipts.
@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use craftobj_client::CraftOBJClient;
+use craftobj_client::CraftObjClient;
 use craftobj_core::{
     ContentId, PublishOptions, StorageReceipt,
     payment_channel::{
@@ -55,9 +55,9 @@ fn write_test_file(dir: &PathBuf, name: &str, content: &[u8]) -> PathBuf {
 #[test]
 fn publish_fetch_plaintext() {
     let dir = tmp_dir();
-    let mut client = CraftOBJClient::new(&dir).unwrap();
+    let mut client = CraftObjClient::new(&dir).unwrap();
 
-    let content = b"Hello CraftOBJ - plaintext lifecycle test with enough data to chunk.";
+    let content = b"Hello CraftObj - plaintext lifecycle test with enough data to chunk.";
     let file = write_test_file(&dir, "plain.txt", content);
 
     // Publish
@@ -90,7 +90,7 @@ fn publish_fetch_plaintext() {
 #[test]
 fn publish_fetch_large_content_multichunk() {
     let dir = tmp_dir();
-    let mut client = CraftOBJClient::new(&dir).unwrap();
+    let mut client = CraftObjClient::new(&dir).unwrap();
 
     // 200KB — will produce multiple chunks at 64KB default
     let content: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
@@ -115,7 +115,7 @@ fn publish_fetch_large_content_multichunk() {
 #[test]
 fn publish_encrypted_grant_fetch_decrypt() {
     let dir = tmp_dir();
-    let mut client = CraftOBJClient::new(&dir).unwrap();
+    let mut client = CraftObjClient::new(&dir).unwrap();
 
     let creator = keygen();
     let recipient = keygen();
@@ -174,7 +174,7 @@ fn publish_encrypted_grant_fetch_decrypt() {
 #[test]
 fn pre_multiple_recipients_independent() {
     let dir = tmp_dir();
-    let mut client = CraftOBJClient::new(&dir).unwrap();
+    let mut client = CraftObjClient::new(&dir).unwrap();
 
     let creator = keygen();
     let recipients: Vec<SigningKey> = (0..5).map(|_| keygen()).collect();
@@ -222,7 +222,7 @@ fn pre_multiple_recipients_independent() {
 #[test]
 fn revoke_and_rotate_denies_revoked_user() {
     let dir = tmp_dir();
-    let mut client = CraftOBJClient::new(&dir).unwrap();
+    let mut client = CraftObjClient::new(&dir).unwrap();
 
     let creator = keygen();
     let user_a = keygen();

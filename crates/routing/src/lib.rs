@@ -1,4 +1,4 @@
-//! CraftOBJ Routing
+//! CraftObj Routing
 //!
 //! DHT-based content provider discovery built on craftec-network's Kademlia.
 //!
@@ -72,7 +72,7 @@ pub fn provider_key(content_id: &ContentId, segment_index: u32) -> Vec<u8> {
 }
 
 /// Content router — wraps CraftBehaviour's generic DHT methods
-/// with CraftOBJ-specific key schemes.
+/// with CraftObj-specific key schemes.
 pub struct ContentRouter;
 
 impl ContentRouter {
@@ -104,7 +104,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = manifest_dht_key(&manifest.content_id);
         let value = serde_json::to_vec(manifest)
-            .map_err(|e| CraftOBJError::ManifestError(e.to_string()))?;
+            .map_err(|e| CraftObjError::ManifestError(e.to_string()))?;
         debug!(
             "Publishing manifest for {} ({} bytes)",
             manifest.content_id,
@@ -112,7 +112,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(MANIFEST_RECORD_TTL))
-            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch a manifest from the DHT.
@@ -133,7 +133,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = access_dht_key(&access_list.content_id);
         let value = bincode::serialize(access_list)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("serialize access list: {e}")))?;
+            .map_err(|e| CraftObjError::EncryptionError(format!("serialize access list: {e}")))?;
         debug!(
             "Publishing access list for {} ({} bytes, {} entries)",
             access_list.content_id,
@@ -142,7 +142,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(ACCESS_RECORD_TTL))
-            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch an access list from the DHT.
@@ -164,7 +164,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = rekey_dht_key(content_id, &entry.recipient_did);
         let value = bincode::serialize(entry)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("serialize re-key: {e}")))?;
+            .map_err(|e| CraftObjError::EncryptionError(format!("serialize re-key: {e}")))?;
         debug!(
             "Publishing re-key for {} → {} ({} bytes)",
             content_id,
@@ -173,7 +173,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(ACCESS_RECORD_TTL))
-            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch a re-encryption key entry from the DHT.
@@ -200,7 +200,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = removal_dht_key(content_id);
         let value = bincode::serialize(notice)
-            .map_err(|e| CraftOBJError::StorageError(format!("serialize removal notice: {e}")))?;
+            .map_err(|e| CraftObjError::StorageError(format!("serialize removal notice: {e}")))?;
         debug!(
             "Publishing removal notice for {} ({} bytes)",
             content_id,
@@ -208,7 +208,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(REMOVAL_RECORD_TTL))
-            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch a removal notice from the DHT.
@@ -240,38 +240,38 @@ impl ContentRouter {
         // Overwrite with empty value (tombstone)
         behaviour
             .put_record(&key, vec![], local_peer_id, Some(Duration::from_secs(1)))
-            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
     }
 }
 
 /// Parse a manifest from a DHT record value.
 pub fn parse_manifest_record(value: &[u8]) -> Result<ContentManifest> {
     serde_json::from_slice(value)
-        .map_err(|e| CraftOBJError::ManifestError(e.to_string()))
+        .map_err(|e| CraftObjError::ManifestError(e.to_string()))
 }
 
 /// Parse an access list from a DHT record value.
 pub fn parse_access_list_record(value: &[u8]) -> Result<AccessList> {
     bincode::deserialize(value)
-        .map_err(|e| CraftOBJError::EncryptionError(format!("deserialize access list: {e}")))
+        .map_err(|e| CraftObjError::EncryptionError(format!("deserialize access list: {e}")))
 }
 
 /// Parse a removal notice from a DHT record value.
 pub fn parse_removal_record(value: &[u8]) -> Result<RemovalNotice> {
     if value.is_empty() {
-        return Err(CraftOBJError::StorageError("removal record is empty".into()));
+        return Err(CraftObjError::StorageError("removal record is empty".into()));
     }
     bincode::deserialize(value)
-        .map_err(|e| CraftOBJError::StorageError(format!("deserialize removal notice: {e}")))
+        .map_err(|e| CraftObjError::StorageError(format!("deserialize removal notice: {e}")))
 }
 
 /// Parse a re-key entry from a DHT record value.
 pub fn parse_rekey_record(value: &[u8]) -> Result<ReKeyEntry> {
     if value.is_empty() {
-        return Err(CraftOBJError::EncryptionError("re-key record is tombstoned".into()));
+        return Err(CraftObjError::EncryptionError("re-key record is tombstoned".into()));
     }
     bincode::deserialize(value)
-        .map_err(|e| CraftOBJError::EncryptionError(format!("deserialize re-key: {e}")))
+        .map_err(|e| CraftObjError::EncryptionError(format!("deserialize re-key: {e}")))
 }
 
 #[cfg(test)]

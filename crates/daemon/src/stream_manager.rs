@@ -1,4 +1,4 @@
-//! Simple stream-per-request transport for CraftOBJ.
+//! Simple stream-per-request transport for CraftObj.
 //!
 //! Each request opens a fresh yamux substream:
 //!   1. Open stream to peer
@@ -10,7 +10,7 @@
 //! No persistent streams. No stream management. No contention.
 
 use craftobj_transfer::wire::{read_frame, write_request_frame, write_response_frame, StreamFrame};
-use craftobj_transfer::{CraftOBJRequest, CraftOBJResponse};
+use craftobj_transfer::{CraftObjRequest, CraftObjResponse};
 use libp2p::PeerId;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -19,7 +19,7 @@ use tracing::{info, warn};
 pub struct InboundMessage {
     pub peer: PeerId,
     pub seq_id: u64,
-    pub request: CraftOBJRequest,
+    pub request: CraftObjRequest,
     /// The stream to write the response on (same stream the request came from).
     pub stream: libp2p::Stream,
 }
@@ -27,12 +27,12 @@ pub struct InboundMessage {
 /// An outbound request to send to a peer.
 pub struct OutboundMessage {
     pub peer: PeerId,
-    pub request: CraftOBJRequest,
+    pub request: CraftObjRequest,
     /// Receives the response from the peer.
-    pub reply_tx: Option<tokio::sync::oneshot::Sender<CraftOBJResponse>>,
+    pub reply_tx: Option<tokio::sync::oneshot::Sender<CraftObjResponse>>,
 }
 
-/// Protocol for CraftOBJ transfer streams.
+/// Protocol for CraftObj transfer streams.
 pub fn transfer_stream_protocol() -> libp2p::StreamProtocol {
     libp2p::StreamProtocol::new(craftobj_core::TRANSFER_PROTOCOL)
 }
@@ -125,7 +125,7 @@ impl StreamManager {
                     Ok(Err(e)) => {
                         warn!("[stream_mgr.rs] Failed to open stream to {}: {}", peer, e);
                         if let Some(tx) = msg.reply_tx {
-                            let _ = tx.send(CraftOBJResponse::Ack {
+                            let _ = tx.send(CraftObjResponse::Ack {
                                 status: craftobj_core::WireStatus::Error,
                             });
                         }
@@ -134,7 +134,7 @@ impl StreamManager {
                     Err(_) => {
                         warn!("[stream_mgr.rs] Timeout opening stream to {}", peer);
                         if let Some(tx) = msg.reply_tx {
-                            let _ = tx.send(CraftOBJResponse::Ack {
+                            let _ = tx.send(CraftObjResponse::Ack {
                                 status: craftobj_core::WireStatus::Error,
                             });
                         }
@@ -146,7 +146,7 @@ impl StreamManager {
                 if let Err(e) = write_request_frame(&mut stream, 0, &msg.request).await {
                     warn!("[stream_mgr.rs] Write to {} failed: {}", peer, e);
                     if let Some(tx) = msg.reply_tx {
-                        let _ = tx.send(CraftOBJResponse::Ack {
+                        let _ = tx.send(CraftObjResponse::Ack {
                             status: craftobj_core::WireStatus::Error,
                         });
                     }

@@ -14,7 +14,7 @@ use libp2p::PeerId;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::commands::CraftOBJCommand;
+use crate::commands::CraftObjCommand;
 use crate::peer_scorer::PeerScorer;
 use crate::push_target;
 
@@ -136,7 +136,7 @@ impl DemandSignalTracker {
 /// Push-based — same pattern as repair.
 pub struct ScalingCoordinator {
     local_peer_id: PeerId,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
     /// Track which CIDs we've recently attempted scaling for (avoid duplicates).
     recent_scaling: HashMap<ContentId, Instant>,
@@ -147,7 +147,7 @@ pub struct ScalingCoordinator {
 impl ScalingCoordinator {
     pub fn new(
         local_peer_id: PeerId,
-        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+        command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Self {
         Self {
             local_peer_id,
@@ -314,7 +314,7 @@ impl ScalingCoordinator {
 
         // Push piece to target node
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        if self.command_tx.send(CraftOBJCommand::PushPiece {
+        if self.command_tx.send(CraftObjCommand::PushPiece {
             peer_id: target_peer,
             content_id,
             segment_index,
@@ -365,7 +365,7 @@ pub fn create_demand_signal(
 mod tests {
     use super::*;
 
-    fn make_tx() -> mpsc::UnboundedSender<CraftOBJCommand> {
+    fn make_tx() -> mpsc::UnboundedSender<CraftObjCommand> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
     }

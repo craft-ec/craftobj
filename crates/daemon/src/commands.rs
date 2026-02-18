@@ -4,13 +4,13 @@
 //! and stream-based transfers.
 
 use craftobj_core::{ContentId, ContentManifest};
-use craftobj_transfer::CraftOBJResponse;
+use craftobj_transfer::CraftObjResponse;
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
 /// Commands that can be sent to the swarm event loop.
 #[derive(Debug)]
-pub enum CraftOBJCommand {
+pub enum CraftObjCommand {
     /// Announce this node as a provider for a content ID.
     AnnounceProvider {
         content_id: ContentId,
@@ -35,14 +35,14 @@ pub enum CraftOBJCommand {
         merkle_root: [u8; 32],
         have_pieces: Vec<[u8; 32]>,
         max_pieces: u16,
-        reply_tx: oneshot::Sender<Result<CraftOBJResponse, String>>,
+        reply_tx: oneshot::Sender<Result<CraftObjResponse, String>>,
     },
     /// Query a peer's PieceMap entries for a specific segment (lightweight sync).
     PieceMapQuery {
         peer_id: PeerId,
         content_id: ContentId,
         segment_index: u32,
-        reply_tx: oneshot::Sender<Result<CraftOBJResponse, String>>,
+        reply_tx: oneshot::Sender<Result<CraftObjResponse, String>>,
     },
     /// Store a re-encryption key in the DHT for access grant.
     PutReKey {

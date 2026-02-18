@@ -1,4 +1,4 @@
-//! CraftOBJ daemon service
+//! CraftObj daemon service
 //!
 //! Manages the libp2p swarm, IPC server, and content operations.
 
@@ -7,23 +7,23 @@ use std::sync::Arc;
 
 use craftec_ipc::IpcServer;
 use craftec_network::NetworkConfig;
-use craftobj_client::CraftOBJClient;
-use craftobj_core::{ContentId, ContentManifest, CraftOBJCapability, WireStatus};
-use craftobj_transfer::{CraftOBJRequest, CraftOBJResponse};
+use craftobj_client::CraftObjClient;
+use craftobj_core::{ContentId, ContentManifest, CraftObjCapability, WireStatus};
+use craftobj_transfer::{CraftObjRequest, CraftObjResponse};
 use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::stream_manager::{StreamManager, InboundMessage, OutboundMessage, transfer_stream_protocol};
 
-use crate::behaviour::{build_craftobj_swarm, CraftOBJBehaviourEvent, CraftOBJSwarm};
-use crate::commands::CraftOBJCommand;
+use crate::behaviour::{build_craftobj_swarm, CraftObjBehaviourEvent, CraftObjSwarm};
+use crate::commands::CraftObjCommand;
 use crate::events::{self, DaemonEvent, EventSender};
-use crate::handler::CraftOBJHandler;
+use crate::handler::CraftObjHandler;
 use crate::peer_reconnect::PeerReconnector;
-use crate::protocol::{CraftOBJProtocol, CraftOBJEvent};
+use crate::protocol::{CraftObjProtocol, CraftObjEvent};
 
-/// Default socket path for the CraftOBJ daemon.
+/// Default socket path for the CraftObj daemon.
 pub fn default_socket_path() -> String {
     if cfg!(target_os = "linux") {
         if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -33,7 +33,7 @@ pub fn default_socket_path() -> String {
     "/tmp/craftobj.sock".to_string()
 }
 
-/// Default data directory for CraftOBJ storage.
+/// Default data directory for CraftObj storage.
 pub fn default_data_dir() -> std::path::PathBuf {
     let base = dirs_data_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     base.join("craftobj")
@@ -89,7 +89,7 @@ enum PendingRequest {
 /// Global pending requests tracker.
 type PendingRequests = Arc<Mutex<HashMap<ContentId, PendingRequest>>>;
 
-/// Run the CraftOBJ daemon.
+/// Run the CraftObj daemon.
 ///
 /// This starts the libp2p swarm and IPC server, then blocks until shutdown.
 pub async fn run_daemon(
@@ -102,7 +102,7 @@ pub async fn run_daemon(
     run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None, None).await
 }
 
-/// Run the CraftOBJ daemon with an optional config file path override.
+/// Run the CraftObj daemon with an optional config file path override.
 pub async fn run_daemon_with_config(
     keypair: Keypair,
     data_dir: std::path::PathBuf,
@@ -143,7 +143,7 @@ pub async fn run_daemon_with_config(
     let (event_tx, _) = events::event_channel(256);
 
     // Build client and shared store
-    let client = CraftOBJClient::new(&data_dir)?;
+    let client = CraftObjClient::new(&data_dir)?;
     let client = Arc::new(Mutex::new(client));
     
     let store = Arc::new(Mutex::new(craftobj_store::FsStore::new(&data_dir)?));
@@ -160,10 +160,10 @@ pub async fn run_daemon_with_config(
         Arc::new(Mutex::new(tree))
     };
 
-    // Build swarm with CraftOBJ wrapper behaviour (CraftBehaviour + libp2p_stream)
+    // Build swarm with CraftObj wrapper behaviour (CraftBehaviour + libp2p_stream)
     let (mut swarm, local_peer_id) = build_craftobj_swarm(keypair.clone(), network_config).await
         .map_err(|e| format!("Failed to build swarm: {}", e))?;
-    info!("[service.rs] CraftOBJ node started: {}", local_peer_id);
+    info!("[service.rs] CraftObj node started: {}", local_peer_id);
 
     // Set Kademlia to server mode so DHT queries work (especially on localhost / LAN)
     swarm.behaviour_mut().craft.kademlia.set_mode(Some(libp2p::kad::Mode::Server));
@@ -203,10 +203,10 @@ pub async fn run_daemon_with_config(
     }
 
     // Create event channel for protocol communication
-    let (protocol_event_tx, mut protocol_event_rx) = mpsc::unbounded_channel::<CraftOBJEvent>();
+    let (protocol_event_tx, mut protocol_event_rx) = mpsc::unbounded_channel::<CraftObjEvent>();
     
     // Create command channel for IPC → swarm communication
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<CraftOBJCommand>();
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<CraftObjCommand>();
     let command_tx_for_caps = command_tx.clone();
     let command_tx_for_maintenance = command_tx.clone();
     let command_tx_for_events = command_tx.clone();
@@ -214,8 +214,8 @@ pub async fn run_daemon_with_config(
     // Create pending requests tracker for DHT operations
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
 
-    // Create CraftOBJ protocol handler (DHT operations only)
-    let protocol = CraftOBJProtocol::new(protocol_event_tx);
+    // Create CraftObj protocol handler (DHT operations only)
+    let protocol = CraftObjProtocol::new(protocol_event_tx);
 
     // Peer scorer — tracks capabilities and reliability
     let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
@@ -311,13 +311,13 @@ pub async fn run_daemon_with_config(
         let mut result = Vec::new();
         for cap in &daemon_config.capabilities {
             match cap.to_lowercase().as_str() {
-                "storage" => result.push(CraftOBJCapability::Storage),
-                "client" => result.push(CraftOBJCapability::Client),
+                "storage" => result.push(CraftObjCapability::Storage),
+                "client" => result.push(CraftObjCapability::Client),
                 _ => warn!("[service.rs] Unknown capability '{}' in config, skipping", cap),
             }
         }
         if result.is_empty() {
-            vec![CraftOBJCapability::Client]
+            vec![CraftObjCapability::Client]
         } else {
             result
         }
@@ -325,7 +325,7 @@ pub async fn run_daemon_with_config(
     info!("[service.rs] Capabilities: {:?}", own_capabilities);
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
-    let mut handler = CraftOBJHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone(), channel_store);
+    let mut handler = CraftObjHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone(), channel_store);
     handler.set_settlement_client(settlement_client);
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
@@ -543,7 +543,7 @@ async fn eviction_maintenance_loop(
     pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>>,
     merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
 ) {
     use std::time::Duration;
     const DISK_SPACE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
@@ -630,7 +630,7 @@ async fn eviction_maintenance_loop(
                 // Remove DHT provider records and untrack all segments for this removed CID
                 for seg in segments_seen {
                     let pkey = craftobj_routing::provider_key(cid, seg);
-                    let _ = command_tx.send(CraftOBJCommand::StopProviding { key: pkey });
+                    let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
             }
@@ -663,13 +663,13 @@ async fn eviction_maintenance_loop(
 async fn gc_loop(
     store: Arc<Mutex<craftobj_store::FsStore>>,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
-    client: Arc<Mutex<craftobj_client::CraftOBJClient>>,
+    client: Arc<Mutex<craftobj_client::CraftObjClient>>,
     merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
     event_tx: EventSender,
     gc_interval_secs: u64,
     _max_storage_bytes: u64,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
 ) {
     use std::time::Duration;
 
@@ -754,7 +754,7 @@ async fn gc_loop(
                     }
                     // Remove DHT provider record and untrack segment after dropping all pieces
                     let pkey = craftobj_routing::provider_key(cid, seg);
-                    let _ = command_tx.send(CraftOBJCommand::StopProviding { key: pkey });
+                    let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
             }
@@ -783,15 +783,15 @@ async fn gc_loop(
 }
 
 async fn drive_swarm(
-    swarm: &mut CraftOBJSwarm,
-    protocol: Arc<CraftOBJProtocol>,
-    command_rx: &mut mpsc::UnboundedReceiver<CraftOBJCommand>,
+    swarm: &mut CraftObjSwarm,
+    protocol: Arc<CraftObjProtocol>,
+    command_rx: &mut mpsc::UnboundedReceiver<CraftObjCommand>,
     pending_requests: PendingRequests,
     peer_scorer: SharedPeerScorer,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     event_tx: EventSender,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
-    client: Arc<Mutex<craftobj_client::CraftOBJClient>>,
+    client: Arc<Mutex<craftobj_client::CraftObjClient>>,
     max_storage_bytes: u64,
     store_for_repair: Arc<Mutex<craftobj_store::FsStore>>,
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
@@ -887,7 +887,7 @@ async fn drive_swarm(
                     }
                     SwarmEvent::Behaviour(event) => {
                         match event {
-                            CraftOBJBehaviourEvent::Craft(ref craft_event) => {
+                            CraftObjBehaviourEvent::Craft(ref craft_event) => {
                                 debug!("Craft behaviour event: {:?}", craft_event);
                                 // Handle mDNS discovery
                                 handle_mdns_event(swarm, craft_event, &event_tx);
@@ -900,7 +900,7 @@ async fn drive_swarm(
                                     protocol.handle_kademlia_event(kad_event).await;
                                 }
                             }
-                            CraftOBJBehaviourEvent::Stream(()) => {
+                            CraftObjBehaviourEvent::Stream(()) => {
                                 // libp2p_stream produces no swarm events
                             }
                         }
@@ -913,12 +913,12 @@ async fn drive_swarm(
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
                     match cmd {
-                        CraftOBJCommand::SyncPieceMap { content_id, segment_index } => {
+                        CraftObjCommand::SyncPieceMap { content_id, segment_index } => {
                             // Query all connected peers for their PieceMap entries for this segment
                             let peers: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
                             debug!("[service.rs] SyncPieceMap for {}/seg{}: querying {} peers", content_id, segment_index, peers.len());
                             for peer_id in peers {
-                                let request = CraftOBJRequest::PieceMapQuery { content_id, segment_index };
+                                let request = CraftObjRequest::PieceMapQuery { content_id, segment_index };
                                 let (ack_tx, ack_rx) = oneshot::channel();
                                 let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
                                 let tx = outbound_tx.clone();
@@ -928,7 +928,7 @@ async fn drive_swarm(
                                         return;
                                     }
                                     match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                                        Ok(Ok(CraftOBJResponse::PieceMapEntries { entries })) => {
+                                        Ok(Ok(CraftObjResponse::PieceMapEntries { entries })) => {
                                             let mut map = pm.lock().await;
                                             for entry in entries {
                                                 let stored = craftobj_core::PieceStored {
@@ -953,7 +953,7 @@ async fn drive_swarm(
                                 });
                             }
                         }
-                        CraftOBJCommand::TriggerDistribution => {
+                        CraftObjCommand::TriggerDistribution => {
                             info!("[service.rs] Received TriggerDistribution command — running initial push");
                             let ct = content_tracker.clone();
                             let ctx = command_tx.clone();
@@ -1059,17 +1059,17 @@ async fn drive_swarm(
 /// Handle an incoming transfer request from a peer via persistent stream.
 async fn handle_incoming_transfer_request(
     peer: &libp2p::PeerId,
-    request: CraftOBJRequest,
+    request: CraftObjRequest,
     store: &Arc<Mutex<craftobj_store::FsStore>>,
     _content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
-    protocol: &Arc<CraftOBJProtocol>,
+    protocol: &Arc<CraftObjProtocol>,
     demand_tracker: &Arc<Mutex<crate::scaling::DemandTracker>>,
     piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
     signing_key: Option<&ed25519_dalek::SigningKey>,
-    command_tx: &mpsc::UnboundedSender<CraftOBJCommand>,
-) -> CraftOBJResponse {
+    command_tx: &mpsc::UnboundedSender<CraftObjCommand>,
+) -> CraftObjResponse {
     match request {
-        CraftOBJRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
+        CraftObjRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
             info!("[service.rs] Handling PieceSync from {} for {}/seg{} (they have {} pieces, want max {})", peer, content_id, segment_index, have_pieces.len(), max_pieces);
             info!("[service.rs] PieceSync handler: acquiring store lock...");
             let store_guard = store.lock().await;
@@ -1108,9 +1108,9 @@ async fn handle_incoming_transfer_request(
                 let mut dt = demand_tracker.lock().await;
                 dt.record_fetch(content_id);
             }
-            CraftOBJResponse::PieceBatch { pieces }
+            CraftObjResponse::PieceBatch { pieces }
         }
-        CraftOBJRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
+        CraftObjRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
             info!("[service.rs] Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
             info!("[service.rs] PiecePush handler: acquiring store lock...");
             let store_guard = store.lock().await;
@@ -1119,14 +1119,14 @@ async fn handle_incoming_transfer_request(
             // Check if we have the manifest (must receive ManifestPush first)
             if store_guard.get_manifest(&content_id).is_err() {
                 warn!("[service.rs] Received piece push for {} but no manifest — rejecting", content_id);
-                return CraftOBJResponse::Ack { status: WireStatus::Error };
+                return CraftObjResponse::Ack { status: WireStatus::Error };
             }
 
             match store_guard.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
                 Ok(()) => {
                     info!("[service.rs] Stored pushed piece for {}/seg{}", content_id, segment_index);
                     // Notify protocol of piece push for tracker update
-                    if let Err(e) = protocol.event_tx.send(CraftOBJEvent::PiecePushReceived { content_id }) {
+                    if let Err(e) = protocol.event_tx.send(CraftObjEvent::PiecePushReceived { content_id }) {
                         debug!("Failed to send piece push event: {}", e);
                     }
                     // Emit PieceStored event to PieceMap
@@ -1136,7 +1136,7 @@ async fn handle_incoming_transfer_request(
                         let newly_tracked = map.track_segment(content_id, segment_index);
                         if newly_tracked {
                             // Trigger scoped sync from peers for this segment
-                            let _ = command_tx.send(CraftOBJCommand::SyncPieceMap {
+                            let _ = command_tx.send(CraftObjCommand::SyncPieceMap {
                                 content_id,
                                 segment_index,
                             });
@@ -1163,16 +1163,16 @@ async fn handle_incoming_transfer_request(
                     }
                     // Publish DHT provider record for this CID+segment
                     let pkey = craftobj_routing::provider_key(&content_id, segment_index);
-                    let _ = command_tx.send(CraftOBJCommand::StartProviding { key: pkey });
-                    CraftOBJResponse::Ack { status: WireStatus::Ok }
+                    let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
+                    CraftObjResponse::Ack { status: WireStatus::Ok }
                 }
                 Err(e) => {
                     warn!("[service.rs] Failed to store pushed piece: {}", e);
-                    CraftOBJResponse::Ack { status: WireStatus::Error }
+                    CraftObjResponse::Ack { status: WireStatus::Error }
                 }
             }
         }
-        CraftOBJRequest::ManifestPush { content_id, manifest_json } => {
+        CraftObjRequest::ManifestPush { content_id, manifest_json } => {
             info!("[service.rs] Handling ManifestPush from {} for {}", peer, content_id);
             match serde_json::from_slice::<craftobj_core::ContentManifest>(&manifest_json) {
                 Ok(manifest) => {
@@ -1182,27 +1182,27 @@ async fn handle_incoming_transfer_request(
                     match store_guard.store_manifest(&manifest) {
                         Ok(()) => {
                             info!("[service.rs] Stored manifest for {}", content_id);
-                            if let Err(e) = protocol.event_tx.send(CraftOBJEvent::ManifestPushReceived {
+                            if let Err(e) = protocol.event_tx.send(CraftObjEvent::ManifestPushReceived {
                                 content_id,
                                 manifest,
                             }) {
                                 debug!("Failed to send manifest push event: {}", e);
                             }
-                            CraftOBJResponse::Ack { status: WireStatus::Ok }
+                            CraftObjResponse::Ack { status: WireStatus::Ok }
                         }
                         Err(e) => {
                             warn!("[service.rs] Failed to store manifest: {}", e);
-                            CraftOBJResponse::Ack { status: WireStatus::Error }
+                            CraftObjResponse::Ack { status: WireStatus::Error }
                         }
                     }
                 }
                 Err(e) => {
                     warn!("[service.rs] Failed to parse manifest JSON: {}", e);
-                    CraftOBJResponse::Ack { status: WireStatus::Error }
+                    CraftObjResponse::Ack { status: WireStatus::Error }
                 }
             }
         }
-        CraftOBJRequest::PieceMapQuery { content_id, segment_index } => {
+        CraftObjRequest::PieceMapQuery { content_id, segment_index } => {
             debug!("[service.rs] Handling PieceMapQuery from {} for {}/seg{}", peer, content_id, segment_index);
             let map = piece_map.lock().await;
             let pieces = map.pieces_for_segment(&content_id, segment_index);
@@ -1214,16 +1214,16 @@ async fn handle_incoming_transfer_request(
                 })
                 .collect();
             debug!("[service.rs] Returning {} PieceMap entries for {}/seg{}", entries.len(), content_id, segment_index);
-            CraftOBJResponse::PieceMapEntries { entries }
+            CraftObjResponse::PieceMapEntries { entries }
         }
     }
 }
 
 /// Handle a command from the IPC handler.
 async fn handle_command(
-    swarm: &mut CraftOBJSwarm,
-    protocol: &Arc<CraftOBJProtocol>,
-    command: CraftOBJCommand,
+    swarm: &mut CraftObjSwarm,
+    protocol: &Arc<CraftObjProtocol>,
+    command: CraftObjCommand,
     pending_requests: PendingRequests,
     outbound_tx: &mpsc::Sender<OutboundMessage>,
     event_tx: &EventSender,
@@ -1231,7 +1231,7 @@ async fn handle_command(
     signing_key: &Option<ed25519_dalek::SigningKey>,
 ) {
     match command {
-        CraftOBJCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
+        CraftObjCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
             debug!("Handling announce provider command for {}", content_id);
             
             // Get the local peer ID
@@ -1253,7 +1253,7 @@ async fn handle_command(
             let _ = reply_tx.send(result);
         }
         
-        CraftOBJCommand::ResolveProviders { content_id, reply_tx } => {
+        CraftObjCommand::ResolveProviders { content_id, reply_tx } => {
             debug!("Handling resolve providers command for {}", content_id);
             
             match protocol.resolve_providers(&mut swarm.behaviour_mut().craft, &content_id).await {
@@ -1269,7 +1269,7 @@ async fn handle_command(
             }
         }
         
-        CraftOBJCommand::GetManifest { content_id, reply_tx } => {
+        CraftObjCommand::GetManifest { content_id, reply_tx } => {
             debug!("Handling get manifest command for {}", content_id);
             
             match protocol.get_manifest(&mut swarm.behaviour_mut().craft, &content_id).await {
@@ -1285,9 +1285,9 @@ async fn handle_command(
             }
         }
         
-        CraftOBJCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
+        CraftObjCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
             info!("[service.rs] Handling PieceSync command: {}/{} to peer {} (sending {} have_pieces, max_pieces={})", content_id, segment_index, peer_id, have_pieces.len(), max_pieces);
-            let request = CraftOBJRequest::PieceSync {
+            let request = CraftObjRequest::PieceSync {
                 content_id,
                 segment_index,
                 merkle_root,
@@ -1308,7 +1308,7 @@ async fn handle_command(
                 match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
                     Ok(Ok(response)) => { 
                         let desc = match &response {
-                            craftobj_transfer::CraftOBJResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
+                            craftobj_transfer::CraftObjResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
                             other => format!("{:?}", other),
                         };
                         info!("[service.rs] PieceSync to {}: got response: {}", peer_id, desc);
@@ -1326,9 +1326,9 @@ async fn handle_command(
             });
         }
 
-        CraftOBJCommand::PieceMapQuery { peer_id, content_id, segment_index, reply_tx } => {
+        CraftObjCommand::PieceMapQuery { peer_id, content_id, segment_index, reply_tx } => {
             debug!("[service.rs] Handling PieceMapQuery command: {}/seg{} to peer {}", content_id, segment_index, peer_id);
-            let request = CraftOBJRequest::PieceMapQuery { content_id, segment_index };
+            let request = CraftObjRequest::PieceMapQuery { content_id, segment_index };
             let (ack_tx, ack_rx) = oneshot::channel();
             let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
@@ -1345,7 +1345,7 @@ async fn handle_command(
             });
         }
 
-        CraftOBJCommand::PutReKey { content_id, entry, reply_tx } => {
+        CraftObjCommand::PutReKey { content_id, entry, reply_tx } => {
             debug!("Handling put re-key command for {} → {}", content_id, hex::encode(entry.recipient_did));
             let local_peer_id = *swarm.local_peer_id();
             let result = craftobj_routing::ContentRouter::put_re_key(
@@ -1354,7 +1354,7 @@ async fn handle_command(
             let _ = reply_tx.send(result);
         }
 
-        CraftOBJCommand::RemoveReKey { content_id, recipient_did, reply_tx } => {
+        CraftObjCommand::RemoveReKey { content_id, recipient_did, reply_tx } => {
             debug!("Handling remove re-key command for {} → {}", content_id, hex::encode(recipient_did));
             let local_peer_id = *swarm.local_peer_id();
             let result = craftobj_routing::ContentRouter::remove_re_key(
@@ -1363,7 +1363,7 @@ async fn handle_command(
             let _ = reply_tx.send(result);
         }
 
-        CraftOBJCommand::PutAccessList { access_list, reply_tx } => {
+        CraftObjCommand::PutAccessList { access_list, reply_tx } => {
             debug!("Handling put access list command for {}", access_list.content_id);
             let local_peer_id = *swarm.local_peer_id();
             let result = craftobj_routing::ContentRouter::put_access_list(
@@ -1372,7 +1372,7 @@ async fn handle_command(
             let _ = reply_tx.send(result);
         }
 
-        CraftOBJCommand::GetAccessList { content_id, reply_tx } => {
+        CraftObjCommand::GetAccessList { content_id, reply_tx } => {
             debug!("Handling get access list command for {}", content_id);
             match protocol.get_access_list_dht(&mut swarm.behaviour_mut().craft, &content_id).await {
                 Ok(()) => {
@@ -1385,7 +1385,7 @@ async fn handle_command(
             }
         }
 
-        CraftOBJCommand::PublishRemoval { content_id, notice, reply_tx } => {
+        CraftObjCommand::PublishRemoval { content_id, notice, reply_tx } => {
             debug!("Handling publish removal command for {}", content_id);
             let local_peer_id = *swarm.local_peer_id();
 
@@ -1397,9 +1397,9 @@ async fn handle_command(
             let _ = reply_tx.send(dht_result);
         }
 
-        CraftOBJCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
+        CraftObjCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
             debug!("Handling push piece command: {}/{} to {}", content_id, segment_index, peer_id);
-            let request = CraftOBJRequest::PiecePush {
+            let request = CraftObjRequest::PiecePush {
                 content_id,
                 segment_index,
                 piece_id,
@@ -1418,7 +1418,7 @@ async fn handle_command(
                 }
                 info!("[service.rs] PushPiece: waiting for ack from {} (5s timeout)", peer_id);
                 match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                    Ok(Ok(CraftOBJResponse::Ack { status })) => {
+                    Ok(Ok(CraftObjResponse::Ack { status })) => {
                         info!("[service.rs] PushPiece to {}: got ack status={:?}", peer_id, status);
                         if status == craftobj_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
@@ -1442,9 +1442,9 @@ async fn handle_command(
             });
         }
 
-        CraftOBJCommand::PushManifest { peer_id, content_id, manifest_json, reply_tx } => {
+        CraftObjCommand::PushManifest { peer_id, content_id, manifest_json, reply_tx } => {
             debug!("Handling push manifest command for {} to {}", content_id, peer_id);
-            let request = CraftOBJRequest::ManifestPush {
+            let request = CraftObjRequest::ManifestPush {
                 content_id,
                 manifest_json,
             };
@@ -1460,7 +1460,7 @@ async fn handle_command(
                 }
                 info!("[service.rs] PushManifest: waiting for ack from {} (5s timeout)", peer_id);
                 match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                    Ok(Ok(CraftOBJResponse::Ack { status })) => {
+                    Ok(Ok(CraftObjResponse::Ack { status })) => {
                         info!("[service.rs] PushManifest to {}: got ack status={:?}", peer_id, status);
                         if status == craftobj_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
@@ -1486,7 +1486,7 @@ async fn handle_command(
 
         // RequestInventory removed — challenger now uses PieceSync
 
-        CraftOBJCommand::CheckRemoval { content_id, reply_tx } => {
+        CraftObjCommand::CheckRemoval { content_id, reply_tx } => {
             debug!("Handling check removal command for {}", content_id);
             // For now, just start a DHT query. Full async response would need pending request tracking.
             // This is a simplified version — the RemovalCache handles most checks locally.
@@ -1496,7 +1496,7 @@ async fn handle_command(
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
         }
-        CraftOBJCommand::StartProviding { key } => {
+        CraftObjCommand::StartProviding { key } => {
             debug!("Handling StartProviding command (key len={})", key.len());
             match swarm.behaviour_mut().craft.start_providing(&key) {
                 Ok(_query_id) => debug!("Started providing for key {}", hex::encode(&key[..8.min(key.len())])),
@@ -1504,18 +1504,18 @@ async fn handle_command(
             }
         }
 
-        CraftOBJCommand::StopProviding { key } => {
+        CraftObjCommand::StopProviding { key } => {
             debug!("Handling StopProviding command (key len={})", key.len());
             swarm.behaviour_mut().craft.stop_providing(&key);
             debug!("Stopped providing for key {}", hex::encode(&key[..8.min(key.len())]));
         }
 
-        CraftOBJCommand::SyncPieceMap { .. } => {
+        CraftObjCommand::SyncPieceMap { .. } => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("SyncPieceMap should be intercepted in drive_swarm");
         }
 
-        CraftOBJCommand::TriggerDistribution => {
+        CraftObjCommand::TriggerDistribution => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("TriggerDistribution should be intercepted in drive_swarm");
         }
@@ -1524,7 +1524,7 @@ async fn handle_command(
 
 /// Handle mDNS discovery events: add peers to Kademlia and dial them.
 fn handle_mdns_event(
-    swarm: &mut CraftOBJSwarm,
+    swarm: &mut CraftObjSwarm,
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     event_tx: &EventSender,
 ) {
@@ -1556,18 +1556,18 @@ fn handle_mdns_event(
 
 /// Handle protocol events (DHT query results, etc.).
 async fn handle_protocol_events(
-    event_rx: &mut mpsc::UnboundedReceiver<CraftOBJEvent>,
+    event_rx: &mut mpsc::UnboundedReceiver<CraftObjEvent>,
     pending_requests: PendingRequests,
     daemon_event_tx: EventSender,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
 ) {
     info!("[service.rs] Starting protocol events handler");
     
     while let Some(event) = event_rx.recv().await {
         match event {
-            CraftOBJEvent::ProvidersResolved { content_id, providers } => {
+            CraftObjEvent::ProvidersResolved { content_id, providers } => {
                 info!("[service.rs] Found {} providers for {}", providers.len(), content_id);
                 let _ = daemon_event_tx.send(DaemonEvent::ProvidersResolved {
                     content_id: content_id.to_hex(),
@@ -1590,7 +1590,7 @@ async fn handle_protocol_events(
                 }
             }
             
-            CraftOBJEvent::ManifestRetrieved { content_id, manifest } => {
+            CraftObjEvent::ManifestRetrieved { content_id, manifest } => {
                 info!("[service.rs] Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count);
                 let _ = daemon_event_tx.send(DaemonEvent::ManifestRetrieved {
                     content_id: content_id.to_hex(),
@@ -1605,7 +1605,7 @@ async fn handle_protocol_events(
                 }
             }
             
-            CraftOBJEvent::AccessListRetrieved { content_id, access_list } => {
+            CraftObjEvent::AccessListRetrieved { content_id, access_list } => {
                 info!("[service.rs] Retrieved access list for {} ({} entries)", content_id, access_list.entries.len());
                 let mut pending = pending_requests.lock().await;
                 if let Some(PendingRequest::GetAccessList { reply_tx }) = pending.remove(&content_id) {
@@ -1614,11 +1614,11 @@ async fn handle_protocol_events(
                 }
             }
 
-            CraftOBJEvent::PiecePushReceived { content_id } => {
+            CraftObjEvent::PiecePushReceived { content_id } => {
                 let mut t = content_tracker.lock().await;
                 t.increment_local_pieces(&content_id);
             }
-            CraftOBJEvent::ManifestPushReceived { content_id, manifest } => {
+            CraftObjEvent::ManifestPushReceived { content_id, manifest } => {
                 info!("[service.rs] Received manifest push for {} — tracking as storage provider", content_id);
                 let mut t = content_tracker.lock().await;
                 t.track_stored(content_id, &manifest);
@@ -1633,7 +1633,7 @@ async fn handle_protocol_events(
 
                 // Announce as provider in DHT so other nodes can discover us
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                let cmd = CraftOBJCommand::AnnounceProvider {
+                let cmd = CraftObjCommand::AnnounceProvider {
                     content_id,
                     manifest: manifest.clone(),
                     reply_tx,
@@ -1653,7 +1653,7 @@ async fn handle_protocol_events(
                     // Small delay to let other nodes announce first
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    let cmd = CraftOBJCommand::ResolveProviders { content_id, reply_tx };
+                    let cmd = CraftObjCommand::ResolveProviders { content_id, reply_tx };
                     if cmd_tx.send(cmd).is_ok() {
                         if let Ok(Ok(providers)) = reply_rx.await {
                             let mut t = tracker_clone.lock().await;
@@ -1665,7 +1665,7 @@ async fn handle_protocol_events(
                     }
                 });
             }
-            CraftOBJEvent::DhtError { content_id, error } => {
+            CraftObjEvent::DhtError { content_id, error } => {
                 warn!("[service.rs] DHT error for {}: {}", content_id, error);
                 let _ = daemon_event_tx.send(DaemonEvent::DhtError {
                     content_id: content_id.to_hex(),

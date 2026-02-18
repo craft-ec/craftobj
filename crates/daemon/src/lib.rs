@@ -1,6 +1,6 @@
-//! CraftOBJ Daemon
+//! CraftObj Daemon
 //!
-//! Background service that runs the CraftOBJ node:
+//! Background service that runs the CraftObj node:
 //! - libp2p swarm event loop
 //! - IPC server for desktop/CLI clients
 //! - Content routing and transfer

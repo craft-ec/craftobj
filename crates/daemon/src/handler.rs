@@ -1,6 +1,6 @@
 //! IPC request handler
 //!
-//! Implements craftec_ipc::IpcHandler for CraftOBJ daemon.
+//! Implements craftec_ipc::IpcHandler for CraftObj daemon.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use craftec_ipc::server::IpcHandler;
-use craftobj_client::CraftOBJClient;
+use craftobj_client::CraftObjClient;
 use craftobj_core::PublishOptions;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -17,15 +17,15 @@ use tracing::{debug, info, warn};
 
 use crate::channel_store::ChannelStore;
 use craftobj_transfer;
-use crate::commands::CraftOBJCommand;
+use crate::commands::CraftObjCommand;
 use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
 use crate::events::{DaemonEvent, EventSender};
-use crate::protocol::CraftOBJProtocol;
+use crate::protocol::CraftObjProtocol;
 use crate::receipt_store::PersistentReceiptStore;
 use crate::settlement::SolanaClient;
 
-use craftobj_core::CraftOBJCapability;
+use craftobj_core::CraftObjCapability;
 use ed25519_dalek;
 
 use crate::peer_scorer::PeerScorer;
@@ -47,7 +47,7 @@ struct CidNetworkHealth {
     providers: Vec<Value>,
 }
 
-impl CraftOBJHandler {
+impl CraftObjHandler {
     /// Compute network health for a CID by aggregating local + remote pieces.
     /// `local_seg_pieces` should contain per-segment local piece counts.
     /// `manifest` provides segment count and per-segment k values.
@@ -192,17 +192,17 @@ impl CraftOBJHandler {
     }
 }
 
-/// CraftOBJ IPC handler wrapping a CraftOBJClient and protocol.
-pub struct CraftOBJHandler {
-    client: Arc<Mutex<CraftOBJClient>>,
-    _protocol: Option<Arc<CraftOBJProtocol>>,
-    command_tx: Option<mpsc::UnboundedSender<CraftOBJCommand>>,
+/// CraftObj IPC handler wrapping a CraftObjClient and protocol.
+pub struct CraftObjHandler {
+    client: Arc<Mutex<CraftObjClient>>,
+    _protocol: Option<Arc<CraftObjProtocol>>,
+    command_tx: Option<mpsc::UnboundedSender<CraftObjCommand>>,
     peer_scorer: Option<SharedPeerScorer>,
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     channel_store: Option<Arc<Mutex<ChannelStore>>>,
     settlement_client: Option<Arc<Mutex<SolanaClient>>>,
     content_tracker: Option<Arc<Mutex<ContentTracker>>>,
-    own_capabilities: Vec<CraftOBJCapability>,
+    own_capabilities: Vec<CraftObjCapability>,
     daemon_config: Option<Arc<Mutex<DaemonConfig>>>,
     data_dir: Option<std::path::PathBuf>,
     event_sender: Option<EventSender>,
@@ -224,11 +224,11 @@ pub struct CraftOBJHandler {
     start_time: Instant,
 }
 
-impl CraftOBJHandler {
+impl CraftObjHandler {
     pub fn new(
-        client: Arc<Mutex<CraftOBJClient>>,
-        protocol: Arc<CraftOBJProtocol>,
-        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+        client: Arc<Mutex<CraftObjClient>>,
+        protocol: Arc<CraftObjProtocol>,
+        command_tx: mpsc::UnboundedSender<CraftObjCommand>,
         peer_scorer: SharedPeerScorer,
         receipt_store: Arc<Mutex<PersistentReceiptStore>>,
         channel_store: Arc<Mutex<ChannelStore>>,
@@ -307,12 +307,12 @@ impl CraftOBJHandler {
     }
 
     /// Set the node's own capabilities (for reporting via `node.capabilities` RPC).
-    pub fn set_own_capabilities(&mut self, caps: Vec<CraftOBJCapability>) {
+    pub fn set_own_capabilities(&mut self, caps: Vec<CraftObjCapability>) {
         self.own_capabilities = caps;
     }
 
     /// Create handler without protocol (for testing).
-    pub fn new_without_protocol(client: Arc<Mutex<CraftOBJClient>>) -> Self {
+    pub fn new_without_protocol(client: Arc<Mutex<CraftObjClient>>) -> Self {
         Self { 
             client, 
             _protocol: None,
@@ -441,7 +441,7 @@ impl CraftOBJHandler {
             debug!("Publishing manifest for {} to DHT (without provider announcement)", result.content_id);
             
             let (reply_tx, reply_rx) = oneshot::channel();
-            let command = CraftOBJCommand::AnnounceProvider {
+            let command = CraftObjCommand::AnnounceProvider {
                 content_id: result.content_id,
                 manifest,
                 reply_tx,
@@ -502,7 +502,7 @@ impl CraftOBJHandler {
 
         // Trigger immediate distribution to push shards to storage peers
         if let Some(ref command_tx) = self.command_tx {
-            let _ = command_tx.send(CraftOBJCommand::TriggerDistribution);
+            let _ = command_tx.send(CraftObjCommand::TriggerDistribution);
         }
 
         let mut response = serde_json::json!({
@@ -579,7 +579,7 @@ impl CraftOBJHandler {
                 // Also resolve DHT providers and merge
                 {
                     let (reply_tx, reply_rx) = oneshot::channel();
-                    let command = CraftOBJCommand::ResolveProviders {
+                    let command = CraftObjCommand::ResolveProviders {
                         content_id: cid,
                         reply_tx,
                     };
@@ -637,7 +637,7 @@ impl CraftOBJHandler {
                 info!("[handler.rs] Attempting DHT-only resolution for {}", cid);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let command = CraftOBJCommand::ResolveProviders {
+                let command = CraftObjCommand::ResolveProviders {
                     content_id: cid,
                     reply_tx,
                 };
@@ -648,7 +648,7 @@ impl CraftOBJHandler {
                             info!("[handler.rs] Found {} providers for {} via DHT", providers.len(), cid);
 
                             let (manifest_tx, manifest_rx) = oneshot::channel();
-                            let command = CraftOBJCommand::GetManifest {
+                            let command = CraftObjCommand::GetManifest {
                                 content_id: cid,
                                 reply_tx: manifest_tx,
                             };
@@ -935,7 +935,7 @@ impl CraftOBJHandler {
         // Announce as provider
         if let Some(ref command_tx) = self.command_tx {
             let (tx, rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::AnnounceProvider {
+            command_tx.send(CraftObjCommand::AnnounceProvider {
                 content_id: cid,
                 manifest,
                 reply_tx: tx,
@@ -961,7 +961,7 @@ impl CraftOBJHandler {
         content_id: &craftobj_core::ContentId,
         manifest: &craftobj_core::ContentManifest,
         providers: &[libp2p::PeerId],
-        command_tx: &tokio::sync::mpsc::UnboundedSender<CraftOBJCommand>,
+        command_tx: &tokio::sync::mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Result<(), String> {
         use std::collections::HashMap;
         use tokio::task::JoinSet;
@@ -1044,8 +1044,8 @@ impl CraftOBJHandler {
                 info!("[handler.rs] Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
-                    let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftOBJResponse, String>>();
-                    let command = CraftOBJCommand::PieceSync {
+                    let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftObjResponse, String>>();
+                    let command = CraftObjCommand::PieceSync {
                         peer_id: provider,
                         content_id: cid,
                         segment_index: seg_idx,
@@ -1058,7 +1058,7 @@ impl CraftOBJHandler {
                         return (provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
                     }
                     match reply_rx.await {
-                        Ok(Ok(craftobj_transfer::CraftOBJResponse::PieceBatch { pieces })) => {
+                        Ok(Ok(craftobj_transfer::CraftObjResponse::PieceBatch { pieces })) => {
                             if pieces.is_empty() {
                                 (provider, Err("no pieces returned".into()), start.elapsed())
                             } else {
@@ -1133,7 +1133,7 @@ impl CraftOBJHandler {
                                         // Publish DHT provider record for this CID+segment
                                         {
                                             let pkey = craftobj_routing::provider_key(&cid, seg_idx);
-                                            let _ = command_tx.send(CraftOBJCommand::StartProviding { key: pkey });
+                                            let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
                                         }
                                         coeff_matrix.push(coefficients);
                                         current_rank = new_rank;
@@ -1182,8 +1182,8 @@ impl CraftOBJHandler {
                             let cmd_tx = command_tx.clone();
                             join_set.spawn(async move {
                                 let start = std::time::Instant::now();
-                                let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftOBJResponse, String>>();
-                                let command = CraftOBJCommand::PieceSync {
+                                let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftObjResponse, String>>();
+                                let command = CraftObjCommand::PieceSync {
                                     peer_id: next_provider,
                                     content_id: cid,
                                     segment_index: seg_idx,
@@ -1196,7 +1196,7 @@ impl CraftOBJHandler {
                                     return (next_provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
                                 }
                                 match reply_rx.await {
-                                    Ok(Ok(craftobj_transfer::CraftOBJResponse::PieceBatch { pieces })) => {
+                                    Ok(Ok(craftobj_transfer::CraftObjResponse::PieceBatch { pieces })) => {
                                         if pieces.is_empty() {
                                             (next_provider, Err("no pieces returned".into()), start.elapsed())
                                         } else {
@@ -1283,7 +1283,7 @@ impl CraftOBJHandler {
         // Store re-key in DHT
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::PutReKey {
+            command_tx.send(CraftObjCommand::PutReKey {
                 content_id,
                 entry: entry.clone(),
                 reply_tx,
@@ -1319,7 +1319,7 @@ impl CraftOBJHandler {
 
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::RemoveReKey {
+            command_tx.send(CraftObjCommand::RemoveReKey {
                 content_id,
                 recipient_did,
                 reply_tx,
@@ -1349,7 +1349,7 @@ impl CraftOBJHandler {
 
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::GetAccessList {
+            command_tx.send(CraftObjCommand::GetAccessList {
                 content_id,
                 reply_tx,
             }).map_err(|e| e.to_string())?;
@@ -1406,7 +1406,7 @@ impl CraftOBJHandler {
         // 1. Revoke: tombstone the old re-key
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::RemoveReKey {
+            command_tx.send(CraftObjCommand::RemoveReKey {
                 content_id,
                 recipient_did: revoked_bytes,
                 reply_tx,
@@ -1431,7 +1431,7 @@ impl CraftOBJHandler {
             // Store re-keys for remaining users
             for (entry, _re_enc) in &revocation.re_grants {
                 let (reply_tx, reply_rx) = oneshot::channel();
-                command_tx.send(CraftOBJCommand::PutReKey {
+                command_tx.send(CraftObjCommand::PutReKey {
                     content_id: revocation.new_content_id,
                     entry: entry.clone(),
                     reply_tx,
@@ -1446,7 +1446,7 @@ impl CraftOBJHandler {
                     .map_err(|e| e.to_string())?
             };
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::AnnounceProvider {
+            command_tx.send(CraftObjCommand::AnnounceProvider {
                 content_id: revocation.new_content_id,
                 manifest,
                 reply_tx,
@@ -1490,7 +1490,7 @@ impl CraftOBJHandler {
 
         let command_tx = self.command_tx.as_ref().ok_or("no command channel")?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        command_tx.send(CraftOBJCommand::ResolveProviders { content_id: cid, reply_tx: tx })
+        command_tx.send(CraftObjCommand::ResolveProviders { content_id: cid, reply_tx: tx })
             .map_err(|e| format!("send error: {e}"))?;
         let providers = rx.await.map_err(|e| format!("recv error: {e}"))??;
         Ok(serde_json::json!({
@@ -1563,7 +1563,7 @@ impl CraftOBJHandler {
         // Publish to DHT
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftOBJCommand::PublishRemoval {
+            command_tx.send(CraftObjCommand::PublishRemoval {
                 content_id,
                 notice: notice.clone(),
                 reply_tx,
@@ -2409,7 +2409,7 @@ fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
-impl IpcHandler for CraftOBJHandler {
+impl IpcHandler for CraftObjHandler {
     fn handle(
         &self,
         method: &str,

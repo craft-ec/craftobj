@@ -1,6 +1,6 @@
-//! CraftOBJ Store
+//! CraftObj Store
 //!
-//! Filesystem content-addressed storage for CraftOBJ.
+//! Filesystem content-addressed storage for CraftObj.
 //!
 //! Layout:
 //! ```text

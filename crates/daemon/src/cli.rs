@@ -1,4 +1,4 @@
-//! CraftOBJ CLI — connects to a running daemon via IPC
+//! CraftObj CLI — connects to a running daemon via IPC
 //!
 //! Usage:
 //!   craftobj-cli [--socket <PATH>] <COMMAND> [ARGS...]
@@ -18,7 +18,7 @@ use craftec_ipc::IpcClient;
 use craftobj_daemon::service;
 
 fn usage() -> ! {
-    eprintln!("CraftOBJ CLI");
+    eprintln!("CraftObj CLI");
     eprintln!();
     eprintln!("Usage: craftobj-cli [--socket <PATH>] <COMMAND> [ARGS...]");
     eprintln!();

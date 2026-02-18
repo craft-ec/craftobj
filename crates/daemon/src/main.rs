@@ -1,4 +1,4 @@
-//! CraftOBJ Daemon entry point
+//! CraftObj Daemon entry point
 //!
 //! Usage:
 //!   craftobj-daemon [OPTIONS]
@@ -51,7 +51,7 @@ fn parse_args() -> (String, std::path::PathBuf, String, String, u16, Option<std:
                 if i < args.len() { config_path = Some(std::path::PathBuf::from(&args[i])); }
             }
             "--help" | "-h" => {
-                eprintln!("CraftOBJ Daemon");
+                eprintln!("CraftObj Daemon");
                 eprintln!();
                 eprintln!("Usage: craftobj-daemon [OPTIONS]");
                 eprintln!();
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_pubkey_hex = hex::encode(node_signing_key.public_key_bytes());
 
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
-    eprintln!("║  CraftOBJ Daemon                                          ║");
+    eprintln!("║  CraftObj Daemon                                          ║");
     eprintln!("╠══════════════════════════════════════════════════════════════╣");
     eprintln!("║  Peer ID:    {}  ║", &peer_id.to_string()[..46]);
     eprintln!("║  Pubkey:     {:<47}║", &node_pubkey_hex[..46]);
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info!("CraftOBJ daemon starting with peer ID {}", peer_id);
+    info!("CraftObj daemon starting with peer ID {}", peer_id);
 
     // Convert craftec SigningKeypair to ed25519_dalek SigningKey
     let dalek_key = ed25519_dalek::SigningKey::from_bytes(&node_signing_key.secret_key_bytes());

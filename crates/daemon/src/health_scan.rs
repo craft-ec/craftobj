@@ -17,7 +17,7 @@ use libp2p::PeerId;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::commands::CraftOBJCommand;
+use crate::commands::CraftObjCommand;
 use crate::piece_map::PieceMap;
 use crate::scaling::DemandSignalTracker;
 
@@ -76,7 +76,7 @@ pub struct HealthScan {
     demand_tracker: Arc<Mutex<DemandSignalTracker>>,
     local_peer_id: PeerId,
     tier_target: f64,
-    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     scan_interval: Duration,
     data_dir: Option<PathBuf>,
     /// Cache of last-known Merkle roots from providers, keyed by (peer, cid).
@@ -90,7 +90,7 @@ impl HealthScan {
         store: Arc<Mutex<FsStore>>,
         demand_tracker: Arc<Mutex<DemandSignalTracker>>,
         local_peer_id: PeerId,
-        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+        command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Self {
         Self {
             piece_map,
@@ -187,7 +187,7 @@ impl HealthScan {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .command_tx
-            .send(CraftOBJCommand::ResolveProviders {
+            .send(CraftObjCommand::ResolveProviders {
                 content_id: cid,
                 reply_tx: tx,
             })
@@ -225,9 +225,9 @@ impl HealthScan {
         content_id: ContentId,
         known_root: Option<[u8; 32]>,
     ) -> Option<MerklePullResponse> {
-        // TODO: Wire via CraftOBJCommand::MerklePull or a new request-response protocol.
+        // TODO: Wire via CraftObjCommand::MerklePull or a new request-response protocol.
         // For now, return None to skip all remote pulls.
-        // When wired, add a `MerklePull` variant to CraftOBJCommand:
+        // When wired, add a `MerklePull` variant to CraftObjCommand:
         //
         //   MerklePull {
         //       peer_id: PeerId,
@@ -511,7 +511,7 @@ impl HealthScan {
                     map.apply_event(&event);
                     // Publish DHT provider record for this CID+segment
                     let pkey = craftobj_routing::provider_key(&cid, segment);
-                    let _ = self.command_tx.send(CraftOBJCommand::StartProviding { key: pkey });
+                    let _ = self.command_tx.send(CraftObjCommand::StartProviding { key: pkey });
                     info!(
                         "HealthScan repair complete for {}/seg{}: generated 1 new piece",
                         cid, segment
@@ -662,7 +662,7 @@ mod tests {
     use super::*;
     use craftobj_core::{ContentId, PieceEvent, PieceStored};
 
-    fn make_tx() -> mpsc::UnboundedSender<CraftOBJCommand> {
+    fn make_tx() -> mpsc::UnboundedSender<CraftObjCommand> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
     }
@@ -833,11 +833,11 @@ mod tests {
 
     /// Spawn a task that drains the command channel, replying with empty results
     /// so that resolve_providers doesn't hang in tests.
-    fn drain_commands(mut rx: mpsc::UnboundedReceiver<CraftOBJCommand>) {
+    fn drain_commands(mut rx: mpsc::UnboundedReceiver<CraftObjCommand>) {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    CraftOBJCommand::ResolveProviders { reply_tx, .. } => {
+                    CraftObjCommand::ResolveProviders { reply_tx, .. } => {
                         let _ = reply_tx.send(Ok(vec![]));
                     }
                     _ => {}

@@ -1,4 +1,4 @@
-//! Wire framing for persistent CraftOBJ streams.
+//! Wire framing for persistent CraftObj streams.
 //!
 //! Wire format: `[seq_id: u64 BE][type: u8][len: u32 BE][payload: bytes]`
 //!
@@ -8,7 +8,7 @@ use std::io;
 
 use futures::prelude::*;
 
-use crate::{CraftOBJRequest, CraftOBJResponse, PieceMapEntry, PiecePayload};
+use crate::{CraftObjRequest, CraftObjResponse, PieceMapEntry, PiecePayload};
 use craftobj_core::{ContentId, WireStatus};
 
 // Type discriminants (matching existing codec)
@@ -27,16 +27,16 @@ const MAX_FRAME_PAYLOAD: usize = 50 * 1024 * 1024;
 #[derive(Debug)]
 pub enum StreamFrame {
     /// A request message from the peer.
-    Request { seq_id: u64, request: CraftOBJRequest },
+    Request { seq_id: u64, request: CraftObjRequest },
     /// A response message from the peer.
-    Response { seq_id: u64, response: CraftOBJResponse },
+    Response { seq_id: u64, response: CraftObjResponse },
 }
 
 /// Write a request frame: `[seq_id:8][type:1][len:4][payload]` + flush.
 pub async fn write_request_frame<T: AsyncWrite + Unpin>(
     io: &mut T,
     seq_id: u64,
-    request: &CraftOBJRequest,
+    request: &CraftObjRequest,
 ) -> io::Result<()> {
     let (msg_type, payload) = serialize_request(request)?;
     write_raw_frame(io, seq_id, msg_type, &payload).await
@@ -46,7 +46,7 @@ pub async fn write_request_frame<T: AsyncWrite + Unpin>(
 pub async fn write_response_frame<T: AsyncWrite + Unpin>(
     io: &mut T,
     seq_id: u64,
-    response: &CraftOBJResponse,
+    response: &CraftObjResponse,
 ) -> io::Result<()> {
     let (msg_type, payload) = serialize_response(response)?;
     write_raw_frame(io, seq_id, msg_type, &payload).await
@@ -129,9 +129,9 @@ async fn write_raw_frame<T: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn serialize_request(request: &CraftOBJRequest) -> io::Result<(u8, Vec<u8>)> {
+fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
     match request {
-        CraftOBJRequest::PieceSync { content_id, segment_index, merkle_root, have_pieces, max_pieces } => {
+        CraftObjRequest::PieceSync { content_id, segment_index, merkle_root, have_pieces, max_pieces } => {
             let inner = PieceSyncWire {
                 content_id: *content_id,
                 segment_index: *segment_index,
@@ -143,7 +143,7 @@ fn serialize_request(request: &CraftOBJRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_SYNC, payload))
         }
-        CraftOBJRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
+        CraftObjRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
             let inner = PiecePushWire {
                 content_id: *content_id,
                 segment_index: *segment_index,
@@ -155,7 +155,7 @@ fn serialize_request(request: &CraftOBJRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_PUSH, payload))
         }
-        CraftOBJRequest::ManifestPush { content_id, manifest_json } => {
+        CraftObjRequest::ManifestPush { content_id, manifest_json } => {
             let inner = ManifestPushWire {
                 content_id: *content_id,
                 manifest_json: manifest_json.clone(),
@@ -164,7 +164,7 @@ fn serialize_request(request: &CraftOBJRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_MANIFEST_PUSH, payload))
         }
-        CraftOBJRequest::PieceMapQuery { content_id, segment_index } => {
+        CraftObjRequest::PieceMapQuery { content_id, segment_index } => {
             let inner = PieceMapQueryWire {
                 content_id: *content_id,
                 segment_index: *segment_index,
@@ -176,12 +176,12 @@ fn serialize_request(request: &CraftOBJRequest) -> io::Result<(u8, Vec<u8>)> {
     }
 }
 
-fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftOBJRequest> {
+fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjRequest> {
     match msg_type {
         TYPE_PIECE_SYNC => {
             let inner: PieceSyncWire = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJRequest::PieceSync {
+            Ok(CraftObjRequest::PieceSync {
                 content_id: inner.content_id,
                 segment_index: inner.segment_index,
                 merkle_root: inner.merkle_root,
@@ -192,7 +192,7 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftOBJReque
         TYPE_PIECE_PUSH => {
             let inner: PiecePushWire = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJRequest::PiecePush {
+            Ok(CraftObjRequest::PiecePush {
                 content_id: inner.content_id,
                 segment_index: inner.segment_index,
                 piece_id: inner.piece_id,
@@ -203,7 +203,7 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftOBJReque
         TYPE_MANIFEST_PUSH => {
             let inner: ManifestPushWire = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJRequest::ManifestPush {
+            Ok(CraftObjRequest::ManifestPush {
                 content_id: inner.content_id,
                 manifest_json: inner.manifest_json,
             })
@@ -211,7 +211,7 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftOBJReque
         TYPE_PIECE_MAP_QUERY => {
             let inner: PieceMapQueryWire = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJRequest::PieceMapQuery {
+            Ok(CraftObjRequest::PieceMapQuery {
                 content_id: inner.content_id,
                 segment_index: inner.segment_index,
             })
@@ -223,19 +223,19 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftOBJReque
     }
 }
 
-fn serialize_response(response: &CraftOBJResponse) -> io::Result<(u8, Vec<u8>)> {
+fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> {
     match response {
-        CraftOBJResponse::PieceBatch { pieces } => {
+        CraftObjResponse::PieceBatch { pieces } => {
             let payload = bincode::serialize(pieces)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_BATCH, payload))
         }
-        CraftOBJResponse::Ack { status } => {
+        CraftObjResponse::Ack { status } => {
             let payload = bincode::serialize(status)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_ACK, payload))
         }
-        CraftOBJResponse::PieceMapEntries { entries } => {
+        CraftObjResponse::PieceMapEntries { entries } => {
             let payload = bincode::serialize(entries)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_MAP_ENTRIES, payload))
@@ -243,22 +243,22 @@ fn serialize_response(response: &CraftOBJResponse) -> io::Result<(u8, Vec<u8>)> 
     }
 }
 
-fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftOBJResponse> {
+fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResponse> {
     match msg_type {
         TYPE_PIECE_BATCH => {
             let pieces: Vec<PiecePayload> = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJResponse::PieceBatch { pieces })
+            Ok(CraftObjResponse::PieceBatch { pieces })
         }
         TYPE_ACK => {
             let status: WireStatus = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJResponse::Ack { status })
+            Ok(CraftObjResponse::Ack { status })
         }
         TYPE_PIECE_MAP_ENTRIES => {
             let entries: Vec<PieceMapEntry> = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftOBJResponse::PieceMapEntries { entries })
+            Ok(CraftObjResponse::PieceMapEntries { entries })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -306,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_frame_roundtrip() {
-        let req = CraftOBJRequest::PieceSync {
+        let req = CraftObjRequest::PieceSync {
             content_id: ContentId::from_bytes(b"test"),
             segment_index: 3,
             merkle_root: [0xAB; 32],
@@ -324,7 +324,7 @@ mod tests {
             StreamFrame::Request { seq_id, request } => {
                 assert_eq!(seq_id, 42);
                 match request {
-                    CraftOBJRequest::PieceSync { segment_index, max_pieces, .. } => {
+                    CraftObjRequest::PieceSync { segment_index, max_pieces, .. } => {
                         assert_eq!(segment_index, 3);
                         assert_eq!(max_pieces, 10);
                     }
@@ -337,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_response_frame_roundtrip() {
-        let resp = CraftOBJResponse::Ack { status: WireStatus::Ok };
+        let resp = CraftObjResponse::Ack { status: WireStatus::Ok };
 
         let mut buf = Vec::new();
         write_response_frame(&mut futures::io::Cursor::new(&mut buf), 99, &resp)
@@ -349,7 +349,7 @@ mod tests {
             StreamFrame::Response { seq_id, response } => {
                 assert_eq!(seq_id, 99);
                 match response {
-                    CraftOBJResponse::Ack { status } => {
+                    CraftObjResponse::Ack { status } => {
                         assert_eq!(status as u8, WireStatus::Ok as u8);
                     }
                     _ => panic!("wrong variant"),

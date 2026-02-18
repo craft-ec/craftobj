@@ -1,6 +1,6 @@
-//! CraftOBJ Transfer
+//! CraftObj Transfer
 //!
-//! Piece exchange protocol for CraftOBJ using RLNC coding.
+//! Piece exchange protocol for CraftObj using RLNC coding.
 //!
 //! Protocol: `/craftobj/transfer/3.0.0`
 //!
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 // Request / Response types for request_response
 // ========================================================================
 
-/// A request in the CraftOBJ transfer protocol.
+/// A request in the CraftObj transfer protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CraftObjRequest {
     /// Fetch pieces for a segment. Peer sends pieces NOT in `have_pieces`.
@@ -75,9 +75,9 @@ pub struct PieceMapEntry {
     pub coefficients: Vec<u8>,
 }
 
-/// A response in the CraftOBJ transfer protocol.
+/// A response in the CraftObj transfer protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CraftOBJResponse {
+pub enum CraftObjResponse {
     /// Response to PieceSync: batch of pieces the peer has that we don't.
     PieceBatch { pieces: Vec<PiecePayload> },
     /// Ack for PiecePush or ManifestPush.
@@ -92,21 +92,21 @@ mod tests {
 
     #[test]
     fn test_request_variants() {
-        let _sync = CraftOBJRequest::PieceSync {
+        let _sync = CraftObjRequest::PieceSync {
             content_id: ContentId::from_bytes(b"test"),
             segment_index: 0,
             merkle_root: [0; 32],
             have_pieces: vec![],
             max_pieces: 10,
         };
-        let _push = CraftOBJRequest::PiecePush {
+        let _push = CraftObjRequest::PiecePush {
             content_id: ContentId::from_bytes(b"test"),
             segment_index: 0,
             piece_id: [0; 32],
             coefficients: vec![],
             data: vec![],
         };
-        let _manifest = CraftOBJRequest::ManifestPush {
+        let _manifest = CraftObjRequest::ManifestPush {
             content_id: ContentId::from_bytes(b"test"),
             manifest_json: vec![],
         };
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_response_variants() {
-        let _batch = CraftOBJResponse::PieceBatch { pieces: vec![] };
-        let _ack = CraftOBJResponse::Ack { status: WireStatus::Ok };
+        let _batch = CraftObjResponse::PieceBatch { pieces: vec![] };
+        let _ack = CraftObjResponse::Ack { status: WireStatus::Ok };
     }
 }

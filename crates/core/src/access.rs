@@ -57,24 +57,24 @@ impl AccessList {
     /// Verify the creator's signature.
     pub fn verify(&self) -> Result<()> {
         let verifying_key = VerifyingKey::from_bytes(&self.creator_did)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("invalid creator key: {e}")))?;
+            .map_err(|e| CraftObjError::EncryptionError(format!("invalid creator key: {e}")))?;
         let sig = Signature::from_slice(&self.signature)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("invalid signature: {e}")))?;
+            .map_err(|e| CraftObjError::EncryptionError(format!("invalid signature: {e}")))?;
         verifying_key
             .verify(&self.signable_data(), &sig)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("signature verification failed: {e}")))
+            .map_err(|e| CraftObjError::EncryptionError(format!("signature verification failed: {e}")))
     }
 
     /// Serialize for DHT storage.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(self)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("serialization failed: {e}")))
+            .map_err(|e| CraftObjError::EncryptionError(format!("serialization failed: {e}")))
     }
 
     /// Deserialize from DHT storage.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         bincode::deserialize(data)
-            .map_err(|e| CraftOBJError::EncryptionError(format!("deserialization failed: {e}")))
+            .map_err(|e| CraftObjError::EncryptionError(format!("deserialization failed: {e}")))
     }
 }
 
@@ -98,7 +98,7 @@ fn ed25519_to_x25519_public(verifying_key: &VerifyingKey) -> Result<X25519Public
     let compressed = CompressedEdwardsY(verifying_key.to_bytes());
     let edwards = compressed
         .decompress()
-        .ok_or_else(|| CraftOBJError::EncryptionError("invalid ed25519 public key".into()))?;
+        .ok_or_else(|| CraftObjError::EncryptionError("invalid ed25519 public key".into()))?;
     let montgomery = edwards.to_montgomery();
     Ok(X25519PublicKey::from(montgomery.to_bytes()))
 }
@@ -123,7 +123,7 @@ pub fn grant_access(
     let sym_key = Sha256::digest(shared_secret.as_bytes());
 
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
@@ -131,7 +131,7 @@ pub fn grant_access(
 
     let ciphertext = cipher
         .encrypt(nonce, content_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
 
     // Pack: [ephemeral_pubkey:32][nonce:12][ciphertext]
     let mut encrypted_key = Vec::with_capacity(32 + 12 + ciphertext.len());
@@ -153,7 +153,7 @@ pub fn decrypt_access_entry(
     recipient_keypair: &SigningKey,
 ) -> Result<Vec<u8>> {
     if entry.encrypted_key.len() < 32 + 12 + 16 {
-        return Err(CraftOBJError::EncryptionError("encrypted key too short".into()));
+        return Err(CraftObjError::EncryptionError("encrypted key too short".into()));
     }
 
     let ephemeral_pubkey = X25519PublicKey::from({
@@ -169,12 +169,12 @@ pub fn decrypt_access_entry(
     let sym_key = Sha256::digest(shared_secret.as_bytes());
 
     let cipher = ChaCha20Poly1305::new_from_slice(&sym_key)
-        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftObjError::EncryptionError(e.to_string()))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|e| CraftOBJError::EncryptionError(format!("decryption failed: {e}")))
+        .map_err(|e| CraftObjError::EncryptionError(format!("decryption failed: {e}")))
 }
 
 /// Create a signed AccessList for a content item.

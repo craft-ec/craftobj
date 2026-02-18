@@ -1,6 +1,6 @@
-//! CraftOBJ Core
+//! CraftObj Core
 //!
-//! Content types and protocol primitives for CraftOBJ:
+//! Content types and protocol primitives for CraftObj:
 //! content-addressed distributed storage with RLNC erasure coding.
 
 pub mod access;
@@ -319,7 +319,7 @@ impl StorageReceipt {
     }
 }
 
-/// Wire protocol magic bytes: "COBJ" (CraftOBJ)
+/// Wire protocol magic bytes: "COBJ" (CraftObj)
 pub const WIRE_MAGIC: [u8; 4] = [0x43, 0x4F, 0x42, 0x4A];
 
 /// Transfer stream protocol ID.
@@ -500,7 +500,7 @@ pub struct DemandSignal {
     pub timestamp: u64,
 }
 
-/// Capabilities a CraftOBJ node can declare.
+/// Capabilities a CraftObj node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CraftObjCapability {
     /// Publishes and fetches content.
