@@ -14,7 +14,7 @@ use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::stream_manager::{StreamManager, InboundMessage, OutboundMessage, transfer_stream_protocol};
+use crate::stream_manager::{StreamManager, InboundMessage, OutboundMessage};
 
 use crate::behaviour::{build_craftobj_swarm, CraftObjBehaviourEvent, CraftObjSwarm};
 use crate::commands::CraftObjCommand;
@@ -1216,6 +1216,76 @@ async fn handle_incoming_transfer_request(
             debug!("[service.rs] Returning {} PieceMap entries for {}/seg{}", entries.len(), content_id, segment_index);
             CraftObjResponse::PieceMapEntries { entries }
         }
+        CraftObjRequest::MerkleRoot { content_id, segment_index } => {
+            info!("[service.rs] Handling MerkleRoot from {} for {}/seg{}", peer, content_id, segment_index);
+            
+            // Get pieces for this segment from local store and build response
+            let store_guard = store.lock().await;
+            let pieces = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
+            
+            if pieces.is_empty() {
+                // No pieces for this segment, return empty root
+                let empty_root = craftobj_store::merkle::StorageMerkleTree::new().root();
+                CraftObjResponse::MerkleRootResponse { 
+                    root: empty_root, 
+                    leaf_count: 0 
+                }
+            } else {
+                // Build merkle tree from our pieces for this segment
+                let mut tree = craftobj_store::merkle::StorageMerkleTree::new();
+                for piece_id in &pieces {
+                    tree.insert(&content_id, segment_index, piece_id);
+                }
+                CraftObjResponse::MerkleRootResponse { 
+                    root: tree.root(), 
+                    leaf_count: pieces.len() as u32 
+                }
+            }
+        }
+        CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
+            info!("[service.rs] Handling MerkleDiff from {} for {}/seg{} since {}", peer, content_id, segment_index, hex::encode(&since_root[..8]));
+            
+            // Get current pieces for this segment
+            let store_guard = store.lock().await;
+            let pieces = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
+            
+            // Build current merkle tree
+            let mut current_tree = craftobj_store::merkle::StorageMerkleTree::new();
+            for piece_id in &pieces {
+                current_tree.insert(&content_id, segment_index, piece_id);
+            }
+            let current_root = current_tree.root();
+            
+            // If roots are the same, no changes
+            if current_root == since_root {
+                CraftObjResponse::MerkleDiffResponse {
+                    current_root,
+                    added: vec![],
+                    removed: vec![],
+                }
+            } else {
+                // For now, we don't have a way to reconstruct the old tree state from just the root.
+                // This would require either maintaining historical tree states or a more sophisticated diff protocol.
+                // As a simplified implementation, we'll return all current pieces as "added".
+                // A proper implementation would need to maintain tree history or use a different diff approach.
+                let mut added = Vec::new();
+                let peer_bytes = peer.to_bytes();
+                for piece_id in pieces {
+                    if let Ok((_, coefficients)) = store_guard.get_piece(&content_id, segment_index, &piece_id) {
+                        added.push(craftobj_transfer::PieceMapEntry {
+                            node: peer_bytes.to_vec(),
+                            piece_id,
+                            coefficients,
+                        });
+                    }
+                }
+                CraftObjResponse::MerkleDiffResponse {
+                    current_root,
+                    added,
+                    removed: vec![], // Can't compute removals without old state
+                }
+            }
+        }
     }
 }
 
@@ -1518,6 +1588,82 @@ async fn handle_command(
         CraftObjCommand::TriggerDistribution => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("TriggerDistribution should be intercepted in drive_swarm");
+        }
+
+        CraftObjCommand::MerkleRoot { peer_id, content_id, segment_index, reply_tx } => {
+            debug!("Handling MerkleRoot command: {}/{} from {}", content_id, segment_index, peer_id);
+            let request = craftobj_transfer::CraftObjRequest::MerkleRoot {
+                content_id,
+                segment_index,
+            };
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
+            tokio::spawn(async move {
+                if tx.send(msg).await.is_err() {
+                    warn!("[service.rs] MerkleRoot to {}: outbound channel closed", peer_id);
+                    let _ = reply_tx.send(None);
+                    return;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+                    Ok(Ok(craftobj_transfer::CraftObjResponse::MerkleRootResponse { root, leaf_count })) => {
+                        let _ = reply_tx.send(Some((root, leaf_count)));
+                    }
+                    Ok(Ok(other)) => {
+                        warn!("[service.rs] MerkleRoot to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
+                        let _ = reply_tx.send(None);
+                    }
+                    Ok(Err(_)) => {
+                        warn!("[service.rs] MerkleRoot to {}: ack channel closed", peer_id);
+                        let _ = reply_tx.send(None);
+                    }
+                    Err(_) => {
+                        warn!("[service.rs] MerkleRoot to {}: timed out after 10s", peer_id);
+                        let _ = reply_tx.send(None);
+                    }
+                }
+            });
+        }
+
+        CraftObjCommand::MerkleDiff { peer_id, content_id, segment_index, since_root, reply_tx } => {
+            debug!("Handling MerkleDiff command: {}/{} from {} since {}", content_id, segment_index, peer_id, hex::encode(&since_root[..8]));
+            let request = craftobj_transfer::CraftObjRequest::MerkleDiff {
+                content_id,
+                segment_index,
+                since_root,
+            };
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
+            tokio::spawn(async move {
+                if tx.send(msg).await.is_err() {
+                    warn!("[service.rs] MerkleDiff to {}: outbound channel closed", peer_id);
+                    let _ = reply_tx.send(None);
+                    return;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+                    Ok(Ok(craftobj_transfer::CraftObjResponse::MerkleDiffResponse { current_root, added, removed })) => {
+                        let result = crate::commands::MerkleDiffResult {
+                            current_root,
+                            added,
+                            removed,
+                        };
+                        let _ = reply_tx.send(Some(result));
+                    }
+                    Ok(Ok(other)) => {
+                        warn!("[service.rs] MerkleDiff to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
+                        let _ = reply_tx.send(None);
+                    }
+                    Ok(Err(_)) => {
+                        warn!("[service.rs] MerkleDiff to {}: ack channel closed", peer_id);
+                        let _ = reply_tx.send(None);
+                    }
+                    Err(_) => {
+                        warn!("[service.rs] MerkleDiff to {}: timed out after 10s", peer_id);
+                        let _ = reply_tx.send(None);
+                    }
+                }
+            });
         }
     }
 }
