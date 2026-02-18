@@ -117,4 +117,8 @@ pub enum DataCraftCommand {
     BroadcastGoingOffline {
         data: Vec<u8>,
     },
+    /// Broadcast a PieceEvent via gossipsub on PIECE_EVENTS_TOPIC.
+    BroadcastPieceEvent {
+        event_data: Vec<u8>,
+    },
 }

@@ -262,6 +262,12 @@ pub async fn run_daemon_with_config(
     {
         error!("Failed to subscribe to scaling topic: {:?}", e);
     }
+    if let Err(e) = swarm
+        .behaviour_mut().craft
+        .subscribe_topic(datacraft_core::PIECE_EVENTS_TOPIC)
+    {
+        error!("Failed to subscribe to piece events topic: {:?}", e);
+    }
 
     // Peer scorer — tracks capabilities and reliability
     let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
@@ -417,6 +423,50 @@ pub async fn run_daemon_with_config(
     handler.set_challenger(challenger_mgr.clone());
     handler.set_local_peer_id(local_peer_id);
     handler.set_demand_signal_tracker(demand_signal_tracker.clone());
+
+    // PieceMap — event-sourced materialized view of piece locations
+    let piece_map = {
+        let mut pm = crate::piece_map::PieceMap::new(local_peer_id);
+        // Initialize from local store: scan all local pieces and record them
+        let local_node_bytes = local_peer_id.to_bytes().to_vec();
+        if let Ok(store_guard) = client.try_lock() {
+            if let Ok(cids) = store_guard.store().list_content_with_pieces() {
+                for cid in cids {
+                    if let Ok(segments) = store_guard.store().list_segments(&cid) {
+                        for seg in segments {
+                            if let Ok(pieces) = store_guard.store().list_pieces(&cid, seg) {
+                                for pid in pieces {
+                                    if let Ok((_data, coefficients)) = store_guard.store().get_piece(&cid, seg, &pid) {
+                                        let seq = pm.next_seq();
+                                        let event = datacraft_core::PieceEvent::Stored(datacraft_core::PieceStored {
+                                            node: local_node_bytes.clone(),
+                                            cid,
+                                            segment: seg,
+                                            piece_id: pid,
+                                            coefficients,
+                                            seq,
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            signature: vec![], // Local init, no need to sign
+                                        });
+                                        pm.apply_event(&event);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            info!("[service.rs] PieceMap initialized with {} CIDs from local store", pm.all_cids().len());
+        } else {
+            warn!("[service.rs] Could not lock client for PieceMap initialization");
+        }
+        Arc::new(Mutex::new(pm))
+    };
+
+    handler.set_piece_map(piece_map.clone());
     let handler = Arc::new(handler);
 
     // Load or generate API key for WebSocket authentication
@@ -496,7 +546,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone(), piece_map.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
@@ -521,13 +571,13 @@ pub async fn run_daemon_with_config(
         _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone(), content_tracker.clone()) => {
             info!("[service.rs] Scaling maintenance loop ended");
         }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone()) => {
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), piece_map.clone(), command_tx.clone()) => {
             info!("[service.rs] Eviction maintenance loop ended");
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
             info!("[service.rs] Aggregation loop ended");
         }
-        _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes) => {
+        _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes, piece_map.clone(), command_tx.clone()) => {
             info!("[service.rs] GC loop ended");
         }
         _ = content_health_loop(content_tracker.clone(), store.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
@@ -594,6 +644,8 @@ async fn eviction_maintenance_loop(
     event_tx: EventSender,
     pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
+    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
+    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
 ) {
     use std::time::Duration;
     const DISK_SPACE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
@@ -648,6 +700,40 @@ async fn eviction_maintenance_loop(
             &segment_ranks_by_cid,
         );
 
+        // Emit PieceDropped events for all evicted/retired content
+        {
+            let mut map = piece_map.lock().await;
+            let local_node = map.local_node().to_vec();
+            let all_removed: Vec<_> = result.evicted.iter().map(|(cid, _)| *cid)
+                .chain(result.retired.iter().map(|(cid, _)| *cid))
+                .collect();
+            for cid in &all_removed {
+                // Content already deleted by eviction manager; emit drops from PieceMap state
+                // We can't list pieces from store anymore, so remove from PieceMap by querying it
+                let pieces: Vec<(u32, [u8; 32])> = map.pieces_for_cid_local(cid);
+                for (seg, pid) in pieces {
+                    let seq = map.next_seq();
+                    let dropped = datacraft_core::PieceDropped {
+                        node: local_node.clone(),
+                        cid: *cid,
+                        segment: seg,
+                        piece_id: pid,
+                        seq,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        signature: vec![],
+                    };
+                    let event = datacraft_core::PieceEvent::Dropped(dropped);
+                    map.apply_event(&event);
+                    if let Ok(data) = bincode::serialize(&event) {
+                        let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
+                    }
+                }
+            }
+        }
+
         for (cid, reason) in &result.evicted {
             let _ = event_tx.send(DaemonEvent::ContentEvicted {
                 content_id: cid.to_hex(),
@@ -680,6 +766,8 @@ async fn gc_loop(
     event_tx: EventSender,
     gc_interval_secs: u64,
     _max_storage_bytes: u64,
+    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
+    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
 ) {
     use std::time::Duration;
 
@@ -738,6 +826,36 @@ async fn gc_loop(
                 continue; // Keep pinned, published, and storage provider content
             }
 
+            // Emit PieceDropped events before deletion
+            {
+                let segments = s.list_segments(cid).unwrap_or_default();
+                let mut map = piece_map.lock().await;
+                let local_node = map.local_node().to_vec();
+                for seg in segments {
+                    let pieces = s.list_pieces(cid, seg).unwrap_or_default();
+                    for pid in pieces {
+                        let seq = map.next_seq();
+                        let dropped = datacraft_core::PieceDropped {
+                            node: local_node.clone(),
+                            cid: *cid,
+                            segment: seg,
+                            piece_id: pid,
+                            seq,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            signature: vec![],
+                        };
+                        let event = datacraft_core::PieceEvent::Dropped(dropped);
+                        map.apply_event(&event);
+                        if let Ok(data) = bincode::serialize(&event) {
+                            let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
+                        }
+                    }
+                }
+            }
+
             // Unpinned, untracked content (fetched temporarily) -> delete
             if let Ok(()) = s.delete_content(cid) {
                 deleted_count += 1;
@@ -788,6 +906,7 @@ async fn drive_swarm(
     max_peer_connections: usize,
     degradation_coordinator: Arc<Mutex<crate::degradation::DegradationCoordinator>>,
     demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>,
+    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -958,8 +1077,9 @@ async fn drive_swarm(
                                 handle_gossipsub_removal(craft_event, &removal_cache, &event_tx).await;
                                 handle_gossipsub_storage_receipt(craft_event, &event_tx, &receipt_store).await;
                                 handle_gossipsub_repair(craft_event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
-                                handle_gossipsub_degradation(craft_event, &degradation_coordinator, &store_for_repair, &event_tx, &merkle_tree).await;
+                                handle_gossipsub_degradation(craft_event, &degradation_coordinator, &store_for_repair, &event_tx, &merkle_tree, &piece_map, &command_tx).await;
                                 handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker, &demand_signal_tracker).await;
+                                handle_gossipsub_piece_event(craft_event, &piece_map).await;
                                 // Handle Kademlia events for DHT queries
                                 if let craftec_network::behaviour::CraftBehaviourEvent::Kademlia(ref kad_event) = craft_event {
                                     protocol.handle_kademlia_event(kad_event).await;
@@ -1018,12 +1138,16 @@ async fn drive_swarm(
                 let ct_clone = content_tracker.clone();
                 let proto_clone = protocol.clone();
                 let dt_clone = demand_tracker.clone();
+                let pm_clone = piece_map.clone();
+                let sk_clone = signing_key.clone();
+                let cmd_tx_clone = command_tx.clone();
                 let peer = msg.peer;
                 let seq_id = msg.seq_id;
                 let mut stream = msg.stream;
                 tokio::spawn(async move {
                     let response = handle_incoming_transfer_request(
                         &peer, msg.request, &store_clone, &ct_clone, &proto_clone, &dt_clone,
+                        &pm_clone, sk_clone.as_ref(), &cmd_tx_clone,
                     ).await;
                     info!("[service.rs] Spawned handler done for {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
                     // Write response back on the SAME stream the request came from
@@ -1079,6 +1203,9 @@ async fn handle_incoming_transfer_request(
     _content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
     protocol: &Arc<DataCraftProtocol>,
     demand_tracker: &Arc<Mutex<crate::scaling::DemandTracker>>,
+    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
 ) -> DataCraftResponse {
     match request {
         DataCraftRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
@@ -1140,6 +1267,32 @@ async fn handle_incoming_transfer_request(
                     // Notify protocol of piece push for tracker update
                     if let Err(e) = protocol.event_tx.send(DataCraftEvent::PiecePushReceived { content_id }) {
                         debug!("Failed to send piece push event: {}", e);
+                    }
+                    // Emit PieceStored event to PieceMap and gossipsub
+                    {
+                        let mut map = piece_map.lock().await;
+                        let seq = map.next_seq();
+                        let mut stored = datacraft_core::PieceStored {
+                            node: map.local_node().to_vec(),
+                            cid: content_id,
+                            segment: segment_index,
+                            piece_id,
+                            coefficients: coefficients.clone(),
+                            seq,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            signature: vec![],
+                        };
+                        if let Some(key) = signing_key {
+                            stored.sign(key);
+                        }
+                        let event = datacraft_core::PieceEvent::Stored(stored);
+                        map.apply_event(&event);
+                        if let Ok(data) = bincode::serialize(&event) {
+                            let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
+                        }
                     }
                     DataCraftResponse::Ack { status: WireStatus::Ok }
                 }
@@ -1534,6 +1687,14 @@ async fn handle_command(
             }
         }
 
+        DataCraftCommand::BroadcastPieceEvent { event_data } => {
+            debug!("Broadcasting PieceEvent via gossipsub ({} bytes)", event_data.len());
+            if let Err(e) = swarm.behaviour_mut().craft
+                .publish_to_topic(datacraft_core::PIECE_EVENTS_TOPIC, event_data) {
+                warn!("[service.rs] Failed to broadcast PieceEvent via gossipsub: {:?}", e);
+            }
+        }
+
         DataCraftCommand::TriggerDistribution => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("TriggerDistribution should be intercepted in drive_swarm");
@@ -1788,6 +1949,8 @@ async fn handle_gossipsub_degradation(
     store: &Arc<Mutex<datacraft_store::FsStore>>,
     _event_tx: &EventSender,
     merkle_tree: &Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
+    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
+    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
 ) {
     use libp2p::gossipsub;
     use craftec_network::behaviour::CraftBehaviourEvent;
@@ -1810,6 +1973,8 @@ async fn handle_gossipsub_degradation(
                         let dc = degradation_coordinator.clone();
                         let st = store.clone();
                         let mt = merkle_tree.clone();
+                        let pm = piece_map.clone();
+                        let cmd_tx = command_tx.clone();
                         let cid = signal.content_id;
                         let seg = signal.segment_index;
                         drop(store_guard);
@@ -1819,7 +1984,28 @@ async fn handle_gossipsub_degradation(
                             let store_guard = st.lock().await;
                             let mut tree = mt.lock().await;
                             let mut coord = dc.lock().await;
-                            coord.execute_degradation(&store_guard, cid, seg, Some(&mut tree));
+                            if let Some(dropped_piece_id) = coord.execute_degradation(&store_guard, cid, seg, Some(&mut tree)) {
+                                // Emit PieceDropped event
+                                let mut map = pm.lock().await;
+                                let seq = map.next_seq();
+                                let dropped = datacraft_core::PieceDropped {
+                                    node: map.local_node().to_vec(),
+                                    cid,
+                                    segment: seg,
+                                    piece_id: dropped_piece_id,
+                                    seq,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    signature: vec![],
+                                };
+                                let event = datacraft_core::PieceEvent::Dropped(dropped);
+                                map.apply_event(&event);
+                                if let Ok(data) = bincode::serialize(&event) {
+                                    let _ = cmd_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
+                                }
+                            }
                         });
                     }
                 }
@@ -1917,6 +2103,39 @@ async fn handle_gossipsub_going_offline(
                     let _ = event_tx.send(DaemonEvent::PeerGoingOffline {
                         peer_id: propagation_source.to_string(),
                     });
+                }
+            }
+        }
+    }
+}
+
+/// Handle gossipsub piece events (PieceStored/PieceDropped).
+async fn handle_gossipsub_piece_event(
+    event: &craftec_network::behaviour::CraftBehaviourEvent,
+    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
+) {
+    use craftec_network::behaviour::CraftBehaviourEvent;
+    use libp2p::gossipsub;
+
+    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        message, ..
+    }) = event
+    {
+        let topic_str = message.topic.as_str();
+        if topic_str == datacraft_core::PIECE_EVENTS_TOPIC {
+            match bincode::deserialize::<datacraft_core::PieceEvent>(&message.data) {
+                Ok(piece_event) => {
+                    // TODO: verify signature (requires resolving PeerId → pubkey)
+                    // For now, apply the event to the PieceMap
+                    let mut map = piece_map.lock().await;
+                    map.apply_event(&piece_event);
+                    debug!(
+                        "Applied PieceEvent from gossipsub: seq={}",
+                        piece_event.seq(),
+                    );
+                }
+                Err(e) => {
+                    debug!("Failed to parse PieceEvent from gossipsub: {}", e);
                 }
             }
         }

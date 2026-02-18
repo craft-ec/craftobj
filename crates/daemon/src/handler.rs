@@ -203,6 +203,8 @@ pub struct DataCraftHandler {
     challenger: Option<Arc<Mutex<crate::challenger::ChallengerManager>>>,
     /// Demand signal tracker for content demand status.
     demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
+    /// PieceMap for event-sourced piece tracking.
+    piece_map: Option<Arc<Mutex<crate::piece_map::PieceMap>>>,
     /// Start time for uptime calculation.
     start_time: Instant,
 }
@@ -234,9 +236,14 @@ impl DataCraftHandler {
             merkle_tree: None,
             challenger: None,
             demand_signal_tracker: None,
+            piece_map: None,
             local_peer_id: None,
             start_time: Instant::now(),
         }
+    }
+
+    pub fn set_piece_map(&mut self, pm: Arc<Mutex<crate::piece_map::PieceMap>>) {
+        self.piece_map = Some(pm);
     }
 
     pub fn set_demand_signal_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>) {
@@ -309,8 +316,56 @@ impl DataCraftHandler {
             merkle_tree: None,
             challenger: None,
             demand_signal_tracker: None,
+            piece_map: None,
             local_peer_id: None,
             start_time: Instant::now(),
+        }
+    }
+
+    /// Emit PieceDropped events for all pieces of a CID (used when deleting content).
+    async fn emit_pieces_dropped_for_content(&self, cid: &datacraft_core::ContentId) {
+        if let Some(ref pm) = self.piece_map {
+            // Collect all local pieces for this CID from the store before deletion
+            let client = self.client.lock().await;
+            let segments = match client.store().list_segments(cid) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            drop(client);
+
+            let mut map = pm.lock().await;
+            let local_node = map.local_node().to_vec();
+            for seg in segments {
+                let pieces = {
+                    let client = self.client.lock().await;
+                    client.store().list_pieces(cid, seg).unwrap_or_default()
+                };
+                for pid in pieces {
+                    let seq = map.next_seq();
+                    let mut dropped = datacraft_core::PieceDropped {
+                        node: local_node.clone(),
+                        cid: *cid,
+                        segment: seg,
+                        piece_id: pid,
+                        seq,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        signature: vec![],
+                    };
+                    if let Some(ref key) = self.node_signing_key {
+                        dropped.sign(key);
+                    }
+                    let event = datacraft_core::PieceEvent::Dropped(dropped);
+                    map.apply_event(&event);
+                    if let Ok(data) = bincode::serialize(&event) {
+                        if let Some(ref tx) = self.command_tx {
+                            let _ = tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -921,6 +976,8 @@ impl DataCraftHandler {
             let client = self.client.clone();
             let peer_scorer = self.peer_scorer.clone();
             let merkle_tree = self.merkle_tree.clone();
+            let piece_map = self.piece_map.clone();
+            let signing_key = self.node_signing_key.clone();
             let command_tx = command_tx.clone();
             let cid = *content_id;
             let ranked_providers = ranked_providers.clone();
@@ -1040,6 +1097,32 @@ impl DataCraftHandler {
                                     Ok(()) => {
                                         if let Some(ref mt) = merkle_tree {
                                             mt.lock().await.insert(&cid, seg_idx, &piece_id);
+                                        }
+                                        // Emit PieceStored event
+                                        if let Some(ref pm) = piece_map {
+                                            let mut map = pm.lock().await;
+                                            let seq = map.next_seq();
+                                            let mut ps_event = datacraft_core::PieceStored {
+                                                node: map.local_node().to_vec(),
+                                                cid,
+                                                segment: seg_idx,
+                                                piece_id,
+                                                coefficients: coefficients.clone(),
+                                                seq,
+                                                timestamp: std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs(),
+                                                signature: vec![],
+                                            };
+                                            if let Some(ref key) = signing_key {
+                                                ps_event.sign(key);
+                                            }
+                                            let event = datacraft_core::PieceEvent::Stored(ps_event);
+                                            map.apply_event(&event);
+                                            if let Ok(data) = bincode::serialize(&event) {
+                                                let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
+                                            }
                                         }
                                         coeff_matrix.push(coefficients);
                                         current_rank = new_rank;
@@ -1412,6 +1495,9 @@ impl DataCraftHandler {
         let params = params.ok_or("missing params")?;
         let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
         let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+
+        // Emit PieceDropped events before deletion
+        self.emit_pieces_dropped_for_content(&content_id).await;
 
         // Delete pieces + manifest from local store
         {

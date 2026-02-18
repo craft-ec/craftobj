@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use datacraft_core::{ContentId, ContentManifest, PieceEvent, PieceStored, PieceDropped};
+use datacraft_core::{ContentId, ContentManifest, PieceEvent};
+#[cfg(test)]
+use datacraft_core::{PieceStored, PieceDropped};
 use libp2p::PeerId;
 
 /// Materialized view of piece locations across the network.
@@ -199,6 +201,14 @@ impl PieceMap {
         self.pieces.iter()
             .filter(|((_, c, s, _), _)| c == cid && *s == segment)
             .map(|((node, _, _, pid), coeff)| (node, pid, coeff))
+            .collect()
+    }
+
+    /// Get all local pieces for a CID: (segment, piece_id).
+    pub fn pieces_for_cid_local(&self, cid: &ContentId) -> Vec<(u32, [u8; 32])> {
+        self.pieces.keys()
+            .filter(|(node, c, _, _)| node == &self.local_node && c == cid)
+            .map(|(_, _, seg, pid)| (*seg, *pid))
             .collect()
     }
 
