@@ -146,13 +146,46 @@ Flow:
 3. Cross-verifies coefficient vectors from PieceMap against returned data
 4. Pass → StorageReceipt. Fail → mark provider, adjust trust.
 
-## Repair & Degradation
+## Repair & Degradation — Reactive, No Signals
 
-Same as current design, but health data comes from PieceMap instead of peer_scorer:
+No separate RepairSignal/DegradationSignal topics. Every node has the same PieceMap, so every node sees the same rank. Repair and degradation are **reactive** — triggered by PieceMap changes on the affected segment.
 
-- **Repair**: PieceMap shows rank < tier target → emit RepairSignal
-- **Degradation**: PieceMap shows rank > tier target AND no DemandSignal → emit DegradationSignal
-- Demand tracking unchanged (separate DemandSignal gossipsub topic)
+### On PieceDropped(cid, segment):
+
+```
+rank = compute_rank(cid, segment)  // from PieceMap, independence check
+if rank < tier_target AND i_hold_pieces(cid, segment, ≥2):
+    schedule_repair(cid, segment, random_delay 0.5s–10s)
+```
+
+During the delay, if a `PieceStored` arrives for that segment and rank recovers → cancel repair.
+
+### On PieceStored(cid, segment):
+
+```
+// Cancel pending repair if rank recovered
+if pending_repair(cid, segment) AND rank >= tier_target:
+    cancel_repair(cid, segment)
+
+// Check for degradation
+if rank > tier_target AND !has_demand(cid) AND i_hold_pieces(cid, segment, >2):
+    schedule_degradation(cid, segment, random_delay 0.5s–10s)
+```
+
+During the delay, if another `PieceDropped` arrives and rank drops to target → cancel degradation.
+
+### What This Eliminates
+
+- `RepairSignal`, `RepairAnnouncement`, `RepairMessage`, `REPAIR_TOPIC`
+- `DegradationSignal`, `DegradationAnnouncement`, `DegradationMessage`, `DEGRADATION_TOPIC`
+- `RepairCoordinator`, `DegradationCoordinator`
+- Challenger emitting repair/degradation signals
+
+All replaced by a single **HealthReactor** that watches PieceMap changes per-segment and schedules repair/degradation with random delay coordination. The PieceStored/PieceDropped events themselves serve as both signal and announcement — when you repair and store a new piece, the PieceStored event tells everyone the rank improved.
+
+### Demand Awareness
+
+DemandSignal stays as a separate gossipsub topic (`datacraft/scaling/1.0.0`). Degradation checks `DemandSignalTracker.has_recent_signal(cid)` before scheduling drops.
 
 ## Burst Handling
 
@@ -166,10 +199,25 @@ Initial distribution of a 35MB file = ~140 PieceStored events ≈ 30KB total. Go
 - False PieceStored without actual storage → PDP fail → no receipt → no earnings
 - False PieceDropped → node loses pieces from PieceMap → lower perceived contribution
 
+## What This Replaces (updated)
+
+| Current System | New System |
+|---|---|
+| Capability announcements with `piece_counts` | PieceStored/PieceDropped events |
+| `peer_scorer.piece_counts` | PieceMap materialized view |
+| Inventory requests in challenger | Read coefficient vectors from PieceMap |
+| `compute_network_health()` aggregating peer_scorer | Compute rank from PieceMap via independence checking |
+| Separate `StorageMerkleTree` | Derive from PieceMap (own pieces) |
+| Large gossipsub announcements (>1MB) | Tiny per-event messages (~200 bytes) |
+| RepairSignal/Announcement + RepairCoordinator | HealthReactor on PieceDropped |
+| DegradationSignal/Announcement + DegradationCoordinator | HealthReactor on PieceStored |
+| Challenger-driven repair/degradation | Every node reacts independently |
+
 ## Migration Path
 
-1. Implement PieceMap + events alongside current system
-2. Emit PieceStored/Dropped from existing store/drop paths
-3. Build PieceMap consumers (health, challenger, handler)
-4. Remove old announcement/inventory code
-5. Remove peer_scorer.piece_counts
+1. Implement PieceMap + PieceEvent types + gossipsub topic
+2. Emit PieceStored/Dropped from existing store/drop code paths
+3. Build HealthReactor (reactive repair/degradation on PieceMap changes)
+4. Update health computation to use PieceMap with independence checking
+5. Update handler/challenger to read from PieceMap
+6. Remove old systems: announcements, inventory requests, peer_scorer.piece_counts, RepairCoordinator, DegradationCoordinator, StorageMerkleTree
