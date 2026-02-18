@@ -1910,36 +1910,46 @@ impl DataCraftHandler {
 
     /// `content.list_detailed` — Enhanced list with health info per CID.
     async fn handle_content_list_detailed(&self) -> Result<Value, String> {
-        // Single lock on client for all CIDs — avoids re-locking per CID.
         let client = self.client.lock().await;
         let items = client.list().map_err(|e| e.to_string())?;
 
-        // Compute health inline while we hold the client lock.
-        // Uses per-segment k from manifest so last segment doesn't drag down health.
-        let mut cid_health: Vec<(datacraft_core::ContentId, usize, f64, u64)> = Vec::new();
+        // Collect local per-segment piece counts and manifests per CID
+        let mut cid_data: Vec<(datacraft_core::ContentId, Vec<usize>, Option<datacraft_core::ContentManifest>, u64)> = Vec::new();
         for item in &items {
             let manifest = client.store().get_manifest(&item.content_id).ok();
+            let seg_count = manifest.as_ref().map(|m| m.segment_count).unwrap_or(0);
+            let mut local_seg_pieces = vec![0usize; seg_count];
             let segments = client.store().list_segments(&item.content_id).unwrap_or_default();
-            let mut min_rank: Option<usize> = None;
-            let mut min_ratio: Option<f64> = None;
             for &seg in &segments {
                 let pieces = client.store().list_pieces(&item.content_id, seg).unwrap_or_default();
-                let rank = pieces.len();
-                min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
-                let seg_k = manifest.as_ref()
-                    .map(|m| m.k_for_segment(seg as usize))
-                    .unwrap_or(0);
-                if seg_k > 0 {
-                    let ratio = rank as f64 / seg_k as f64;
-                    min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
+                if (seg as usize) < seg_count {
+                    local_seg_pieces[seg as usize] = pieces.len();
                 }
             }
             let disk_usage = client.store().cid_disk_usage(&item.content_id);
-            cid_health.push((item.content_id, min_rank.unwrap_or(0), min_ratio.unwrap_or(0.0), disk_usage));
+            cid_data.push((item.content_id, local_seg_pieces, manifest, disk_usage));
         }
         drop(client);
 
-        // Now build the JSON response with tracker data.
+        // Aggregate network piece counts from peer_scorer (remote peers)
+        let network_pieces_map: std::collections::HashMap<String, Vec<usize>> = if let Some(ref scorer) = self.peer_scorer {
+            let ps = scorer.lock().await;
+            let mut map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+            for (_, peer_score) in ps.iter() {
+                for (cid_hex, seg_counts) in &peer_score.piece_counts {
+                    let entry = map.entry(cid_hex.clone()).or_default();
+                    for (i, &c) in seg_counts.iter().enumerate() {
+                        if i >= entry.len() { entry.resize(i + 1, 0); }
+                        entry[i] += c;
+                    }
+                }
+            }
+            map
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Tracker data
         let tracker_data: Option<Vec<_>> = if let Some(ref tracker) = self.content_tracker {
             let t = tracker.lock().await;
             Some(items.iter().map(|item| t.get(&item.content_id).cloned()).collect())
@@ -1949,15 +1959,57 @@ impl DataCraftHandler {
 
         let mut result = Vec::new();
         for (i, item) in items.iter().enumerate() {
-            let (_, min_rank, health_ratio, disk_usage) = &cid_health[i];
+            let (_, ref local_seg_pieces, ref manifest, disk_usage) = cid_data[i];
+            let cid_hex = item.content_id.to_hex();
+            let seg_count = manifest.as_ref().map(|m| m.segment_count).unwrap_or(0);
+
+            // Compute network health (local + remote pieces)
+            let remote_seg = network_pieces_map.get(&cid_hex);
+            let mut network_total: usize = 0;
+            let mut min_health: Option<f64> = None;
+            let local_total: usize = local_seg_pieces.iter().sum();
+            network_total += local_total;
+            if let Some(rs) = remote_seg {
+                network_total += rs.iter().sum::<usize>();
+            }
+
+            for seg_idx in 0..seg_count {
+                let seg_k = manifest.as_ref().map(|m| m.k_for_segment(seg_idx)).unwrap_or(0);
+                if seg_k == 0 { continue; }
+                let local = local_seg_pieces.get(seg_idx).copied().unwrap_or(0);
+                let remote = remote_seg.and_then(|r| r.get(seg_idx).copied()).unwrap_or(0);
+                let total = local + remote;
+                let ratio = total as f64 / seg_k as f64;
+                min_health = Some(min_health.map_or(ratio, |r: f64| r.min(ratio)));
+            }
+
+            let health_ratio = min_health.unwrap_or(0.0);
+
+            // Provider count: remote peers with pieces + self if local_total > 0
+            let mut provider_count = 0usize;
+            if let Some(ref scorer) = self.peer_scorer {
+                let ps = scorer.lock().await;
+                for (_, peer_score) in ps.iter() {
+                    if let Some(seg_counts) = peer_score.piece_counts.get(&cid_hex) {
+                        if seg_counts.iter().sum::<usize>() > 0 {
+                            provider_count += 1;
+                        }
+                    }
+                }
+            }
+            if local_total > 0 {
+                provider_count += 1;
+            }
 
             let mut obj = serde_json::json!({
-                "content_id": item.content_id.to_hex(),
+                "content_id": cid_hex,
                 "total_size": item.total_size,
                 "segment_count": item.segment_count,
                 "pinned": item.pinned,
-                "min_rank": min_rank,
+                "min_rank": local_seg_pieces.iter().copied().min().unwrap_or(0),
                 "health_ratio": health_ratio,
+                "provider_count": provider_count,
+                "network_total_pieces": network_total,
                 "local_disk_usage": disk_usage,
             });
 
@@ -1967,12 +2019,11 @@ impl DataCraftHandler {
                     obj["encrypted"] = serde_json::json!(state.encrypted);
                     obj["stage"] = serde_json::json!(state.stage.to_string());
                     obj["local_pieces"] = serde_json::json!(state.local_pieces);
-                    obj["provider_count"] = serde_json::json!(state.provider_count);
                     obj["role"] = serde_json::json!(match state.role {
                         crate::content_tracker::ContentRole::Publisher => "publisher",
                         crate::content_tracker::ContentRole::StorageProvider => "storage_provider",
                     });
-                    obj["hot"] = serde_json::json!(state.provider_count > state.segment_count * 2);
+                    obj["hot"] = serde_json::json!(provider_count > state.segment_count * 2);
                 }
             }
 
