@@ -136,6 +136,50 @@ Older events are discarded on nodes. Only the aggregator keeps everything.
 | Separate `StorageMerkleTree` | Derive from PieceMap (own pieces) |
 | Large gossipsub announcements (>1MB for 10GB nodes) | Tiny per-event messages (~200 bytes) |
 
+## Node Online/Offline Status
+
+Node status is derived from existing mechanisms — no new events needed.
+
+### Detection
+
+- **Online**: capability announcement received within `capability_announce_interval × 2`
+- **Offline (graceful)**: `GoingOffline` broadcast received
+- **Offline (crash/disconnect)**: no capability announcement for timeout period
+
+### PieceMap Integration
+
+```rust
+struct PieceMap {
+    pieces: HashMap<(PeerId, ContentId, u32, [u8; 32]), Vec<u8>>,
+    node_seqs: HashMap<PeerId, u64>,
+    node_online: HashMap<PeerId, bool>,      // derived from announcements
+    node_last_seen: HashMap<PeerId, Instant>, // last announcement time
+}
+```
+
+### Health Impact
+
+When computing rank for a segment, only include coefficient vectors from **online** nodes. Offline nodes' pieces exist in PieceMap but are unavailable for reconstruction.
+
+```
+effective_rank(cid, segment) = independence_check(
+    coefficients from PieceMap WHERE node is online
+)
+```
+
+### HealthReactor on Status Change
+
+- **Node goes offline** → recheck all segments where that node held pieces. If effective rank drops below target → schedule repair.
+- **Node comes back online** → recheck segments. If now over-replicated → schedule degradation (if no demand).
+
+### Capability Announcements (Slimmed Down)
+
+Capability announcements remain as heartbeat but no longer carry `piece_counts` — that data flows via PieceStored/PieceDropped events. Announcements carry:
+- Capabilities (storage, aggregator, etc.)
+- Region
+- Max storage bytes
+- Used storage bytes
+
 ## PDP Integration
 
 PDP still verifies actual possession — PieceMap represents **claimed state**. A node could emit PieceStored without actually storing. PDP challenges verify the claim.
