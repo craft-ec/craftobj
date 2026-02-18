@@ -4,9 +4,17 @@
 //! and stream-based transfers.
 
 use craftobj_core::{ContentId, ContentManifest};
-use craftobj_transfer::CraftObjResponse;
+use craftobj_transfer::{CraftObjResponse, PieceMapEntry};
 use libp2p::PeerId;
 use tokio::sync::oneshot;
+
+/// Result from a Merkle diff operation.
+#[derive(Debug, Clone)]
+pub struct MerkleDiffResult {
+    pub current_root: [u8; 32],
+    pub added: Vec<PieceMapEntry>,
+    pub removed: Vec<u32>,
+}
 
 /// Commands that can be sent to the swarm event loop.
 #[derive(Debug)]
@@ -105,4 +113,19 @@ pub enum CraftObjCommand {
     StartProviding { key: Vec<u8> },
     /// Remove a DHT provider record for a CID+segment (called after dropping all pieces for a segment).
     StopProviding { key: Vec<u8> },
+    /// Request Merkle root for a content ID from a peer.
+    MerkleRoot {
+        peer_id: PeerId,
+        content_id: ContentId,
+        segment_index: u32,
+        reply_tx: oneshot::Sender<Option<([u8; 32], u32)>>,
+    },
+    /// Request Merkle diff since a given root from a peer.
+    MerkleDiff {
+        peer_id: PeerId,
+        content_id: ContentId,
+        segment_index: u32,
+        since_root: [u8; 32],
+        reply_tx: oneshot::Sender<Option<MerkleDiffResult>>,
+    },
 }
