@@ -53,6 +53,17 @@ pub enum CraftObjRequest {
         content_id: ContentId,
         segment_index: u32,
     },
+    /// Request Merkle root and leaf count for a content ID.
+    MerkleRoot {
+        content_id: ContentId,
+        segment_index: u32,
+    },
+    /// Request Merkle diff since a given root for a content ID.
+    MerkleDiff {
+        content_id: ContentId,
+        segment_index: u32,
+        since_root: [u8; 32],
+    },
 }
 
 /// A piece within a PieceBatch response.
@@ -84,6 +95,17 @@ pub enum CraftObjResponse {
     Ack { status: WireStatus },
     /// Response to PieceMapQuery: known PieceMap entries for the queried segment.
     PieceMapEntries { entries: Vec<PieceMapEntry> },
+    /// Response to MerkleRoot: current root and leaf count.
+    MerkleRootResponse {
+        root: [u8; 32],
+        leaf_count: u32,
+    },
+    /// Response to MerkleDiff: current root and piece changes.
+    MerkleDiffResponse {
+        current_root: [u8; 32],
+        added: Vec<PieceMapEntry>, // piece_id + coefficients for new pieces
+        removed: Vec<u32>,          // piece_ids that were dropped (first 4 bytes as u32)
+    },
 }
 
 #[cfg(test)]
@@ -110,11 +132,32 @@ mod tests {
             content_id: ContentId::from_bytes(b"test"),
             manifest_json: vec![],
         };
+        let _merkle_root = CraftObjRequest::MerkleRoot {
+            content_id: ContentId::from_bytes(b"test"),
+            segment_index: 0,
+        };
+        let _merkle_diff = CraftObjRequest::MerkleDiff {
+            content_id: ContentId::from_bytes(b"test"),
+            segment_index: 0,
+            since_root: [0xAA; 32],
+        };
     }
 
     #[test]
     fn test_response_variants() {
         let _batch = CraftObjResponse::PieceBatch { pieces: vec![] };
         let _ack = CraftObjResponse::Ack { status: WireStatus::Ok };
+        let _merkle_root_resp = CraftObjResponse::MerkleRootResponse {
+            root: [0xBB; 32],
+            leaf_count: 42,
+        };
+        let _merkle_diff_resp = CraftObjResponse::MerkleDiffResponse {
+            current_root: [0xCC; 32],
+            added: vec![],
+            removed: vec![],
+        };
     }
+
+    // Note: JSON serialization tests removed to avoid adding serde_json dependency.
+    // The wire protocol tests in wire.rs provide sufficient coverage for serialization.
 }

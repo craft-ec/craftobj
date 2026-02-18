@@ -16,9 +16,13 @@ const TYPE_PIECE_SYNC: u8 = 0x01;
 const TYPE_PIECE_PUSH: u8 = 0x02;
 const TYPE_MANIFEST_PUSH: u8 = 0x03;
 const TYPE_PIECE_MAP_QUERY: u8 = 0x04;
+const TYPE_MERKLE_ROOT: u8 = 0x05;
+const TYPE_MERKLE_DIFF: u8 = 0x06;
 const TYPE_PIECE_BATCH: u8 = 0x81;
 const TYPE_ACK: u8 = 0x82;
 const TYPE_PIECE_MAP_ENTRIES: u8 = 0x83;
+const TYPE_MERKLE_ROOT_RESPONSE: u8 = 0x84;
+const TYPE_MERKLE_DIFF_RESPONSE: u8 = 0x85;
 
 /// Maximum frame payload (50 MB).
 const MAX_FRAME_PAYLOAD: usize = 50 * 1024 * 1024;
@@ -82,11 +86,11 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
     }
 
     match ty[0] {
-        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY => {
+        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF => {
             let request = deserialize_request(ty[0], &payload)?;
             Ok(StreamFrame::Request { seq_id, request })
         }
-        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES => {
+        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE => {
             let response = deserialize_response(ty[0], &payload)?;
             Ok(StreamFrame::Response { seq_id, response })
         }
@@ -173,6 +177,25 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_MAP_QUERY, payload))
         }
+        CraftObjRequest::MerkleRoot { content_id, segment_index } => {
+            let inner = MerkleRootWire {
+                content_id: *content_id,
+                segment_index: *segment_index,
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_MERKLE_ROOT, payload))
+        }
+        CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
+            let inner = MerkleDiffWire {
+                content_id: *content_id,
+                segment_index: *segment_index,
+                since_root: *since_root,
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_MERKLE_DIFF, payload))
+        }
     }
 }
 
@@ -216,6 +239,23 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
                 segment_index: inner.segment_index,
             })
         }
+        TYPE_MERKLE_ROOT => {
+            let inner: MerkleRootWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjRequest::MerkleRoot {
+                content_id: inner.content_id,
+                segment_index: inner.segment_index,
+            })
+        }
+        TYPE_MERKLE_DIFF => {
+            let inner: MerkleDiffWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjRequest::MerkleDiff {
+                content_id: inner.content_id,
+                segment_index: inner.segment_index,
+                since_root: inner.since_root,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown request type: 0x{:02x}", msg_type),
@@ -240,6 +280,25 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_MAP_ENTRIES, payload))
         }
+        CraftObjResponse::MerkleRootResponse { root, leaf_count } => {
+            let inner = MerkleRootResponseWire {
+                root: *root,
+                leaf_count: *leaf_count,
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_MERKLE_ROOT_RESPONSE, payload))
+        }
+        CraftObjResponse::MerkleDiffResponse { current_root, added, removed } => {
+            let inner = MerkleDiffResponseWire {
+                current_root: *current_root,
+                added: added.clone(),
+                removed: removed.clone(),
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_MERKLE_DIFF_RESPONSE, payload))
+        }
     }
 }
 
@@ -259,6 +318,23 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResp
             let entries: Vec<PieceMapEntry> = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(CraftObjResponse::PieceMapEntries { entries })
+        }
+        TYPE_MERKLE_ROOT_RESPONSE => {
+            let inner: MerkleRootResponseWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjResponse::MerkleRootResponse {
+                root: inner.root,
+                leaf_count: inner.leaf_count,
+            })
+        }
+        TYPE_MERKLE_DIFF_RESPONSE => {
+            let inner: MerkleDiffResponseWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjResponse::MerkleDiffResponse {
+                current_root: inner.current_root,
+                added: inner.added,
+                removed: inner.removed,
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -298,6 +374,32 @@ struct ManifestPushWire {
 struct PieceMapQueryWire {
     content_id: ContentId,
     segment_index: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MerkleRootWire {
+    content_id: ContentId,
+    segment_index: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MerkleDiffWire {
+    content_id: ContentId,
+    segment_index: u32,
+    since_root: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct MerkleRootResponseWire {
+    root: [u8; 32],
+    leaf_count: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MerkleDiffResponseWire {
+    current_root: [u8; 32],
+    added: Vec<PieceMapEntry>,
+    removed: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -351,6 +453,133 @@ mod tests {
                 match response {
                     CraftObjResponse::Ack { status } => {
                         assert_eq!(status as u8, WireStatus::Ok as u8);
+                    }
+                    _ => panic!("wrong variant"),
+                }
+            }
+            _ => panic!("expected response frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merkle_root_request_wire_roundtrip() {
+        let req = CraftObjRequest::MerkleRoot {
+            content_id: ContentId::from_bytes(b"wire-test"),
+            segment_index: 7,
+        };
+
+        let mut buf = Vec::new();
+        write_request_frame(&mut futures::io::Cursor::new(&mut buf), 123, &req)
+            .await
+            .unwrap();
+
+        let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
+        match frame {
+            StreamFrame::Request { seq_id, request } => {
+                assert_eq!(seq_id, 123);
+                match request {
+                    CraftObjRequest::MerkleRoot { content_id, segment_index } => {
+                        assert_eq!(content_id, ContentId::from_bytes(b"wire-test"));
+                        assert_eq!(segment_index, 7);
+                    }
+                    _ => panic!("wrong variant"),
+                }
+            }
+            _ => panic!("expected request frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merkle_diff_request_wire_roundtrip() {
+        let req = CraftObjRequest::MerkleDiff {
+            content_id: ContentId::from_bytes(b"wire-test"),
+            segment_index: 8,
+            since_root: [0xAB; 32],
+        };
+
+        let mut buf = Vec::new();
+        write_request_frame(&mut futures::io::Cursor::new(&mut buf), 456, &req)
+            .await
+            .unwrap();
+
+        let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
+        match frame {
+            StreamFrame::Request { seq_id, request } => {
+                assert_eq!(seq_id, 456);
+                match request {
+                    CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
+                        assert_eq!(content_id, ContentId::from_bytes(b"wire-test"));
+                        assert_eq!(segment_index, 8);
+                        assert_eq!(since_root, [0xAB; 32]);
+                    }
+                    _ => panic!("wrong variant"),
+                }
+            }
+            _ => panic!("expected request frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merkle_root_response_wire_roundtrip() {
+        let resp = CraftObjResponse::MerkleRootResponse {
+            root: [0xCD; 32],
+            leaf_count: 500,
+        };
+
+        let mut buf = Vec::new();
+        write_response_frame(&mut futures::io::Cursor::new(&mut buf), 789, &resp)
+            .await
+            .unwrap();
+
+        let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
+        match frame {
+            StreamFrame::Response { seq_id, response } => {
+                assert_eq!(seq_id, 789);
+                match response {
+                    CraftObjResponse::MerkleRootResponse { root, leaf_count } => {
+                        assert_eq!(root, [0xCD; 32]);
+                        assert_eq!(leaf_count, 500);
+                    }
+                    _ => panic!("wrong variant"),
+                }
+            }
+            _ => panic!("expected response frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merkle_diff_response_wire_roundtrip() {
+        use crate::PieceMapEntry;
+        
+        let piece_entry = PieceMapEntry {
+            node: vec![5, 6, 7, 8],
+            piece_id: [0x12; 32],
+            coefficients: vec![1, 0, 0, 1],
+        };
+        
+        let resp = CraftObjResponse::MerkleDiffResponse {
+            current_root: [0xEF; 32],
+            added: vec![piece_entry.clone()],
+            removed: vec![10, 20, 30],
+        };
+
+        let mut buf = Vec::new();
+        write_response_frame(&mut futures::io::Cursor::new(&mut buf), 321, &resp)
+            .await
+            .unwrap();
+
+        let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
+        match frame {
+            StreamFrame::Response { seq_id, response } => {
+                assert_eq!(seq_id, 321);
+                match response {
+                    CraftObjResponse::MerkleDiffResponse { current_root, added, removed } => {
+                        assert_eq!(current_root, [0xEF; 32]);
+                        assert_eq!(added.len(), 1);
+                        assert_eq!(added[0].node, piece_entry.node);
+                        assert_eq!(added[0].piece_id, piece_entry.piece_id);
+                        assert_eq!(added[0].coefficients, piece_entry.coefficients);
+                        assert_eq!(removed, vec![10, 20, 30]);
                     }
                     _ => panic!("wrong variant"),
                 }
