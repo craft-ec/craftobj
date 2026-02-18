@@ -566,11 +566,6 @@ pub struct CapabilityAnnouncement {
     /// Root hash of the node's storage Merkle tree (all held pieces).
     #[serde(default)]
     pub storage_root: [u8; 32],
-    /// Per-CID per-segment piece counts (CID hex → vec of piece counts per segment).
-    /// Index = segment index, value = number of pieces held for that segment.
-    /// Peers with ≥2 total pieces for a CID are real providers.
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub piece_counts: std::collections::HashMap<String, Vec<usize>>,
 }
 
 impl CapabilityAnnouncement {
@@ -588,15 +583,6 @@ impl CapabilityAnnouncement {
             data.extend_from_slice(region.as_bytes());
         }
         data.extend_from_slice(&self.storage_root);
-        // Include piece counts in signature (sorted for determinism)
-        let mut sorted_counts: Vec<_> = self.piece_counts.iter().collect();
-        sorted_counts.sort_by_key(|(k, _)| k.clone());
-        for (cid_hex, seg_counts) in &sorted_counts {
-            data.extend_from_slice(cid_hex.as_bytes());
-            for count in *seg_counts {
-                data.extend_from_slice(&count.to_le_bytes());
-            }
-        }
         data
     }
 }
@@ -911,7 +897,6 @@ mod tests {
             storage_used_bytes: 5_000_000_000,
             region: Some("us-east".to_string()),
             storage_root: [0u8; 32],
-            piece_counts: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&ann).unwrap();
         let parsed: CapabilityAnnouncement = serde_json::from_str(&json).unwrap();
@@ -931,7 +916,6 @@ mod tests {
             storage_used_bytes: 0,
             region: None,
             storage_root: [0u8; 32],
-            piece_counts: std::collections::HashMap::new(),
         };
         let data = ann.signable_data();
         assert_eq!(data.len(), 60); // 2 (peer_id) + 2 (caps) + 8 (ts) + 8 + 8 + 32 (storage_root)

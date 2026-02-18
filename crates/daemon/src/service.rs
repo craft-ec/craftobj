@@ -546,7 +546,7 @@ pub async fn run_daemon_with_config(
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
             info!("[service.rs] Protocol events handler ended");
         }
-        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes, daemon_config.region.clone(), merkle_tree.clone(), content_tracker.clone()) => {
+        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes, daemon_config.region.clone(), merkle_tree.clone()) => {
             info!("[service.rs] Capability announcement loop ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
@@ -959,27 +959,11 @@ async fn drive_swarm(
                         // Announce capabilities: immediately + delayed retry after gossipsub mesh forms
                         let used = client.lock().await.store().disk_usage().unwrap_or(0);
                         let sr = merkle_tree.lock().await.root();
-                        let pc = {
-                            let t = content_tracker.lock().await;
-                            let c = client.lock().await;
-                            let mut counts = std::collections::HashMap::new();
-                            for state in t.list() {
-                                if state.local_pieces > 0 {
-                                    let mut seg_counts = Vec::new();
-                                    for seg in 0..state.segment_count as u32 {
-                                        seg_counts.push(c.store().list_pieces(&state.content_id, seg).unwrap_or_default().len());
-                                    }
-                                    counts.insert(state.content_id.to_hex(), seg_counts);
-                                }
-                            }
-                            counts
-                        };
                         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
                             capabilities: own_capabilities.clone(),
                             storage_committed_bytes: max_storage_bytes,
                             storage_used_bytes: used,
                             storage_root: sr,
-                            piece_counts: pc,
                         });
                         // Gossipsub mesh formation takes ~1-3s after connection.
                         // Retry to ensure the new peer receives our announcement.
@@ -988,32 +972,15 @@ async fn drive_swarm(
                         let delayed_client = client.clone();
                         let delayed_max = max_storage_bytes;
                         let delayed_merkle = merkle_tree.clone();
-                        let delayed_ct = content_tracker.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             let used = delayed_client.lock().await.store().disk_usage().unwrap_or(0);
                             let sr = delayed_merkle.lock().await.root();
-                            let pc = {
-                                let t = delayed_ct.lock().await;
-                                let c = delayed_client.lock().await;
-                                let mut counts = std::collections::HashMap::new();
-                                for state in t.list() {
-                                    if state.local_pieces > 0 {
-                                        let mut seg_counts = Vec::new();
-                                        for seg in 0..state.segment_count as u32 {
-                                            seg_counts.push(c.store().list_pieces(&state.content_id, seg).unwrap_or_default().len());
-                                        }
-                                        counts.insert(state.content_id.to_hex(), seg_counts);
-                                    }
-                                }
-                                counts
-                            };
                             let _ = delayed_tx.send(DataCraftCommand::PublishCapabilities {
                                 capabilities: delayed_caps,
                                 storage_committed_bytes: delayed_max,
                                 storage_used_bytes: used,
                                 storage_root: sr,
-                                piece_counts: pc,
                             });
                         });
                     }
@@ -1461,7 +1428,7 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::PublishCapabilities { capabilities, storage_committed_bytes, storage_used_bytes, storage_root, piece_counts } => {
+        DataCraftCommand::PublishCapabilities { capabilities, storage_committed_bytes, storage_used_bytes, storage_root } => {
             let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
             let local_peer_id = *swarm.local_peer_id();
             let timestamp = std::time::SystemTime::now()
@@ -1477,7 +1444,6 @@ async fn handle_command(
                 storage_used_bytes,
                 storage_root,
                 region: region.clone(),
-                piece_counts,
             };
             // Sign the announcement if we have a signing key
             if let Some(key) = signing_key {
@@ -1847,7 +1813,6 @@ async fn handle_gossipsub_capability(
                                 ann.storage_committed_bytes,
                                 ann.storage_used_bytes,
                                 ann.region,
-                                ann.piece_counts,
                                 ann.storage_root,
                             );
                         }
@@ -2074,7 +2039,6 @@ async fn announce_capabilities_periodically(
     max_storage_bytes: u64,
     _region: Option<String>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
-    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
     use std::time::Duration;
 
@@ -2086,30 +2050,12 @@ async fn announce_capabilities_periodically(
         interval.tick().await;
         let used = client.lock().await.store().disk_usage().unwrap_or(0);
         let storage_root = merkle_tree.lock().await.root();
-        // Build piece counts from content tracker
-        let piece_counts: std::collections::HashMap<String, Vec<usize>> = {
-            let t = content_tracker.lock().await;
-            let c = client.lock().await;
-            let mut counts = std::collections::HashMap::new();
-            for state in t.list() {
-                if state.local_pieces > 0 {
-                    let mut seg_counts = Vec::new();
-                    for seg in 0..state.segment_count as u32 {
-                        let n = c.store().list_pieces(&state.content_id, seg).unwrap_or_default().len();
-                        seg_counts.push(n);
-                    }
-                    counts.insert(state.content_id.to_hex(), seg_counts);
-                }
-            }
-            counts
-        };
-        debug!("Publishing capability announcement (storage: {}/{} bytes, merkle root: {}, cids: {})", used, max_storage_bytes, hex::encode(&storage_root[..8]), piece_counts.len());
+        debug!("Publishing capability announcement (storage: {}/{} bytes, merkle root: {})", used, max_storage_bytes, hex::encode(&storage_root[..8]));
         let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
             capabilities: capabilities.clone(),
             storage_committed_bytes: max_storage_bytes,
             storage_used_bytes: used,
             storage_root,
-            piece_counts,
         });
     }
 }

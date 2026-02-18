@@ -71,11 +71,23 @@ impl DataCraftHandler {
             if i < seg_count { network_seg_pieces[i] += c; }
         }
 
-        // Add remote pieces from peer_scorer
-        if let Some(ref scorer) = self.peer_scorer {
-            let ps = scorer.lock().await;
-            for (peer, peer_score) in ps.iter() {
-                if let Some(seg_counts) = peer_score.piece_counts.get(cid_hex) {
+        // Add remote pieces from PieceMap (piece_counts removed from capability announcements)
+        if let Some(ref pm) = self.piece_map {
+            if let Ok(cid) = datacraft_core::ContentId::from_hex(cid_hex) {
+                let map = pm.lock().await;
+                // Count pieces per node per segment from PieceMap
+                let mut node_pieces: std::collections::HashMap<Vec<u8>, Vec<usize>> = std::collections::HashMap::new();
+                for seg in 0..seg_count as u32 {
+                    for (node, _pid, _coeff) in map.pieces_for_segment(&cid, seg) {
+                        let local_node = map.local_node();
+                        if node == local_node { continue; } // Skip local, already counted
+                        let entry = node_pieces.entry(node.clone()).or_insert_with(|| vec![0; seg_count]);
+                        if (seg as usize) < seg_count {
+                            entry[seg as usize] += 1;
+                        }
+                    }
+                }
+                for (node, seg_counts) in &node_pieces {
                     let total: usize = seg_counts.iter().sum();
                     if total > 0 {
                         network_total += total;
@@ -84,21 +96,24 @@ impl DataCraftHandler {
                             if i < seg_count { network_seg_pieces[i] += c; }
                         }
                         if include_provider_details {
+                            let peer_id_str = if let Ok(pid) = libp2p::PeerId::from_bytes(node) {
+                                pid.to_string()
+                            } else {
+                                hex::encode(node)
+                            };
                             providers.push(serde_json::json!({
-                                "peer_id": peer.to_string(),
+                                "peer_id": peer_id_str,
                                 "piece_count": total,
                                 "segment_pieces": seg_counts,
-                                "merkle_root": hex::encode(peer_score.storage_root),
-                                "last_seen": peer_score.last_announcement.elapsed().as_secs(),
-                                "region": peer_score.region.as_deref().unwrap_or("unknown"),
-                                "score": peer_score.score(),
-                                "latency_ms": peer_score.avg_latency_ms,
                             }));
                         }
                     }
                 }
             }
-            // Add tracked providers without piece_counts (if detailed)
+        }
+        // Add tracked providers without PieceMap entries (if detailed)
+        if let Some(ref scorer) = self.peer_scorer {
+            let ps = scorer.lock().await;
             if include_provider_details {
                 if let Some(ref tracker) = self.content_tracker {
                     if let Ok(cid) = datacraft_core::ContentId::from_hex(cid_hex) {
@@ -544,28 +559,27 @@ impl DataCraftHandler {
             if let Some(manifest) = local_manifest {
                 info!("[handler.rs] Found manifest locally for {}", cid);
 
-                // Step 2: Get providers from peer scorer (peers that announced having pieces for this CID)
-                let cid_hex_key = cid.to_hex();
+                // Step 2: Get providers from PieceMap (peers that hold pieces for this CID)
                 let mut providers = Vec::new();
-                if let Some(ref scorer) = self.peer_scorer {
-                    let s = scorer.lock().await;
-                    for (peer_id, score) in s.iter() {
-                        if let Some(seg_counts) = score.piece_counts.get(&cid_hex_key) {
-                            let total: usize = seg_counts.iter().sum();
-                            if total > 0 {
-                                // Skip self — sending PieceSync to ourselves deadlocks
-                                if self.local_peer_id.as_ref() == Some(peer_id) {
-                                    info!("[handler.rs] Skipping self ({}) as provider for {}", peer_id, cid);
-                                    continue;
+                if let Some(ref pm) = self.piece_map {
+                    let map = pm.lock().await;
+                    let local_node = map.local_node().to_vec();
+                    // Collect unique providers across all segments
+                    let mut seen = std::collections::HashSet::new();
+                    for seg in 0..manifest.segment_count as u32 {
+                        for (node, _pid, _coeff) in map.pieces_for_segment(&cid, seg) {
+                            if node == &local_node { continue; }
+                            if seen.insert(node.clone()) {
+                                if let Ok(peer_id) = libp2p::PeerId::from_bytes(&node) {
+                                    info!("[handler.rs] Provider {} found in PieceMap for {}", peer_id, cid);
+                                    providers.push(peer_id);
                                 }
-                                info!("[handler.rs] Provider {} has {} pieces for {}", peer_id, total, cid);
-                                providers.push(*peer_id);
                             }
                         }
                     }
                 }
 
-                info!("[handler.rs] Found {} providers for {} via peer scorer", providers.len(), cid);
+                info!("[handler.rs] Found {} providers for {} via PieceMap", providers.len(), cid);
 
                 // Also resolve DHT providers and merge
                 {
@@ -2172,22 +2186,29 @@ impl DataCraftHandler {
     /// `network.health` — Network-wide health statistics.
     async fn handle_network_health(&self) -> Result<Value, String> {
         // Network storage from peer scorer
-        let (storage_summary, storage_node_count, unique_providers, network_piece_counts) = if let Some(ref scorer) = self.peer_scorer {
+        let (storage_summary, storage_node_count, unique_providers) = if let Some(ref scorer) = self.peer_scorer {
             let ps = scorer.lock().await;
             let summary = ps.network_storage_summary();
             let node_count = summary.storage_node_count;
             let unique = ps.iter().count();
-            // Aggregate total piece counts across all peers per CID
-            let mut cid_pieces: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for (_, peer_score) in ps.iter() {
-                for (cid_hex, seg_counts) in &peer_score.piece_counts {
-                    let total: usize = seg_counts.iter().sum();
-                    *cid_pieces.entry(cid_hex.clone()).or_default() += total;
+            (Some(summary), node_count, unique)
+        } else {
+            (None, 0, 0)
+        };
+
+        // Aggregate total piece counts from PieceMap
+        let network_piece_counts: std::collections::HashMap<String, usize> = if let Some(ref pm) = self.piece_map {
+            let map = pm.lock().await;
+            let mut cid_pieces = std::collections::HashMap::new();
+            for cid in map.all_cids() {
+                let total = map.total_pieces(&cid);
+                if total > 0 {
+                    cid_pieces.insert(cid.to_hex(), total);
                 }
             }
-            (Some(summary), node_count, unique, cid_pieces)
+            cid_pieces
         } else {
-            (None, 0, 0, std::collections::HashMap::new())
+            std::collections::HashMap::new()
         };
 
         let mut total_content = 0usize;

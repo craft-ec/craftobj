@@ -60,8 +60,6 @@ pub struct PeerScore {
     pub storage_used_bytes: u64,
     /// Geographic region from capability announcement (e.g. "us-east", "eu-west").
     pub region: Option<String>,
-    /// Per-CID piece counts from capability announcement (CID hex → count).
-    pub piece_counts: std::collections::HashMap<String, Vec<usize>>,
     /// Root hash of the node's storage Merkle tree.
     pub storage_root: [u8; 32],
 
@@ -93,7 +91,6 @@ impl PeerScore {
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
             region: None,
-            piece_counts: std::collections::HashMap::new(),
             storage_root: [0u8; 32],
             bytes_sent: 0,
             bytes_received: 0,
@@ -290,7 +287,7 @@ impl PeerScorer {
         capabilities: Vec<DataCraftCapability>,
         _timestamp: u64,
     ) {
-        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None, std::collections::HashMap::new());
+        self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None);
     }
 
     /// Update capabilities and storage info from a gossipsub announcement.
@@ -302,9 +299,8 @@ impl PeerScorer {
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
         region: Option<String>,
-        piece_counts: std::collections::HashMap<String, Vec<usize>>,
     ) {
-        self.update_capabilities_full(peer, capabilities, _timestamp, storage_committed_bytes, storage_used_bytes, region, piece_counts, [0u8; 32]);
+        self.update_capabilities_full(peer, capabilities, _timestamp, storage_committed_bytes, storage_used_bytes, region, [0u8; 32]);
     }
 
     /// Update capabilities, storage info, and merkle root from a gossipsub announcement.
@@ -316,7 +312,6 @@ impl PeerScorer {
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
         region: Option<String>,
-        piece_counts: std::collections::HashMap<String, Vec<usize>>,
         storage_root: [u8; 32],
     ) {
         let now = Instant::now();
@@ -328,7 +323,6 @@ impl PeerScorer {
         entry.storage_committed_bytes = storage_committed_bytes;
         entry.storage_used_bytes = storage_used_bytes;
         entry.region = region;
-        entry.piece_counts = piece_counts;
         entry.storage_root = storage_root;
     }
 
@@ -554,7 +548,6 @@ mod tests {
                 storage_committed_bytes: 0,
                 storage_used_bytes: 0,
                 region: None,
-                piece_counts: std::collections::HashMap::new(),
                 storage_root: [0u8; 32],
                 bytes_sent: 0,
                 bytes_received: 0,
