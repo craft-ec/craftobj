@@ -503,41 +503,8 @@ impl PieceDropped {
 /// Gossipsub topic for StorageReceipt broadcast (aggregator collection).
 pub const STORAGE_RECEIPT_TOPIC: &str = "datacraft/storage-receipts/1.0.0";
 
-/// Gossipsub topic for degradation signals and announcements.
-pub const DEGRADATION_TOPIC: &str = "datacraft/degradation/1.0.0";
-
 /// Gossipsub topic for demand/scaling signals.
 pub const SCALING_TOPIC: &str = "datacraft/scaling/1.0.0";
-
-/// Degradation signal: challenger detected over-replication for a segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DegradationSignal {
-    pub content_id: ContentId,
-    pub segment_index: u32,
-    pub excess_pieces: usize,
-    pub current_rank: usize,
-    pub target_rank: usize,
-    pub k: usize,
-    pub challenger: Vec<u8>,
-    pub timestamp: u64,
-}
-
-/// Degradation announcement: a node dropped a piece.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DegradationAnnouncement {
-    pub content_id: ContentId,
-    pub segment_index: u32,
-    pub piece_id: [u8; 32],
-    pub dropper: Vec<u8>,
-    pub timestamp: u64,
-}
-
-/// Wrapper for degradation gossipsub messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DegradationMessage {
-    Signal(DegradationSignal),
-    Announcement(DegradationAnnouncement),
-}
 
 /// Demand signal: a serving node detected high demand for content.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -246,12 +246,6 @@ pub async fn run_daemon_with_config(
     }
     if let Err(e) = swarm
         .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::DEGRADATION_TOPIC)
-    {
-        error!("Failed to subscribe to degradation topic: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
         .subscribe_topic(datacraft_core::SCALING_TOPIC)
     {
         error!("Failed to subscribe to scaling topic: {:?}", e);
@@ -500,11 +494,6 @@ pub async fn run_daemon_with_config(
         });
     }
 
-    // Degradation coordinator for over-replication reduction
-    let degradation_command_tx = command_tx.clone();
-    let degradation_coord = crate::degradation::DegradationCoordinator::new(local_peer_id, degradation_command_tx);
-    let degradation_coordinator: Arc<Mutex<crate::degradation::DegradationCoordinator>> = Arc::new(Mutex::new(degradation_coord));
-
     // HealthScan — periodic scan of owned segments for repair/degradation
     let health_scan_command_tx = command_tx.clone();
     let health_scan = crate::health_scan::HealthScan::new(
@@ -548,7 +537,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone(), piece_map.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, demand_signal_tracker.clone(), piece_map.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
@@ -915,7 +904,6 @@ async fn drive_swarm(
     signing_key: Option<ed25519_dalek::SigningKey>,
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     max_peer_connections: usize,
-    degradation_coordinator: Arc<Mutex<crate::degradation::DegradationCoordinator>>,
     demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
 ) {
@@ -1087,7 +1075,6 @@ async fn drive_swarm(
                                 }
                                 handle_gossipsub_removal(craft_event, &removal_cache, &event_tx).await;
                                 handle_gossipsub_storage_receipt(craft_event, &event_tx, &receipt_store).await;
-                                handle_gossipsub_degradation(craft_event, &degradation_coordinator, &store_for_repair, &event_tx, &merkle_tree, &piece_map, &command_tx).await;
                                 handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker, &demand_signal_tracker).await;
                                 handle_gossipsub_piece_event(craft_event, &piece_map).await;
                                 // Handle Kademlia events for DHT queries
@@ -1648,14 +1635,6 @@ async fn handle_command(
             }
         }
 
-        DataCraftCommand::BroadcastDegradationMessage { degradation_data } => {
-            debug!("Broadcasting degradation message via gossipsub ({} bytes)", degradation_data.len());
-            if let Err(e) = swarm.behaviour_mut().craft
-                .publish_to_topic(datacraft_core::DEGRADATION_TOPIC, degradation_data) {
-                warn!("[service.rs] Failed to broadcast degradation message via gossipsub: {:?}", e);
-            }
-        }
-
         DataCraftCommand::BroadcastDemandSignal { signal_data } => {
             debug!("Broadcasting demand signal via gossipsub ({} bytes)", signal_data.len());
             if let Err(e) = swarm.behaviour_mut().craft
@@ -1960,89 +1939,6 @@ async fn handle_gossipsub_storage_receipt(
                 }
                 Err(e) => {
                     debug!("Failed to parse StorageReceipt from gossipsub: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Handle incoming degradation signals and announcements from gossipsub.
-async fn handle_gossipsub_degradation(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    degradation_coordinator: &Arc<Mutex<crate::degradation::DegradationCoordinator>>,
-    store: &Arc<Mutex<datacraft_store::FsStore>>,
-    _event_tx: &EventSender,
-    merkle_tree: &Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
-    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
-) {
-    use libp2p::gossipsub;
-    use craftec_network::behaviour::CraftBehaviourEvent;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::DEGRADATION_TOPIC {
-            match bincode::deserialize::<datacraft_core::DegradationMessage>(&message.data) {
-                Ok(datacraft_core::DegradationMessage::Signal(signal)) => {
-                    debug!(
-                        "Received degradation signal for {}/seg{}: {} excess pieces",
-                        signal.content_id, signal.segment_index, signal.excess_pieces
-                    );
-                    let store_guard = store.lock().await;
-                    let mut coord = degradation_coordinator.lock().await;
-                    if let Some(delay) = coord.handle_degradation_signal(&signal, &store_guard) {
-                        let dc = degradation_coordinator.clone();
-                        let st = store.clone();
-                        let mt = merkle_tree.clone();
-                        let pm = piece_map.clone();
-                        let cmd_tx = command_tx.clone();
-                        let cid = signal.content_id;
-                        let seg = signal.segment_index;
-                        drop(store_guard);
-                        drop(coord);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            let store_guard = st.lock().await;
-                            let mut tree = mt.lock().await;
-                            let mut coord = dc.lock().await;
-                            if let Some(dropped_piece_id) = coord.execute_degradation(&store_guard, cid, seg, Some(&mut tree)) {
-                                // Emit PieceDropped event
-                                let mut map = pm.lock().await;
-                                let seq = map.next_seq();
-                                let dropped = datacraft_core::PieceDropped {
-                                    node: map.local_node().to_vec(),
-                                    cid,
-                                    segment: seg,
-                                    piece_id: dropped_piece_id,
-                                    seq,
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    signature: vec![],
-                                };
-                                let event = datacraft_core::PieceEvent::Dropped(dropped);
-                                map.apply_event(&event);
-                                if let Ok(data) = bincode::serialize(&event) {
-                                    let _ = cmd_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                                }
-                            }
-                        });
-                    }
-                }
-                Ok(datacraft_core::DegradationMessage::Announcement(announcement)) => {
-                    debug!(
-                        "Received degradation announcement for {}/seg{} from dropper",
-                        announcement.content_id, announcement.segment_index
-                    );
-                    let mut coord = degradation_coordinator.lock().await;
-                    coord.handle_degradation_announcement(&announcement);
-                }
-                Err(e) => {
-                    debug!("Failed to parse degradation message from gossipsub: {}", e);
                 }
             }
         }
