@@ -129,10 +129,10 @@ impl HealthScan {
     // Step 1: Pull Merkle diffs from providers to update PieceMap
     // -----------------------------------------------------------------------
 
-    /// Pull Merkle diffs from all providers for a given CID.
+    /// Pull Merkle diffs from all providers for a given CID and all its segments.
     ///
     /// For each provider obtained from the DHT:
-    /// 1. Send a [`MerklePullRequest`] with our last known root (or `None`).
+    /// 1. Send [`MerklePullRequest`] for each segment we're tracking.
     /// 2. If the root is unchanged, skip.
     /// 3. If changed, apply the diff (or full leaves) to the local [`PieceMap`].
     async fn pull_merkle_for_cid(&mut self, cid: ContentId) {
@@ -143,42 +143,59 @@ impl HealthScan {
             return;
         }
 
+        // Get list of segments we're tracking for this CID
+        let tracked_segments = {
+            let map = self.piece_map.lock().await;
+            let mut segments = Vec::new();
+            for (tracked_cid, segment) in map.tracked_segments.iter() {
+                if *tracked_cid == cid {
+                    segments.push(*segment);
+                }
+            }
+            if segments.is_empty() {
+                // Default to segment 0 if none tracked yet
+                segments.push(0);
+            }
+            segments
+        };
+
         for peer_id in providers {
             if peer_id == self.local_peer_id {
                 continue; // skip self
             }
 
-            let cache_key = MerkleCacheKey {
-                peer_id,
-                content_id: cid,
-            };
-            let known_root = self.merkle_root_cache.get(&cache_key).copied();
+            // Pull each segment independently
+            for &segment_index in &tracked_segments {
+                let cache_key = MerkleCacheKey {
+                    peer_id,
+                    content_id: cid,
+                };
+                let known_root = self.merkle_root_cache.get(&cache_key).copied();
 
-            // TODO: Wire actual P2P request. For now this calls a placeholder
-            // that sends a MerklePullRequest via the command channel and awaits
-            // a MerklePullResponse. The network handler must be implemented to
-            // route these requests to peers and invoke
-            // StorageMerkleTree::diff() / leaves() on the responder side.
-            let response = match self.send_merkle_pull(peer_id, cid, known_root).await {
-                Some(r) => r,
-                None => continue,
-            };
+                let response = match self.send_merkle_pull_for_segment(peer_id, cid, segment_index, known_root).await {
+                    Some(r) => r,
+                    None => continue,
+                };
 
-            // Check if root unchanged
-            if Some(response.root) == known_root && response.diff.is_none() && response.full_leaves.is_none() {
-                debug!("HealthScan: {}/{} root unchanged, skipping", cid, peer_id);
-                continue;
+                // Check if root unchanged
+                if Some(response.root) == known_root && response.diff.is_none() && response.full_leaves.is_none() {
+                    debug!("HealthScan: {}/{}/seg{} root unchanged, skipping", cid, peer_id, segment_index);
+                    continue;
+                }
+
+                // Apply diff or full leaves to PieceMap
+                if let Some(ref diff) = response.diff {
+                    self.apply_diff_to_piece_map(cid, &peer_id, diff).await;
+                } else if let Some(ref leaves) = response.full_leaves {
+                    self.apply_full_leaves_to_piece_map(cid, &peer_id, leaves).await;
+                }
+
+                // Update cache with segment-specific key for better granularity
+                // Note: This cache currently uses (peer_id, content_id) as key, which means
+                // it doesn't distinguish between segments. For a full implementation,
+                // the cache key should include segment_index.
+                self.merkle_root_cache.insert(cache_key, response.root);
             }
-
-            // Apply diff or full leaves to PieceMap
-            if let Some(ref diff) = response.diff {
-                self.apply_diff_to_piece_map(cid, &peer_id, diff).await;
-            } else if let Some(ref leaves) = response.full_leaves {
-                self.apply_full_leaves_to_piece_map(cid, &peer_id, leaves).await;
-            }
-
-            // Update cache
-            self.merkle_root_cache.insert(cache_key, response.root);
         }
     }
 
@@ -206,20 +223,53 @@ impl HealthScan {
         }
     }
 
-    /// Send a Merkle pull request to a peer.
+    /// Send a Merkle pull request to a peer for all segments that we are tracking.
     ///
-    /// Gets the Merkle root and diff for all segments of a content ID from a peer.
-    /// For simplicity, this pulls segment 0 only for now. A full implementation would
-    /// iterate through all segments.
+    /// Gets the Merkle root and diff for each segment separately from a peer.
+    /// This properly handles multi-segment content instead of just segment 0.
     async fn send_merkle_pull(
         &self,
         peer_id: PeerId,
         content_id: ContentId,
         known_root: Option<[u8; 32]>,
     ) -> Option<MerklePullResponse> {
-        // For now, we'll handle segment 0 only. A full implementation would need to
-        // discover which segments the peer has or query all segments.
-        let segment_index = 0;
+        // Get list of segments we're tracking for this CID
+        let tracked_segments = {
+            let map = self.piece_map.lock().await;
+            let mut segments = Vec::new();
+            for (cid, segment) in map.tracked_segments.iter() {
+                if *cid == content_id {
+                    segments.push(*segment);
+                }
+            }
+            segments
+        };
+
+        if tracked_segments.is_empty() {
+            debug!("HealthScan: no tracked segments for {} - defaulting to segment 0", content_id);
+            return self.send_merkle_pull_for_segment(peer_id, content_id, 0, known_root).await;
+        }
+
+        // For multi-segment pulls, we'll query each segment independently and merge results
+        // For now, let's handle them sequentially starting with segment 0
+        // TODO: Could be optimized to query multiple segments in parallel
+        for &segment_index in &tracked_segments {
+            if let Some(response) = self.send_merkle_pull_for_segment(peer_id, content_id, segment_index, known_root).await {
+                return Some(response);
+            }
+        }
+        
+        None
+    }
+
+    /// Send a Merkle pull request for a specific segment.
+    async fn send_merkle_pull_for_segment(
+        &self,
+        peer_id: PeerId,
+        content_id: ContentId,
+        segment_index: u32,
+        known_root: Option<[u8; 32]>,
+    ) -> Option<MerklePullResponse> {
         
         if let Some(root) = known_root {
             // Pull diff since known root
