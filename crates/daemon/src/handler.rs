@@ -358,7 +358,7 @@ impl DataCraftHandler {
         // Register CID with challenger for PDP tracking
         if let Some(ref challenger) = self.challenger {
             let mut mgr = challenger.lock().await;
-            mgr.register_cid(result.content_id, None);
+            mgr.register_cid(result.content_id, Some(crate::health::TierInfo { min_piece_ratio: 1.5 }));
         }
 
         // Don't announce publisher as provider — publisher is a client that deletes

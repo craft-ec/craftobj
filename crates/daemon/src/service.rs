@@ -1955,7 +1955,8 @@ async fn handle_protocol_events(
                 // Register CID with challenger for PDP tracking
                 {
                     let mut mgr = challenger.lock().await;
-                    mgr.register_cid(content_id, None);
+                    // Default baseline: 1.5x redundancy target for all content
+                    mgr.register_cid(content_id, Some(crate::health::TierInfo { min_piece_ratio: 1.5 }));
                 }
 
                 // Announce as provider in DHT so other nodes can discover us
