@@ -1122,6 +1122,46 @@ async fn drive_swarm(
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
                     match cmd {
+                        DataCraftCommand::SyncPieceMap { content_id, segment_index } => {
+                            // Query all connected peers for their PieceMap entries for this segment
+                            let peers: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
+                            debug!("[service.rs] SyncPieceMap for {}/seg{}: querying {} peers", content_id, segment_index, peers.len());
+                            for peer_id in peers {
+                                let request = DataCraftRequest::PieceMapQuery { content_id, segment_index };
+                                let (ack_tx, ack_rx) = oneshot::channel();
+                                let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
+                                let tx = outbound_tx.clone();
+                                let pm = piece_map.clone();
+                                tokio::spawn(async move {
+                                    if tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+                                        Ok(Ok(DataCraftResponse::PieceMapEntries { entries })) => {
+                                            let mut map = pm.lock().await;
+                                            for entry in entries {
+                                                let stored = datacraft_core::PieceStored {
+                                                    node: entry.node,
+                                                    cid: content_id,
+                                                    segment: segment_index,
+                                                    piece_id: entry.piece_id,
+                                                    coefficients: entry.coefficients,
+                                                    seq: 0,
+                                                    timestamp: 0,
+                                                    signature: vec![],
+                                                };
+                                                let event = datacraft_core::PieceEvent::Stored(stored);
+                                                map.apply_event(&event);
+                                            }
+                                            debug!("[service.rs] SyncPieceMap: populated entries from {}", peer_id);
+                                        }
+                                        _ => {
+                                            debug!("[service.rs] SyncPieceMap: no response from {}", peer_id);
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         DataCraftCommand::TriggerDistribution => {
                             info!("[service.rs] Received TriggerDistribution command — running initial push");
                             let ct = content_tracker.clone();
@@ -1296,7 +1336,14 @@ async fn handle_incoming_transfer_request(
                     {
                         let mut map = piece_map.lock().await;
                         // Track segment if this is the first piece for it
-                        map.track_segment(content_id, segment_index);
+                        let newly_tracked = map.track_segment(content_id, segment_index);
+                        if newly_tracked {
+                            // Trigger scoped sync from peers for this segment
+                            let _ = command_tx.send(DataCraftCommand::SyncPieceMap {
+                                content_id,
+                                segment_index,
+                            });
+                        }
                         let seq = map.next_seq();
                         let mut stored = datacraft_core::PieceStored {
                             node: map.local_node().to_vec(),
@@ -1357,6 +1404,20 @@ async fn handle_incoming_transfer_request(
                     DataCraftResponse::Ack { status: WireStatus::Error }
                 }
             }
+        }
+        DataCraftRequest::PieceMapQuery { content_id, segment_index } => {
+            debug!("[service.rs] Handling PieceMapQuery from {} for {}/seg{}", peer, content_id, segment_index);
+            let map = piece_map.lock().await;
+            let pieces = map.pieces_for_segment(&content_id, segment_index);
+            let entries: Vec<datacraft_transfer::PieceMapEntry> = pieces.into_iter()
+                .map(|(node, pid, coeff)| datacraft_transfer::PieceMapEntry {
+                    node: node.clone(),
+                    piece_id: *pid,
+                    coefficients: coeff.clone(),
+                })
+                .collect();
+            debug!("[service.rs] Returning {} PieceMap entries for {}/seg{}", entries.len(), content_id, segment_index);
+            DataCraftResponse::PieceMapEntries { entries }
         }
     }
 }
@@ -1510,6 +1571,25 @@ async fn handle_command(
                         warn!("[service.rs] PieceSync to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("piece sync timed out".into())); 
                     }
+                }
+            });
+        }
+
+        DataCraftCommand::PieceMapQuery { peer_id, content_id, segment_index, reply_tx } => {
+            debug!("[service.rs] Handling PieceMapQuery command: {}/seg{} to peer {}", content_id, segment_index, peer_id);
+            let request = DataCraftRequest::PieceMapQuery { content_id, segment_index };
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
+            tokio::spawn(async move {
+                if tx.send(msg).await.is_err() {
+                    let _ = reply_tx.send(Err("outbound channel closed".into()));
+                    return;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+                    Ok(Ok(response)) => { let _ = reply_tx.send(Ok(response)); }
+                    Ok(Err(_)) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
+                    Err(_) => { let _ = reply_tx.send(Err("piece map query timed out".into())); }
                 }
             });
         }
@@ -1719,6 +1799,11 @@ async fn handle_command(
                 .publish_to_topic(datacraft_core::PIECE_EVENTS_TOPIC, event_data) {
                 warn!("[service.rs] Failed to broadcast PieceEvent via gossipsub: {:?}", e);
             }
+        }
+
+        DataCraftCommand::SyncPieceMap { .. } => {
+            // Handled in drive_swarm before dispatch — should not reach here
+            unreachable!("SyncPieceMap should be intercepted in drive_swarm");
         }
 
         DataCraftCommand::TriggerDistribution => {

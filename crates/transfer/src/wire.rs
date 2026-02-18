@@ -8,15 +8,17 @@ use std::io;
 
 use futures::prelude::*;
 
-use crate::{DataCraftRequest, DataCraftResponse, PiecePayload};
+use crate::{DataCraftRequest, DataCraftResponse, PieceMapEntry, PiecePayload};
 use datacraft_core::{ContentId, WireStatus};
 
 // Type discriminants (matching existing codec)
 const TYPE_PIECE_SYNC: u8 = 0x01;
 const TYPE_PIECE_PUSH: u8 = 0x02;
 const TYPE_MANIFEST_PUSH: u8 = 0x03;
+const TYPE_PIECE_MAP_QUERY: u8 = 0x04;
 const TYPE_PIECE_BATCH: u8 = 0x81;
 const TYPE_ACK: u8 = 0x82;
+const TYPE_PIECE_MAP_ENTRIES: u8 = 0x83;
 
 /// Maximum frame payload (50 MB).
 const MAX_FRAME_PAYLOAD: usize = 50 * 1024 * 1024;
@@ -80,11 +82,11 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
     }
 
     match ty[0] {
-        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH => {
+        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY => {
             let request = deserialize_request(ty[0], &payload)?;
             Ok(StreamFrame::Request { seq_id, request })
         }
-        TYPE_PIECE_BATCH | TYPE_ACK => {
+        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES => {
             let response = deserialize_response(ty[0], &payload)?;
             Ok(StreamFrame::Response { seq_id, response })
         }
@@ -162,6 +164,15 @@ fn serialize_request(request: &DataCraftRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_MANIFEST_PUSH, payload))
         }
+        DataCraftRequest::PieceMapQuery { content_id, segment_index } => {
+            let inner = PieceMapQueryWire {
+                content_id: *content_id,
+                segment_index: *segment_index,
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_PIECE_MAP_QUERY, payload))
+        }
     }
 }
 
@@ -197,6 +208,14 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<DataCraftRequ
                 manifest_json: inner.manifest_json,
             })
         }
+        TYPE_PIECE_MAP_QUERY => {
+            let inner: PieceMapQueryWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(DataCraftRequest::PieceMapQuery {
+                content_id: inner.content_id,
+                segment_index: inner.segment_index,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown request type: 0x{:02x}", msg_type),
@@ -216,6 +235,11 @@ fn serialize_response(response: &DataCraftResponse) -> io::Result<(u8, Vec<u8>)>
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_ACK, payload))
         }
+        DataCraftResponse::PieceMapEntries { entries } => {
+            let payload = bincode::serialize(entries)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_PIECE_MAP_ENTRIES, payload))
+        }
     }
 }
 
@@ -230,6 +254,11 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<DataCraftRes
             let status: WireStatus = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(DataCraftResponse::Ack { status })
+        }
+        TYPE_PIECE_MAP_ENTRIES => {
+            let entries: Vec<PieceMapEntry> = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(DataCraftResponse::PieceMapEntries { entries })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -263,6 +292,12 @@ struct PiecePushWire {
 struct ManifestPushWire {
     content_id: ContentId,
     manifest_json: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PieceMapQueryWire {
+    content_id: ContentId,
+    segment_index: u32,
 }
 
 #[cfg(test)]

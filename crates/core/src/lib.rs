@@ -763,6 +763,49 @@ pub enum DataCraftError {
 
 pub type Result<T> = std::result::Result<T, DataCraftError>;
 
+// ── Health History Snapshots ────────────────────────────────
+
+/// A point-in-time snapshot of content health, persisted for timeline display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthSnapshot {
+    /// Unix milliseconds when this snapshot was taken.
+    pub timestamp: u64,
+    /// Content ID this snapshot is for.
+    pub content_id: ContentId,
+    /// Number of segments in the content.
+    pub segment_count: usize,
+    /// Per-segment health snapshots.
+    pub segments: Vec<SegmentSnapshot>,
+    /// Number of unique providers holding pieces for this content.
+    pub provider_count: usize,
+    /// Minimum health ratio across all segments (pieces/k).
+    pub health_ratio: f64,
+    /// Action taken by HealthScan during this cycle, if any.
+    pub action: Option<HealthAction>,
+}
+
+/// Per-segment health snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentSnapshot {
+    /// Segment index.
+    pub index: u32,
+    /// Rank (number of linearly independent pieces from online nodes).
+    pub rank: usize,
+    /// k value for this segment (pieces needed for reconstruction).
+    pub k: usize,
+    /// Number of unique providers for this segment.
+    pub provider_count: usize,
+}
+
+/// Action taken by HealthScan during a scan cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HealthAction {
+    /// A segment was repaired (new piece generated).
+    Repaired { segment: u32 },
+    /// A segment was degraded (excess piece dropped).
+    Degraded { segment: u32 },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,6 +1171,27 @@ mod tests {
         assert_eq!(parsed.cid, notice.cid);
         assert_eq!(parsed.creator, notice.creator);
         assert!(parsed.verify());
+    }
+
+    #[test]
+    fn test_health_snapshot_serde() {
+        let snap = HealthSnapshot {
+            timestamp: 1234567890,
+            content_id: ContentId([1u8; 32]),
+            segment_count: 2,
+            segments: vec![
+                SegmentSnapshot { index: 0, rank: 3, k: 3, provider_count: 2 },
+                SegmentSnapshot { index: 1, rank: 2, k: 3, provider_count: 1 },
+            ],
+            provider_count: 2,
+            health_ratio: 0.667,
+            action: Some(HealthAction::Repaired { segment: 1 }),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: HealthSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.timestamp, 1234567890);
+        assert_eq!(parsed.segments.len(), 2);
+        assert!(matches!(parsed.action, Some(HealthAction::Repaired { segment: 1 })));
     }
 
     #[test]

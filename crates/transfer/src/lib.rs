@@ -48,6 +48,11 @@ pub enum DataCraftRequest {
         content_id: ContentId,
         manifest_json: Vec<u8>,
     },
+    /// Query PieceMap entries for a specific segment (lightweight — no piece data).
+    PieceMapQuery {
+        content_id: ContentId,
+        segment_index: u32,
+    },
 }
 
 /// A piece within a PieceBatch response.
@@ -59,6 +64,17 @@ pub struct PiecePayload {
     pub data: Vec<u8>,
 }
 
+/// A PieceMap entry returned by PieceMapQuery — metadata only, no piece data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PieceMapEntry {
+    /// Node that holds this piece (PeerId bytes).
+    pub node: Vec<u8>,
+    /// Piece identifier (SHA-256 of coefficients).
+    pub piece_id: [u8; 32],
+    /// Coefficient vector over GF(2^8).
+    pub coefficients: Vec<u8>,
+}
+
 /// A response in the DataCraft transfer protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataCraftResponse {
@@ -66,6 +82,8 @@ pub enum DataCraftResponse {
     PieceBatch { pieces: Vec<PiecePayload> },
     /// Ack for PiecePush or ManifestPush.
     Ack { status: WireStatus },
+    /// Response to PieceMapQuery: known PieceMap entries for the queried segment.
+    PieceMapEntries { entries: Vec<PieceMapEntry> },
 }
 
 #[cfg(test)]

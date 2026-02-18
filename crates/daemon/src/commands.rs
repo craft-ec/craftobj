@@ -37,6 +37,13 @@ pub enum DataCraftCommand {
         max_pieces: u16,
         reply_tx: oneshot::Sender<Result<DataCraftResponse, String>>,
     },
+    /// Query a peer's PieceMap entries for a specific segment (lightweight sync).
+    PieceMapQuery {
+        peer_id: PeerId,
+        content_id: ContentId,
+        segment_index: u32,
+        reply_tx: oneshot::Sender<Result<DataCraftResponse, String>>,
+    },
     /// Publish a capability announcement via gossipsub.
     PublishCapabilities {
         capabilities: Vec<DataCraftCapability>,
@@ -120,5 +127,10 @@ pub enum DataCraftCommand {
     /// Broadcast a PieceEvent via gossipsub on PIECE_EVENTS_TOPIC.
     BroadcastPieceEvent {
         event_data: Vec<u8>,
+    },
+    /// Sync PieceMap entries for a newly tracked segment from connected peers.
+    SyncPieceMap {
+        content_id: ContentId,
+        segment_index: u32,
     },
 }
