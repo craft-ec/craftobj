@@ -627,8 +627,10 @@ async fn eviction_maintenance_loop(
                     let event = datacraft_core::PieceEvent::Dropped(dropped);
                     map.apply_event(&event);
                 }
-                // Untrack all segments for this removed CID
+                // Remove DHT provider records and untrack all segments for this removed CID
                 for seg in segments_seen {
+                    let pkey = datacraft_routing::provider_key(cid, seg);
+                    let _ = command_tx.send(DataCraftCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
             }
@@ -750,7 +752,9 @@ async fn gc_loop(
                         let event = datacraft_core::PieceEvent::Dropped(dropped);
                         map.apply_event(&event);
                     }
-                    // Untrack segment after dropping all pieces
+                    // Remove DHT provider record and untrack segment after dropping all pieces
+                    let pkey = datacraft_routing::provider_key(cid, seg);
+                    let _ = command_tx.send(DataCraftCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
             }
@@ -1157,6 +1161,9 @@ async fn handle_incoming_transfer_request(
                         let event = datacraft_core::PieceEvent::Stored(stored);
                         map.apply_event(&event);
                     }
+                    // Publish DHT provider record for this CID+segment
+                    let pkey = datacraft_routing::provider_key(&content_id, segment_index);
+                    let _ = command_tx.send(DataCraftCommand::StartProviding { key: pkey });
                     DataCraftResponse::Ack { status: WireStatus::Ok }
                 }
                 Err(e) => {
@@ -1489,6 +1496,20 @@ async fn handle_command(
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
         }
+        DataCraftCommand::StartProviding { key } => {
+            debug!("Handling StartProviding command (key len={})", key.len());
+            match swarm.behaviour_mut().craft.start_providing(&key) {
+                Ok(_query_id) => debug!("Started providing for key {}", hex::encode(&key[..8.min(key.len())])),
+                Err(e) => warn!("Failed to start providing: {:?}", e),
+            }
+        }
+
+        DataCraftCommand::StopProviding { key } => {
+            debug!("Handling StopProviding command (key len={})", key.len());
+            swarm.behaviour_mut().craft.stop_providing(&key);
+            debug!("Stopped providing for key {}", hex::encode(&key[..8.min(key.len())]));
+        }
+
         DataCraftCommand::SyncPieceMap { .. } => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("SyncPieceMap should be intercepted in drive_swarm");

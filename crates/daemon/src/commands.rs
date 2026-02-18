@@ -101,4 +101,8 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         segment_index: u32,
     },
+    /// Publish a DHT provider record for a CID+segment (called after storing a piece).
+    StartProviding { key: Vec<u8> },
+    /// Remove a DHT provider record for a CID+segment (called after dropping all pieces for a segment).
+    StopProviding { key: Vec<u8> },
 }

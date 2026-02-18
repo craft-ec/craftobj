@@ -1130,6 +1130,11 @@ impl DataCraftHandler {
                                             let event = datacraft_core::PieceEvent::Stored(ps_event);
                                             map.apply_event(&event);
                                         }
+                                        // Publish DHT provider record for this CID+segment
+                                        {
+                                            let pkey = datacraft_routing::provider_key(&cid, seg_idx);
+                                            let _ = command_tx.send(DataCraftCommand::StartProviding { key: pkey });
+                                        }
                                         coeff_matrix.push(coefficients);
                                         current_rank = new_rank;
                                         total_fetched += 1;
