@@ -1117,6 +1117,7 @@ dependencies = [
 name = "craftobj-daemon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bincode",
  "craftec-app",
@@ -1153,6 +1154,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
