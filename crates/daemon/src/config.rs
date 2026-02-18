@@ -57,6 +57,11 @@ pub struct DaemonConfig {
     /// New inbound connections are rejected when this limit is reached.
     pub max_peer_connections: usize,
 
+    // ── Settlement ──────────────────────────────────────────
+    /// Creator pool ID (32-byte hex). Used by aggregator for settlement receipts.
+    /// Leave empty/None for nodes that don't participate in settlement.
+    pub pool_id: Option<String>,
+
     // ── Concurrency & Timeouts ───────────────────────────────
     /// Maximum concurrent piece transfers (default: 64).
     pub max_concurrent_transfers: usize,
@@ -102,6 +107,7 @@ impl Default for DaemonConfig {
             max_storage_bytes: 0,
             gc_interval_secs: 3600,
             max_peer_connections: 50,
+            pool_id: None,
             boot_peers: Vec::new(),
             region: None,
             extra: serde_json::Map::new(),

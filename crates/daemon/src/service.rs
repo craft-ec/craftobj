@@ -477,7 +477,10 @@ pub async fn run_daemon_with_config(
         epoch_duration: std::time::Duration::from_secs(
             daemon_config.aggregation_epoch_secs.unwrap_or(600),
         ),
-        pool_id: [0u8; 32], // TODO: load from config/on-chain
+        pool_id: daemon_config.pool_id.as_deref()
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .unwrap_or([0u8; 32]),
     };
 
     // Run all components concurrently
