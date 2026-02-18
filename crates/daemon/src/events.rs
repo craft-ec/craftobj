@@ -26,12 +26,10 @@ pub enum DaemonEvent {
     },
 
     // -- Announcements --
-    CapabilityAnnounced { peer_id: String, capabilities: Vec<String>, storage_committed: u64, storage_used: u64 },
-    CapabilityPublished { capabilities: Vec<String>, storage_committed: u64, storage_used: u64 },
     ProviderAnnounced { content_id: String },
     ContentReannounced { content_id: String },
 
-    // -- Gossip --
+    // -- Receipts --
     StorageReceiptReceived { content_id: String, storage_node: String },
     RemovalNoticeReceived { content_id: String, creator: String, valid: bool },
 

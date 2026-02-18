@@ -615,10 +615,10 @@ mod tests {
         // Local is the ONLY provider, so it's definitely in top 1 → should repair
         scan.run_scan().await;
 
-        // Check that repair generated a new piece (stored in PieceMap)
-        let map = scan.piece_map.lock().await;
-        let pieces = map.pieces_for_segment(&cid, 0);
-        assert!(pieces.len() > 2, "Should have generated a new piece from repair");
+        // Check that repair generated a new piece (stored in FsStore)
+        let s = store.lock().await;
+        let pieces_after = s.list_pieces(&cid, 0).unwrap();
+        assert!(pieces_after.len() > 2, "Should have generated a new piece from repair");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -673,10 +673,10 @@ mod tests {
         scan.run_scan().await;
 
         // Local node should have attempted repair (every provider repairs with different offset)
-        // Check that repair generated a new piece (stored in PieceMap)
-        let map = scan.piece_map.lock().await;
-        let pieces = map.pieces_for_segment(&cid, 0);
-        assert!(pieces.len() > 2, "Local node should repair with its offset");
+        // Check that repair generated a new piece (stored in FsStore)
+        let s = store.lock().await;
+        let pieces_after = s.list_pieces(&cid, 0).unwrap();
+        assert!(pieces_after.len() > 2, "Local node should repair with its offset");
 
         std::fs::remove_dir_all(&dir).ok();
     }

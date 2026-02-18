@@ -19,7 +19,7 @@ pub type DataCraftSwarm = libp2p::Swarm<DataCraftBehaviour>;
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "DataCraftBehaviourEvent")]
 pub struct DataCraftBehaviour {
-    /// Generic Craftec networking (Kademlia, Gossipsub, mDNS, etc.)
+    /// Generic Craftec networking (Kademlia, mDNS, etc.)
     pub craft: CraftBehaviour,
     /// Persistent stream transport for piece transfer
     pub stream: libp2p_stream::Behaviour,

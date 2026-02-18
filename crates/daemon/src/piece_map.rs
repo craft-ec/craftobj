@@ -1,7 +1,7 @@
 //! PieceMap — scoped, event-sourced materialized view of piece locations.
 //!
 //! Only tracks segments the local node holds pieces in (scoped PieceMap).
-//! Built from PieceStored/PieceDropped events on gossipsub.
+//! Built from PieceStored/PieceDropped events (local and P2P sync).
 //! Events for untracked segments are discarded.
 
 use std::collections::{HashMap, HashSet};

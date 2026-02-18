@@ -82,7 +82,7 @@ pub struct ContentTracker {
     states: HashMap<ContentId, ContentState>,
     path: PathBuf,
     reannounce_threshold_secs: u64,
-    /// In-memory provider tracking per CID (from DHT discovery / gossipsub).
+    /// In-memory provider tracking per CID (from DHT discovery).
     /// Not persisted — rebuilt at runtime from network events.
     providers: HashMap<ContentId, HashSet<PeerId>>,
 }
@@ -209,7 +209,7 @@ impl ContentTracker {
         }
     }
 
-    /// Record a provider PeerId for a CID (from DHT discovery or gossipsub).
+    /// Record a provider PeerId for a CID (from DHT discovery).
     pub fn add_provider(&mut self, content_id: &ContentId, peer: PeerId) {
         let set = self.providers.entry(*content_id).or_default();
         set.insert(peer);

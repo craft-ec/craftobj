@@ -1,6 +1,6 @@
 //! In-memory cache of content removal notices.
 //!
-//! Populated from DHT on startup and gossipsub events.
+//! Populated from DHT lookups.
 //! Storage nodes check this before serving shards to avoid DHT lookup every time.
 
 use std::collections::HashMap;

@@ -1,9 +1,8 @@
 //! Scaling Coordinator
 //!
-//! Demand-driven piece distribution via gossipsub (push-based).
-//! When content is hot (high fetch rate), serving nodes publish demand signals.
-//! Existing providers see the signal, create a new piece via RLNC recombination,
-//! and push it to the highest-rated non-provider node — same pattern as repair.
+//! Demand-driven piece distribution (push-based).
+//! When content is hot (high local fetch rate), nodes can create new pieces via
+//! RLNC recombination and push them to non-provider nodes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,12 +98,11 @@ impl DemandTracker {
     }
 }
 
-/// Tracks received DemandSignals from gossipsub.
-/// Used by the challenger to check if content has active network-wide demand
-/// before emitting degradation signals.
+/// Tracks received DemandSignals.
+/// Used by health_scan to check if content has active demand before degrading.
 #[derive(Default)]
 pub struct DemandSignalTracker {
-    /// Last time a DemandSignal was received per CID (from any peer via gossipsub).
+    /// Last time a DemandSignal was received per CID.
     last_signal: HashMap<ContentId, Instant>,
 }
 
@@ -168,7 +166,7 @@ impl ScalingCoordinator {
         self.peer_scorer = Some(scorer);
     }
 
-    /// Handle an incoming scaling notice (demand signal) from gossipsub.
+    /// Handle an incoming scaling notice (demand signal).
     /// Called by nodes that ARE providers for this CID.
     /// Returns Some(delay) if we should proceed with push, None if we should skip.
     pub fn handle_scaling_notice(

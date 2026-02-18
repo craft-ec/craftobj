@@ -349,21 +349,6 @@ pub const REKEY_DHT_PREFIX: &str = "/datacraft/rekey/";
 /// DHT key prefix for content removal notices.
 pub const REMOVAL_DHT_PREFIX: &str = "/datacraft/removal/";
 
-/// Gossipsub topic for node status heartbeats.
-pub const NODE_STATUS_TOPIC: &str = "datacraft/node-status/1.0.0";
-
-/// Gossipsub topic for ZK-proven storage receipt summaries.
-pub const PROOFS_TOPIC: &str = "datacraft/proofs/1.0.0";
-
-/// Gossipsub topic for capability announcements.
-pub const CAPABILITIES_TOPIC: &str = "datacraft/capabilities/1.0.0";
-
-/// Gossipsub topic for content removal notices (fast propagation).
-pub const REMOVAL_TOPIC: &str = "datacraft/removal/1.0.0";
-
-/// Gossipsub topic for piece events (event-sourced tracking).
-pub const PIECE_EVENTS_TOPIC: &str = "datacraft/pieces/1.0.0";
-
 /// Event-sourced piece tracking event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PieceEvent {
@@ -500,12 +485,6 @@ impl PieceDropped {
     }
 }
 
-/// Gossipsub topic for StorageReceipt broadcast (aggregator collection).
-pub const STORAGE_RECEIPT_TOPIC: &str = "datacraft/storage-receipts/1.0.0";
-
-/// Gossipsub topic for demand/scaling signals.
-pub const SCALING_TOPIC: &str = "datacraft/scaling/1.0.0";
-
 /// Demand signal: a serving node detected high demand for content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DemandSignal {
@@ -542,7 +521,7 @@ impl std::fmt::Display for DataCraftCapability {
     }
 }
 
-/// Announcement of a peer's capabilities, published via gossipsub.
+/// Announcement of a peer's capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityAnnouncement {
     /// Peer ID bytes of the announcing node.
