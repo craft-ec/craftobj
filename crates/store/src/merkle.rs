@@ -59,6 +59,15 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// Diff result between two tree states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleDiff {
+    /// Leaves present in the current tree but not in the other (additions).
+    pub added: Vec<[u8; 32]>,
+    /// Leaves present in the other tree but not in the current tree (removals).
+    pub removed: Vec<[u8; 32]>,
+}
+
 /// Storage Merkle tree over all pieces held by a node.
 #[derive(Debug, Clone)]
 pub struct StorageMerkleTree {
@@ -202,6 +211,74 @@ impl StorageMerkleTree {
             level = next;
         }
         level[0]
+    }
+
+    /// Export leaves for transmission to another node.
+    pub fn leaves(&self) -> &[[u8; 32]] {
+        &self.leaves
+    }
+
+    /// Build a tree from a set of leaves (for remote tree reconstruction).
+    /// Leaves will be sorted and deduplicated.
+    pub fn from_leaves(mut leaves: Vec<[u8; 32]>) -> Self {
+        leaves.sort();
+        leaves.dedup();
+        let root = Self::compute_root_from_leaves(&leaves);
+        Self {
+            leaves,
+            cached_root: root,
+        }
+    }
+
+    /// Quick check: has anything changed since the given root?
+    pub fn has_changed_since(&self, old_root: &[u8; 32]) -> bool {
+        self.cached_root != *old_root
+    }
+
+    /// Compute diff: what changed between `other` (old state) and `self` (current state).
+    /// Uses O(n+m) sorted merge comparison.
+    pub fn diff(&self, other: &StorageMerkleTree) -> MerkleDiff {
+        self.diff_from_leaves(&other.leaves)
+    }
+
+    /// Compute diff from a previous sorted leaf set.
+    /// `old_leaves` must be sorted.
+    pub fn diff_from_leaves(&self, old_leaves: &[[u8; 32]]) -> MerkleDiff {
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut i = 0; // index into self.leaves (current)
+        let mut j = 0; // index into old_leaves
+
+        while i < self.leaves.len() && j < old_leaves.len() {
+            match self.leaves[i].cmp(&old_leaves[j]) {
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    // In current but not in old → added
+                    added.push(self.leaves[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    // In old but not in current → removed
+                    removed.push(old_leaves[j]);
+                    j += 1;
+                }
+            }
+        }
+        // Remaining in current = added
+        while i < self.leaves.len() {
+            added.push(self.leaves[i]);
+            i += 1;
+        }
+        // Remaining in old = removed
+        while j < old_leaves.len() {
+            removed.push(old_leaves[j]);
+            j += 1;
+        }
+
+        MerkleDiff { added, removed }
     }
 
     /// Build proof path for leaf at given index.
@@ -431,6 +508,101 @@ mod tests {
         assert_eq!(tree.root(), manual.root());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_diff_empty_trees() {
+        let t1 = StorageMerkleTree::new();
+        let t2 = StorageMerkleTree::new();
+        let diff = t1.diff(&t2);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn test_diff_additions() {
+        let old = StorageMerkleTree::new();
+        let mut current = StorageMerkleTree::new();
+        current.insert(&cid(1), 0, &pid(1));
+        current.insert(&cid(2), 0, &pid(2));
+        let diff = current.diff(&old);
+        assert_eq!(diff.added.len(), 2);
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn test_diff_removals() {
+        let mut old = StorageMerkleTree::new();
+        old.insert(&cid(1), 0, &pid(1));
+        old.insert(&cid(2), 0, &pid(2));
+        let current = StorageMerkleTree::new();
+        let diff = current.diff(&old);
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.removed.len(), 2);
+    }
+
+    #[test]
+    fn test_diff_mixed() {
+        let mut old = StorageMerkleTree::new();
+        old.insert(&cid(1), 0, &pid(1));
+        old.insert(&cid(2), 0, &pid(2));
+
+        let mut current = StorageMerkleTree::new();
+        current.insert(&cid(2), 0, &pid(2));
+        current.insert(&cid(3), 0, &pid(3));
+
+        let diff = current.diff(&old);
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.added[0], compute_leaf(&cid(3), 0, &pid(3)));
+        assert_eq!(diff.removed[0], compute_leaf(&cid(1), 0, &pid(1)));
+    }
+
+    #[test]
+    fn test_diff_identical() {
+        let mut t1 = StorageMerkleTree::new();
+        t1.insert(&cid(1), 0, &pid(1));
+        t1.insert(&cid(2), 0, &pid(2));
+        let t2 = t1.clone();
+        let diff = t1.diff(&t2);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn test_diff_from_leaves() {
+        let mut current = StorageMerkleTree::new();
+        current.insert(&cid(1), 0, &pid(1));
+        current.insert(&cid(2), 0, &pid(2));
+
+        let old_leaves = vec![compute_leaf(&cid(1), 0, &pid(1))];
+        let diff = current.diff_from_leaves(&old_leaves);
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0], compute_leaf(&cid(2), 0, &pid(2)));
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn test_has_changed_since() {
+        let mut tree = StorageMerkleTree::new();
+        let root1 = tree.root();
+        assert!(!tree.has_changed_since(&root1));
+        tree.insert(&cid(1), 0, &pid(1));
+        assert!(tree.has_changed_since(&root1));
+        assert!(!tree.has_changed_since(&tree.root()));
+    }
+
+    #[test]
+    fn test_from_leaves_roundtrip() {
+        let mut tree = StorageMerkleTree::new();
+        tree.insert(&cid(1), 0, &pid(1));
+        tree.insert(&cid(2), 0, &pid(2));
+        tree.insert(&cid(3), 1, &pid(3));
+
+        let exported = tree.leaves().to_vec();
+        let reconstructed = StorageMerkleTree::from_leaves(exported);
+        assert_eq!(tree.root(), reconstructed.root());
+        assert_eq!(tree.len(), reconstructed.len());
     }
 
     #[test]
