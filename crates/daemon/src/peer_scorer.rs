@@ -40,7 +40,7 @@ pub struct PeerScorer {
 
 /// Per-peer scoring state.
 pub struct PeerScore {
-    /// Known capabilities from gossipsub announcements.
+    /// Known capabilities.
     pub capabilities: Vec<DataCraftCapability>,
     /// When the last capability announcement was received.
     pub last_announcement: Instant,
@@ -279,7 +279,7 @@ impl PeerScorer {
         scored.into_iter().map(|(p, _)| p).collect()
     }
 
-    /// Update capabilities from a gossipsub announcement.
+    /// Update capabilities from peer discovery.
     /// Only updates if the timestamp is newer than the current record.
     pub fn update_capabilities(
         &mut self,
@@ -290,7 +290,7 @@ impl PeerScorer {
         self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None);
     }
 
-    /// Update capabilities and storage info from a gossipsub announcement.
+    /// Update capabilities and storage info from peer discovery.
     pub fn update_capabilities_with_storage(
         &mut self,
         peer: &PeerId,
@@ -303,7 +303,7 @@ impl PeerScorer {
         self.update_capabilities_full(peer, capabilities, _timestamp, storage_committed_bytes, storage_used_bytes, region, [0u8; 32]);
     }
 
-    /// Update capabilities, storage info, and merkle root from a gossipsub announcement.
+    /// Update capabilities, storage info, and merkle root from peer discovery.
     pub fn update_capabilities_full(
         &mut self,
         peer: &PeerId,
@@ -352,7 +352,7 @@ impl PeerScorer {
     }
 
     /// Remove peers whose last announcement exceeds the given TTL.
-    /// Call after processing gossipsub messages, not on a timer.
+    /// Call periodically to remove stale peers.
     pub fn evict_stale(&mut self, ttl: Duration) {
         let now = Instant::now();
         self.scores

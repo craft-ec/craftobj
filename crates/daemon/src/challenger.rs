@@ -232,7 +232,7 @@ impl ChallengerManager {
         }
 
         // Step 1: Read coefficient vectors from PieceMap (replaces inventory requests).
-        // PieceMap contains all known coefficient vectors from gossipsub events.
+        // PieceMap contains all known coefficient vectors from P2P sync.
         let mut all_inventory_vectors: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
         if let Some(ref pm) = self.piece_map {
             let map = pm.lock().await;
@@ -415,7 +415,7 @@ impl ChallengerManager {
             }
         }
 
-        // Receipts are stored locally; no gossipsub broadcast.
+        // Receipts are stored locally.
 
         self.rotation.advance(&cid, &sorted);
         if let Some(state) = self.provided_cids.get_mut(&cid) {

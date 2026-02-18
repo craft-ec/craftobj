@@ -1125,7 +1125,7 @@ async fn handle_incoming_transfer_request(
                     if let Err(e) = protocol.event_tx.send(DataCraftEvent::PiecePushReceived { content_id }) {
                         debug!("Failed to send piece push event: {}", e);
                     }
-                    // Emit PieceStored event to PieceMap and gossipsub
+                    // Emit PieceStored event to PieceMap
                     {
                         let mut map = piece_map.lock().await;
                         // Track segment if this is the first piece for it
