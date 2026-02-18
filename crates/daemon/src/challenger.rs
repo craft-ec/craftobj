@@ -415,13 +415,7 @@ impl ChallengerManager {
             }
         }
 
-        for receipt in &signed_receipts {
-            if let Ok(data) = bincode::serialize(receipt) {
-                let _ = self.command_tx.send(
-                    DataCraftCommand::BroadcastStorageReceipt { receipt_data: data }
-                );
-            }
-        }
+        // Receipts are stored locally; no gossipsub broadcast.
 
         self.rotation.advance(&cid, &sorted);
         if let Some(state) = self.provided_cids.get_mut(&cid) {

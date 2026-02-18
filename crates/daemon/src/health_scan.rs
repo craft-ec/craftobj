@@ -301,9 +301,6 @@ impl HealthScan {
                     };
                     let event = datacraft_core::PieceEvent::Stored(stored);
                     map.apply_event(&event);
-                    if let Ok(data) = bincode::serialize(&event) {
-                        let _ = self.command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                    }
                     info!("HealthScan repair complete for {}/seg{}: generated 1 new piece", cid, segment);
                 }
             }
@@ -350,9 +347,6 @@ impl HealthScan {
             };
             let event = datacraft_core::PieceEvent::Dropped(dropped);
             map.apply_event(&event);
-            if let Ok(data) = bincode::serialize(&event) {
-                let _ = self.command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-            }
         }
     }
 
@@ -621,14 +615,10 @@ mod tests {
         // Local is the ONLY provider, so it's definitely in top 1 → should repair
         scan.run_scan().await;
 
-        // Check that a BroadcastPieceEvent was sent (repair generated a piece)
-        let mut found_broadcast = false;
-        while let Ok(cmd) = rx.try_recv() {
-            if matches!(cmd, DataCraftCommand::BroadcastPieceEvent { .. }) {
-                found_broadcast = true;
-            }
-        }
-        assert!(found_broadcast, "Should have broadcast a PieceStored event from repair");
+        // Check that repair generated a new piece (stored in PieceMap)
+        let map = scan.piece_map.lock().await;
+        let pieces = map.pieces_for_segment(&cid, 0);
+        assert!(pieces.len() > 2, "Should have generated a new piece from repair");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -683,13 +673,10 @@ mod tests {
         scan.run_scan().await;
 
         // Local node should have attempted repair (every provider repairs with different offset)
-        let mut found_broadcast = false;
-        while let Ok(cmd) = rx.try_recv() {
-            if matches!(cmd, DataCraftCommand::BroadcastPieceEvent { .. }) {
-                found_broadcast = true;
-            }
-        }
-        assert!(found_broadcast, "Local node should repair with its offset");
+        // Check that repair generated a new piece (stored in PieceMap)
+        let map = scan.piece_map.lock().await;
+        let pieces = map.pieces_for_segment(&cid, 0);
+        assert!(pieces.len() > 2, "Local node should repair with its offset");
 
         std::fs::remove_dir_all(&dir).ok();
     }

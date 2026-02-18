@@ -36,8 +36,6 @@ pub struct DaemonConfig {
     pub socket_path: Option<String>,
 
     // ── Timing ──────────────────────────────────────────────
-    /// Capability announcement interval in seconds (default: 300)
-    pub capability_announce_interval_secs: u64,
     /// Content reannounce check interval in seconds (default: 600)
     pub reannounce_interval_secs: u64,
     /// Content staleness threshold before re-announcing in seconds (default: 1200)
@@ -93,7 +91,6 @@ impl Default for DaemonConfig {
             listen_port: 0,
             ws_port: 9091,
             socket_path: None,
-            capability_announce_interval_secs: 300,
             reannounce_interval_secs: 600,
             reannounce_threshold_secs: 1200,
             challenger_interval_secs: None,
@@ -200,12 +197,6 @@ impl DaemonConfig {
                 self.capabilities = caps;
             }
         }
-        if let Ok(val) = std::env::var("DATACRAFT_CAPABILITY_ANNOUNCE_INTERVAL") {
-            if let Ok(secs) = val.parse::<u64>() {
-                debug!("DATACRAFT_CAPABILITY_ANNOUNCE_INTERVAL={}", secs);
-                self.capability_announce_interval_secs = secs;
-            }
-        }
         if let Ok(val) = std::env::var("DATACRAFT_REANNOUNCE_INTERVAL") {
             if let Ok(secs) = val.parse::<u64>() {
                 debug!("DATACRAFT_REANNOUNCE_INTERVAL={}", secs);
@@ -239,9 +230,6 @@ impl DaemonConfig {
             } else if let Some(s) = v.as_str() {
                 self.socket_path = Some(s.to_string());
             }
-        }
-        if let Some(v) = partial.get("capability_announce_interval_secs").and_then(|v| v.as_u64()) {
-            self.capability_announce_interval_secs = v;
         }
         if let Some(v) = partial.get("reannounce_interval_secs").and_then(|v| v.as_u64()) {
             self.reannounce_interval_secs = v;
@@ -279,7 +267,6 @@ mod tests {
         let config = DaemonConfig::default();
         assert_eq!(config.schema_version, SCHEMA_VERSION);
         assert_eq!(config.capabilities, vec!["client", "storage"]);
-        assert_eq!(config.capability_announce_interval_secs, 300);
         assert_eq!(config.reannounce_interval_secs, 600);
         assert_eq!(config.reannounce_threshold_secs, 1200);
         assert!(config.challenger_interval_secs.is_none());
@@ -291,7 +278,7 @@ mod tests {
     fn test_load_missing_file() {
         let dir = std::env::temp_dir().join("daemon-config-test-missing");
         let config = DaemonConfig::load(&dir);
-        assert_eq!(config.capability_announce_interval_secs, 300);
+        assert_eq!(config.reannounce_interval_secs, 600);
     }
 
     #[test]
@@ -331,7 +318,7 @@ mod tests {
         assert_eq!(config.challenger_interval_secs, Some(120));
         assert_eq!(config.capabilities, vec!["client", "aggregator"]);
         // Unchanged
-        assert_eq!(config.capability_announce_interval_secs, 300);
+        assert_eq!(config.reannounce_threshold_secs, 1200);
     }
 
     #[test]

@@ -374,11 +374,6 @@ impl DataCraftHandler {
                     }
                     let event = datacraft_core::PieceEvent::Dropped(dropped);
                     map.apply_event(&event);
-                    if let Ok(data) = bincode::serialize(&event) {
-                        if let Some(ref tx) = self.command_tx {
-                            let _ = tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                        }
-                    }
                 }
             }
         }
@@ -1134,9 +1129,6 @@ impl DataCraftHandler {
                                             }
                                             let event = datacraft_core::PieceEvent::Stored(ps_event);
                                             map.apply_event(&event);
-                                            if let Ok(data) = bincode::serialize(&event) {
-                                                let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                                            }
                                         }
                                         coeff_matrix.push(coefficients);
                                         current_rank = new_rank;
@@ -1563,7 +1555,7 @@ impl DataCraftHandler {
                 .map_err(|e| e.to_string())?
         };
 
-        // Publish to DHT + gossipsub
+        // Publish to DHT
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
             command_tx.send(DataCraftCommand::PublishRemoval {
@@ -2460,20 +2452,7 @@ impl IpcHandler for DataCraftHandler {
                 "network.health" => self.handle_network_health().await,
                 "node.stats" => self.handle_node_stats().await,
                 "shutdown" => {
-                    info!("[handler.rs] Shutdown requested via RPC — broadcasting going-offline");
-                    // Broadcast going-offline message before shutdown
-                    if let Some(ref tx) = self.command_tx {
-                        let local_peer_id = serde_json::json!({
-                            "type": "going_offline",
-                            "timestamp": std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                        });
-                        if let Ok(data) = serde_json::to_vec(&local_peer_id) {
-                            let _ = tx.send(DataCraftCommand::BroadcastGoingOffline { data });
-                        }
-                    }
+                    info!("[handler.rs] Shutdown requested via RPC");
                     // Emit event
                     if let Some(ref etx) = self.event_sender {
                         let _ = etx.send(DaemonEvent::PeerGoingOffline {
@@ -2482,9 +2461,8 @@ impl IpcHandler for DataCraftHandler {
                     }
                     // Respond first, then exit
                     let result = Ok(serde_json::json!({"status": "shutting_down"}));
-                    // Schedule exit after response is sent (give time for gossipsub message to propagate)
                     tokio::spawn(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         std::process::exit(0);
                     });
                     result

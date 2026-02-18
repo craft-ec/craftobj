@@ -8,7 +8,7 @@ use std::sync::Arc;
 use craftec_ipc::IpcServer;
 use craftec_network::NetworkConfig;
 use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, ContentManifest, CapabilityAnnouncement, DataCraftCapability, WireStatus};
+use datacraft_core::{ContentId, ContentManifest, DataCraftCapability, WireStatus};
 use datacraft_transfer::{DataCraftRequest, DataCraftResponse};
 use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
@@ -134,8 +134,7 @@ pub async fn run_daemon_with_config(
             cfg
         }
     };
-    info!("[service.rs] Daemon config: capability_announce={}s, reannounce_interval={}s, reannounce_threshold={}s",
-        daemon_config.capability_announce_interval_secs,
+    info!("[service.rs] Daemon config: reannounce_interval={}s, reannounce_threshold={}s",
         daemon_config.reannounce_interval_secs,
         daemon_config.reannounce_threshold_secs,
     );
@@ -193,7 +192,6 @@ pub async fn run_daemon_with_config(
                     }
                 } else {
                     // No peer ID in multiaddr — dial the address directly.
-                    // Won't add to Kademlia but will establish a connection for gossipsub.
                     info!("[service.rs] Dialing boot peer (no peer_id): {}", addr_str);
                     if let Err(e) = swarm.dial(addr) {
                         warn!("[service.rs] Failed to dial boot peer {}: {:?}", addr_str, e);
@@ -219,49 +217,8 @@ pub async fn run_daemon_with_config(
     // Create DataCraft protocol handler (DHT operations only)
     let protocol = DataCraftProtocol::new(protocol_event_tx);
 
-    // Subscribe to gossipsub topics
-    if let Err(e) = swarm
-        .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::NODE_STATUS_TOPIC)
-    {
-        error!("Failed to subscribe to node status: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::CAPABILITIES_TOPIC)
-    {
-        error!("Failed to subscribe to capabilities topic: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::REMOVAL_TOPIC)
-    {
-        error!("Failed to subscribe to removal topic: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::STORAGE_RECEIPT_TOPIC)
-    {
-        error!("Failed to subscribe to storage receipt topic: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::SCALING_TOPIC)
-    {
-        error!("Failed to subscribe to scaling topic: {:?}", e);
-    }
-    if let Err(e) = swarm
-        .behaviour_mut().craft
-        .subscribe_topic(datacraft_core::PIECE_EVENTS_TOPIC)
-    {
-        error!("Failed to subscribe to piece events topic: {:?}", e);
-    }
-
     // Peer scorer — tracks capabilities and reliability
     let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
-
-    // Removal cache for fast local checks
-    let removal_cache = Arc::new(Mutex::new(crate::removal_cache::RemovalCache::new()));
 
     // Start IPC server with enhanced handler
     let ipc_server = IpcServer::new(&socket_path);
@@ -507,12 +464,6 @@ pub async fn run_daemon_with_config(
     );
     let health_scan: Arc<Mutex<crate::health_scan::HealthScan>> = Arc::new(Mutex::new(health_scan));
 
-    // Scaling: coordinator for demand-driven piece acquisition
-    let scaling_command_tx = command_tx.clone();
-    let mut scaling_coord = crate::scaling::ScalingCoordinator::new(local_peer_id, scaling_command_tx);
-    scaling_coord.set_merkle_tree(merkle_tree.clone());
-    let scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>> = Arc::new(Mutex::new(scaling_coord));
-
     // Derive ed25519 signing key for capability announcement signing
     let swarm_signing_key = keypair.clone().try_into_ed25519().ok().map(|ed25519_kp| {
         let secret_bytes = ed25519_kp.secret();
@@ -539,7 +490,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, demand_signal_tracker.clone(), piece_map.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, piece_map.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
@@ -547,9 +498,6 @@ pub async fn run_daemon_with_config(
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
             info!("[service.rs] Protocol events handler ended");
-        }
-        _ = announce_capabilities_periodically(&local_peer_id, own_capabilities, command_tx_for_caps, daemon_config.capability_announce_interval_secs, client.clone(), daemon_config.max_storage_bytes, daemon_config.region.clone(), merkle_tree.clone()) => {
-            info!("[service.rs] Capability announcement loop ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
             info!("[service.rs] Challenger loop ended");
@@ -563,9 +511,6 @@ pub async fn run_daemon_with_config(
             peer_scorer.clone(),
         ) => {
             info!("[service.rs] Content maintenance loop ended");
-        }
-        _ = scaling_maintenance_loop(demand_tracker, command_tx_for_maintenance, local_peer_id, peer_scorer.clone(), content_tracker.clone()) => {
-            info!("[service.rs] Scaling maintenance loop ended");
         }
         _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), piece_map.clone(), command_tx.clone()) => {
             info!("[service.rs] Eviction maintenance loop ended");
@@ -588,49 +533,6 @@ pub async fn run_daemon_with_config(
     }
 
     Ok(())
-}
-
-/// Periodically check demand and broadcast signals for hot content.
-async fn scaling_maintenance_loop(
-    demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
-    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
-    local_peer_id: libp2p::PeerId,
-    peer_scorer: Arc<Mutex<crate::peer_scorer::PeerScorer>>,
-    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
-) {
-    use std::time::Duration;
-    // Initial delay
-    tokio::time::sleep(Duration::from_secs(30)).await;
-
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
-    loop {
-        interval.tick().await;
-        let mut tracker = demand_tracker.lock().await;
-        let hot_cids = tracker.check_demand();
-        for (cid, demand_level) in hot_cids {
-            // Get known providers for this CID to exclude from push targets
-            let known_providers = content_tracker.lock().await.get_providers(&cid);
-            let has_targets = crate::push_target::has_non_provider_targets(
-                &local_peer_id,
-                &known_providers,
-                &Some(peer_scorer.clone()),
-            );
-            if tracker.should_broadcast_demand(&cid, has_targets) {
-                if !has_targets {
-                    debug!("Skipping scaling notice for {}: no non-provider targets", cid);
-                    continue;
-                }
-                let signal = crate::scaling::create_demand_signal(cid, demand_level, 0, &local_peer_id);
-                if let Ok(data) = bincode::serialize(&signal) {
-                    let _ = command_tx.send(DataCraftCommand::BroadcastDemandSignal {
-                        signal_data: data,
-                    });
-                    info!("[service.rs] Broadcasting demand signal for {}: level={}", cid, demand_level);
-                }
-            }
-        }
-        tracker.cleanup();
-    }
 }
 
 /// Periodically check storage pressure and evict free content.
@@ -724,9 +626,6 @@ async fn eviction_maintenance_loop(
                     };
                     let event = datacraft_core::PieceEvent::Dropped(dropped);
                     map.apply_event(&event);
-                    if let Ok(data) = bincode::serialize(&event) {
-                        let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                    }
                 }
                 // Untrack all segments for this removed CID
                 for seg in segments_seen {
@@ -850,9 +749,6 @@ async fn gc_loop(
                         };
                         let event = datacraft_core::PieceEvent::Dropped(dropped);
                         map.apply_event(&event);
-                        if let Ok(data) = bincode::serialize(&event) {
-                            let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                        }
                     }
                     // Untrack segment after dropping all pieces
                     map.untrack_segment(cid, seg);
@@ -882,31 +778,24 @@ async fn gc_loop(
     }
 }
 
-/// Type alias for shared removal cache.
-type SharedRemovalCache = Arc<Mutex<crate::removal_cache::RemovalCache>>;
-
 async fn drive_swarm(
     swarm: &mut DataCraftSwarm,
     protocol: Arc<DataCraftProtocol>,
     command_rx: &mut mpsc::UnboundedReceiver<DataCraftCommand>,
     pending_requests: PendingRequests,
     peer_scorer: SharedPeerScorer,
-    removal_cache: SharedRemovalCache,
-    own_capabilities: Vec<DataCraftCapability>,
     command_tx: mpsc::UnboundedSender<DataCraftCommand>,
     event_tx: EventSender,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
     client: Arc<Mutex<datacraft_client::DataCraftClient>>,
     max_storage_bytes: u64,
     store_for_repair: Arc<Mutex<datacraft_store::FsStore>>,
-    scaling_coordinator: Arc<Mutex<crate::scaling::ScalingCoordinator>>,
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
     merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     max_peer_connections: usize,
-    demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
 ) {
     use libp2p::swarm::SwarmEvent;
@@ -958,33 +847,6 @@ async fn drive_swarm(
                             address: endpoint.get_remote_address().to_string(),
                             total_peers: total,
                         });
-                        // Announce capabilities: immediately + delayed retry after gossipsub mesh forms
-                        let used = client.lock().await.store().disk_usage().unwrap_or(0);
-                        let sr = merkle_tree.lock().await.root();
-                        let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
-                            capabilities: own_capabilities.clone(),
-                            storage_committed_bytes: max_storage_bytes,
-                            storage_used_bytes: used,
-                            storage_root: sr,
-                        });
-                        // Gossipsub mesh formation takes ~1-3s after connection.
-                        // Retry to ensure the new peer receives our announcement.
-                        let delayed_caps = own_capabilities.clone();
-                        let delayed_tx = command_tx.clone();
-                        let delayed_client = client.clone();
-                        let delayed_max = max_storage_bytes;
-                        let delayed_merkle = merkle_tree.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                            let used = delayed_client.lock().await.store().disk_usage().unwrap_or(0);
-                            let sr = delayed_merkle.lock().await.root();
-                            let _ = delayed_tx.send(DataCraftCommand::PublishCapabilities {
-                                capabilities: delayed_caps,
-                                storage_committed_bytes: delayed_max,
-                                storage_used_bytes: used,
-                                storage_root: sr,
-                            });
-                        });
                     }
                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                         let remaining = swarm.connected_peers().count();
@@ -1023,29 +885,12 @@ async fn drive_swarm(
                         match event {
                             DataCraftBehaviourEvent::Craft(ref craft_event) => {
                                 debug!("Craft behaviour event: {:?}", craft_event);
-                                // Update last-seen for gossipsub message sources
-                                if let craftec_network::behaviour::CraftBehaviourEvent::Gossipsub(
-                                    libp2p::gossipsub::Event::Message { propagation_source, .. }
-                                ) = craft_event {
-                                    peer_last_seen.insert(*propagation_source, std::time::Instant::now());
-                                }
-                                // Handle going-offline messages from peers
-                                handle_gossipsub_going_offline(craft_event, &peer_scorer, &event_tx).await;
                                 // Handle mDNS discovery
                                 handle_mdns_event(swarm, craft_event, &event_tx);
-                                // Try to extract gossipsub capability announcements
-                                let new_storage_peer = handle_gossipsub_capability(craft_event, &peer_scorer, &event_tx, &piece_map).await;
                                 {
                                     let mut scorer = peer_scorer.lock().await;
                                     scorer.evict_stale(std::time::Duration::from_secs(900));
                                 }
-                                if new_storage_peer {
-                                    debug!("New storage peer detected — will receive pieces via equalization");
-                                }
-                                handle_gossipsub_removal(craft_event, &removal_cache, &event_tx).await;
-                                handle_gossipsub_storage_receipt(craft_event, &event_tx, &receipt_store).await;
-                                handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker, &demand_signal_tracker).await;
-                                handle_gossipsub_piece_event(craft_event, &piece_map).await;
                                 // Handle Kademlia events for DHT queries
                                 if let craftec_network::behaviour::CraftBehaviourEvent::Kademlia(ref kad_event) = craft_event {
                                     protocol.handle_kademlia_event(kad_event).await;
@@ -1112,8 +957,8 @@ async fn drive_swarm(
                             let etx = event_tx.clone();
                             let ps = peer_scorer.clone();
                             tokio::spawn(async move {
-                                // Short delay to let gossipsub capability announcements arrive first
-                                info!("[service.rs] TriggerDistribution: sleeping 5s for capability announcements");
+                                // Short delay to let peer discovery complete
+                                info!("[service.rs] TriggerDistribution: sleeping 5s for peer discovery");
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 let needs_push = {
                                     let t = ct.lock().await;
@@ -1311,9 +1156,6 @@ async fn handle_incoming_transfer_request(
                         }
                         let event = datacraft_core::PieceEvent::Stored(stored);
                         map.apply_event(&event);
-                        if let Ok(data) = bincode::serialize(&event) {
-                            let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
-                        }
                     }
                     DataCraftResponse::Ack { status: WireStatus::Ok }
                 }
@@ -1436,51 +1278,6 @@ async fn handle_command(
             }
         }
         
-        DataCraftCommand::PublishCapabilities { capabilities, storage_committed_bytes, storage_used_bytes, storage_root } => {
-            let cap_strings: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
-            let local_peer_id = *swarm.local_peer_id();
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let mut announcement = CapabilityAnnouncement {
-                peer_id: local_peer_id.to_bytes(),
-                capabilities,
-                timestamp,
-                signature: vec![],
-                storage_committed_bytes,
-                storage_used_bytes,
-                storage_root,
-                region: region.clone(),
-            };
-            // Sign the announcement if we have a signing key
-            if let Some(key) = signing_key {
-                use ed25519_dalek::Signer;
-                let data = announcement.signable_data();
-                let sig: ed25519_dalek::Signature = key.sign(&data);
-                announcement.signature = sig.to_bytes().to_vec();
-            }
-            match serde_json::to_vec(&announcement) {
-                Ok(data) => {
-                    if let Err(e) = swarm
-                        .behaviour_mut().craft
-                        .publish_to_topic(datacraft_core::CAPABILITIES_TOPIC, data)
-                    {
-                        debug!("Failed to publish capabilities: {:?}", e);
-                    } else {
-                        let _ = event_tx.send(DaemonEvent::CapabilityPublished {
-                            capabilities: cap_strings,
-                            storage_committed: storage_committed_bytes,
-                            storage_used: storage_used_bytes,
-                        });
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to serialize capability announcement: {}", e);
-                }
-            }
-        }
-        
         DataCraftCommand::PieceSync { peer_id, content_id, segment_index, merkle_root, have_pieces, max_pieces, reply_tx } => {
             info!("[service.rs] Handling PieceSync command: {}/{} to peer {} (sending {} have_pieces, max_pieces={})", content_id, segment_index, peer_id, have_pieces.len(), max_pieces);
             let request = DataCraftRequest::PieceSync {
@@ -1590,31 +1387,7 @@ async fn handle_command(
                 &mut swarm.behaviour_mut().craft, &content_id, &notice, &local_peer_id,
             ).map(|_| ()).map_err(|e| e.to_string());
 
-            // Broadcast via gossipsub
-            if let Ok(data) = bincode::serialize(&notice) {
-                if let Err(e) = swarm.behaviour_mut().craft
-                    .publish_to_topic(datacraft_core::REMOVAL_TOPIC, data) {
-                    warn!("[service.rs] Failed to broadcast removal notice via gossipsub: {:?}", e);
-                }
-            }
-
             let _ = reply_tx.send(dht_result);
-        }
-
-        DataCraftCommand::BroadcastStorageReceipt { receipt_data } => {
-            debug!("Broadcasting StorageReceipt via gossipsub ({} bytes)", receipt_data.len());
-            if let Err(e) = swarm.behaviour_mut().craft
-                .publish_to_topic(datacraft_core::STORAGE_RECEIPT_TOPIC, receipt_data) {
-                warn!("[service.rs] Failed to broadcast StorageReceipt via gossipsub: {:?}", e);
-            }
-        }
-
-        DataCraftCommand::BroadcastDemandSignal { signal_data } => {
-            debug!("Broadcasting demand signal via gossipsub ({} bytes)", signal_data.len());
-            if let Err(e) = swarm.behaviour_mut().craft
-                .publish_to_topic(datacraft_core::SCALING_TOPIC, signal_data) {
-                warn!("[service.rs] Failed to broadcast demand signal via gossipsub: {:?}", e);
-            }
         }
 
         DataCraftCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
@@ -1716,22 +1489,6 @@ async fn handle_command(
             // Reply immediately with None — the cache should be checked first by the caller.
             let _ = reply_tx.send(Ok(None));
         }
-        DataCraftCommand::BroadcastGoingOffline { data } => {
-            debug!("Broadcasting going-offline message ({} bytes)", data.len());
-            if let Err(e) = swarm.behaviour_mut().craft
-                .publish_to_topic(datacraft_core::NODE_STATUS_TOPIC, data) {
-                warn!("[service.rs] Failed to broadcast going-offline message: {:?}", e);
-            }
-        }
-
-        DataCraftCommand::BroadcastPieceEvent { event_data } => {
-            debug!("Broadcasting PieceEvent via gossipsub ({} bytes)", event_data.len());
-            if let Err(e) = swarm.behaviour_mut().craft
-                .publish_to_topic(datacraft_core::PIECE_EVENTS_TOPIC, event_data) {
-                warn!("[service.rs] Failed to broadcast PieceEvent via gossipsub: {:?}", e);
-            }
-        }
-
         DataCraftCommand::SyncPieceMap { .. } => {
             // Handled in drive_swarm before dispatch — should not reach here
             unreachable!("SyncPieceMap should be intercepted in drive_swarm");
@@ -1771,309 +1528,6 @@ fn handle_mdns_event(
         if let Err(e) = swarm.behaviour_mut().craft.bootstrap() {
             debug!("Kademlia bootstrap after mDNS: {:?}", e);
         }
-    }
-}
-
-/// Handle gossipsub capability announcement messages.
-/// Returns `true` if a new peer with `Storage` capability was discovered.
-async fn handle_gossipsub_capability(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    peer_scorer: &SharedPeerScorer,
-    event_tx: &EventSender,
-    piece_map: &Arc<tokio::sync::Mutex<crate::piece_map::PieceMap>>,
-) -> bool {
-    use craftec_network::behaviour::CraftBehaviourEvent;
-    use libp2p::gossipsub;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::CAPABILITIES_TOPIC {
-            match serde_json::from_slice::<CapabilityAnnouncement>(&message.data) {
-                Ok(ann) => {
-                    if let Ok(peer_id) = libp2p::PeerId::from_bytes(&ann.peer_id) {
-                        let has_storage = ann.capabilities.contains(&DataCraftCapability::Storage);
-                        let cap_strings: Vec<String> = ann.capabilities.iter().map(|c| c.to_string()).collect();
-                        info!(
-                            "Received capability announcement from {}: {:?}",
-                            peer_id, ann.capabilities
-                        );
-                        let _ = event_tx.send(DaemonEvent::CapabilityAnnounced {
-                            peer_id: peer_id.to_string(),
-                            capabilities: cap_strings,
-                            storage_committed: ann.storage_committed_bytes,
-                            storage_used: ann.storage_used_bytes,
-                        });
-                        let mut scorer = peer_scorer.lock().await;
-                        // Check if this is a NEW storage peer (not previously known)
-                        let is_new = scorer.get(&peer_id).is_none();
-                        // Only update if newer
-                        let dominated = scorer
-                            .get(&peer_id)
-                            .map(|_| true) // Always accept since scorer tracks announcement time
-                            .unwrap_or(true);
-                        if dominated {
-                            scorer.update_capabilities_full(
-                                &peer_id,
-                                ann.capabilities,
-                                ann.timestamp,
-                                ann.storage_committed_bytes,
-                                ann.storage_used_bytes,
-                                ann.region,
-                                ann.storage_root,
-                            );
-                        }
-                        // Update PieceMap node online status from capability announcement
-                        {
-                            let node_bytes = peer_id.to_bytes();
-                            let mut map = piece_map.lock().await;
-                            map.set_node_online(&node_bytes, true);
-                            map.update_last_seen(&node_bytes);
-                        }
-
-                        return is_new && has_storage;
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to parse capability announcement: {}", e);
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Handle gossipsub removal notice messages.
-async fn handle_gossipsub_removal(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    removal_cache: &SharedRemovalCache,
-    event_tx: &EventSender,
-) {
-    use craftec_network::behaviour::CraftBehaviourEvent;
-    use libp2p::gossipsub;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::REMOVAL_TOPIC {
-            match bincode::deserialize::<datacraft_core::RemovalNotice>(&message.data) {
-                Ok(notice) => {
-                    let valid = notice.verify();
-                    let _ = event_tx.send(DaemonEvent::RemovalNoticeReceived {
-                        content_id: notice.cid.to_hex(),
-                        creator: notice.creator.clone(),
-                        valid,
-                    });
-                    if valid {
-                        debug!(
-                            "Received removal notice for {} from {}",
-                            notice.cid, notice.creator
-                        );
-                        let mut cache = removal_cache.lock().await;
-                        cache.insert(notice);
-                    } else {
-                        debug!("Received invalid removal notice, ignoring");
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to parse removal notice: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Handle gossipsub StorageReceipt messages (for aggregator collection).
-async fn handle_gossipsub_storage_receipt(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    event_tx: &EventSender,
-    receipt_store: &Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
-) {
-    use craftec_network::behaviour::CraftBehaviourEvent;
-    use libp2p::gossipsub;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::STORAGE_RECEIPT_TOPIC {
-            match bincode::deserialize::<datacraft_core::StorageReceipt>(&message.data) {
-                Ok(receipt) => {
-                    debug!(
-                        "Received StorageReceipt via gossipsub: content_id={}, storage_node={}",
-                        receipt.content_id,
-                        hex::encode(receipt.storage_node),
-                    );
-                    let _ = event_tx.send(DaemonEvent::StorageReceiptReceived {
-                        content_id: receipt.content_id.to_hex(),
-                        storage_node: hex::encode(receipt.storage_node),
-                    });
-                    // Forward to receipt store for aggregator collection
-                    let mut store = receipt_store.lock().await;
-                    if let Err(e) = store.add_storage(receipt) {
-                        debug!("Failed to store gossipsub receipt: {}", e);
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to parse StorageReceipt from gossipsub: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Handle incoming demand/scaling signals from gossipsub (push-based).
-/// Providers see the notice, create a piece via RLNC recombination, and push to non-provider.
-async fn handle_gossipsub_scaling(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    scaling_coordinator: &Arc<Mutex<crate::scaling::ScalingCoordinator>>,
-    store: &Arc<Mutex<datacraft_store::FsStore>>,
-    _max_storage_bytes: u64,
-    content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
-    demand_signal_tracker: &Arc<Mutex<crate::scaling::DemandSignalTracker>>,
-) {
-    use libp2p::gossipsub;
-    use craftec_network::behaviour::CraftBehaviourEvent;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::SCALING_TOPIC {
-            match bincode::deserialize::<datacraft_core::DemandSignal>(&message.data) {
-                Ok(signal) => {
-                    debug!(
-                        "Received scaling notice for {}: level={}, providers={}",
-                        signal.content_id, signal.demand_level, signal.current_providers
-                    );
-                    // Record demand signal for degradation awareness
-                    demand_signal_tracker.lock().await.record_signal(signal.content_id);
-                    let store_guard = store.lock().await;
-                    let mut coord = scaling_coordinator.lock().await;
-                    // Only providers (nodes holding ≥2 pieces) will get Some(delay)
-                    if let Some(delay) = coord.handle_scaling_notice(&signal, &store_guard) {
-                        let cid = signal.content_id;
-                        drop(store_guard);
-                        let coord_clone = scaling_coordinator.clone();
-                        let store_clone = store.clone();
-                        let ct = content_tracker.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            let store_guard = store_clone.lock().await;
-                            let providers = ct.lock().await.get_providers(&cid);
-                            let coord = coord_clone.lock().await;
-                            coord.execute_scaling(&store_guard, cid, &providers);
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to parse demand signal from gossipsub: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Handle gossipsub "going offline" messages from peers.
-async fn handle_gossipsub_going_offline(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    peer_scorer: &SharedPeerScorer,
-    event_tx: &EventSender,
-) {
-    use craftec_network::behaviour::CraftBehaviourEvent;
-    use libp2p::gossipsub;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        propagation_source,
-        message,
-        ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::NODE_STATUS_TOPIC {
-            // Try to parse as a going-offline message
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&message.data) {
-                if val.get("type").and_then(|t| t.as_str()) == Some("going_offline") {
-                    info!("[service.rs] Peer {} announced going offline", propagation_source);
-                    peer_scorer.lock().await.remove_peer(propagation_source);
-                    let _ = event_tx.send(DaemonEvent::PeerGoingOffline {
-                        peer_id: propagation_source.to_string(),
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// Handle gossipsub piece events (PieceStored/PieceDropped).
-async fn handle_gossipsub_piece_event(
-    event: &craftec_network::behaviour::CraftBehaviourEvent,
-    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
-) {
-    use craftec_network::behaviour::CraftBehaviourEvent;
-    use libp2p::gossipsub;
-
-    if let CraftBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        message, ..
-    }) = event
-    {
-        let topic_str = message.topic.as_str();
-        if topic_str == datacraft_core::PIECE_EVENTS_TOPIC {
-            match bincode::deserialize::<datacraft_core::PieceEvent>(&message.data) {
-                Ok(piece_event) => {
-                    // TODO: verify signature (requires resolving PeerId → pubkey)
-                    // Apply event to PieceMap (no reactive health check — HealthScan handles it periodically)
-                    {
-                        let mut map = piece_map.lock().await;
-                        map.apply_event(&piece_event);
-                    }
-                    debug!(
-                        "Applied PieceEvent from gossipsub: seq={}",
-                        piece_event.seq(),
-                    );
-                }
-                Err(e) => {
-                    debug!("Failed to parse PieceEvent from gossipsub: {}", e);
-                }
-            }
-        }
-    }
-}
-
-/// Periodically publish own capabilities via gossipsub.
-async fn announce_capabilities_periodically(
-    _local_peer_id: &libp2p::PeerId,
-    capabilities: Vec<DataCraftCapability>,
-    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
-    interval_secs: u64,
-    client: Arc<Mutex<datacraft_client::DataCraftClient>>,
-    max_storage_bytes: u64,
-    _region: Option<String>,
-    merkle_tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>,
-) {
-    use std::time::Duration;
-
-    // Initial delay before first announcement
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-    loop {
-        interval.tick().await;
-        let used = client.lock().await.store().disk_usage().unwrap_or(0);
-        let storage_root = merkle_tree.lock().await.root();
-        debug!("Publishing capability announcement (storage: {}/{} bytes, merkle root: {})", used, max_storage_bytes, hex::encode(&storage_root[..8]));
-        let _ = command_tx.send(DataCraftCommand::PublishCapabilities {
-            capabilities: capabilities.clone(),
-            storage_committed_bytes: max_storage_bytes,
-            storage_used_bytes: used,
-            storage_root,
-        });
     }
 }
 

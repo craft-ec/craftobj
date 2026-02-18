@@ -3,7 +3,7 @@
 //! Commands sent from IPC handler to the swarm event loop for DHT operations
 //! and stream-based transfers.
 
-use datacraft_core::{ContentId, ContentManifest, DataCraftCapability};
+use datacraft_core::{ContentId, ContentManifest};
 use datacraft_transfer::DataCraftResponse;
 use libp2p::PeerId;
 use tokio::sync::oneshot;
@@ -44,13 +44,6 @@ pub enum DataCraftCommand {
         segment_index: u32,
         reply_tx: oneshot::Sender<Result<DataCraftResponse, String>>,
     },
-    /// Publish a capability announcement via gossipsub.
-    PublishCapabilities {
-        capabilities: Vec<DataCraftCapability>,
-        storage_committed_bytes: u64,
-        storage_used_bytes: u64,
-        storage_root: [u8; 32],
-    },
     /// Store a re-encryption key in the DHT for access grant.
     PutReKey {
         content_id: ContentId,
@@ -73,7 +66,7 @@ pub enum DataCraftCommand {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<datacraft_core::access::AccessList, String>>,
     },
-    /// Publish a removal notice to DHT and gossipsub.
+    /// Publish a removal notice to DHT.
     PublishRemoval {
         content_id: ContentId,
         notice: datacraft_core::RemovalNotice,
@@ -83,14 +76,6 @@ pub enum DataCraftCommand {
     CheckRemoval {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<Option<datacraft_core::RemovalNotice>, String>>,
-    },
-    /// Broadcast a StorageReceipt via gossipsub (for aggregator collection).
-    BroadcastStorageReceipt {
-        receipt_data: Vec<u8>,
-    },
-    /// Broadcast a demand signal via gossipsub (scaling).
-    BroadcastDemandSignal {
-        signal_data: Vec<u8>,
     },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
@@ -110,14 +95,6 @@ pub enum DataCraftCommand {
         coefficients: Vec<u8>,
         piece_data: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
-    },
-    /// Broadcast a "going offline" message via gossipsub before graceful shutdown.
-    BroadcastGoingOffline {
-        data: Vec<u8>,
-    },
-    /// Broadcast a PieceEvent via gossipsub on PIECE_EVENTS_TOPIC.
-    BroadcastPieceEvent {
-        event_data: Vec<u8>,
     },
     /// Sync PieceMap entries for a newly tracked segment from connected peers.
     SyncPieceMap {
