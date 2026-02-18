@@ -150,11 +150,14 @@ Node status is derived from existing mechanisms — no new events needed.
 
 ```rust
 struct PieceMap {
+    // Scoped: only segments this node holds pieces in
     pieces: HashMap<(PeerId, ContentId, u32, [u8; 32]), Vec<u8>>,
     node_seqs: HashMap<PeerId, u64>,
     node_online: HashMap<PeerId, bool>,      // derived from announcements
     node_last_seen: HashMap<PeerId, Instant>, // last announcement time
+    tracked_segments: HashSet<(ContentId, u32)>,  // segments we hold pieces for
 }
+// Stored on disk. Loaded per-segment for rank computation.
 ```
 
 ### Health Impact
@@ -167,10 +170,9 @@ effective_rank(cid, segment) = independence_check(
 )
 ```
 
-### HealthReactor on Status Change
+### HealthScan on Status Change
 
-- **Node goes offline** → recheck all segments where that node held pieces. If effective rank drops below target → schedule repair.
-- **Node comes back online** → recheck segments. If now over-replicated → schedule degradation (if no demand).
+Node online/offline changes affect effective rank. HealthScan's periodic scan (default 30s) picks this up naturally — no special event handling needed. Offline node's pieces remain in PieceMap but are excluded from rank computation.
 
 ### Capability Announcements (Slimmed Down)
 
@@ -190,46 +192,73 @@ Flow:
 3. Cross-verifies coefficient vectors from PieceMap against returned data
 4. Pass → StorageReceipt. Fail → mark provider, adjust trust.
 
-## Repair & Degradation — Reactive, No Signals
+## Repair & Degradation — Periodic HealthScan
 
-No separate RepairSignal/DegradationSignal topics. Every node has the same PieceMap, so every node sees the same rank. Repair and degradation are **reactive** — triggered by PieceMap changes on the affected segment.
+No separate signal topics. No event-driven reactions. **HealthScan** runs periodically (default 30s) and scans all tracked segments.
 
-### On PieceDropped(cid, segment):
+### Scoped PieceMap
+
+Each node's PieceMap only tracks segments it holds pieces in — not all network content. Stored on disk, not RAM. Scales to any network size:
+
+| Network size | Full PieceMap (unscoped) | Scoped (10 GB node) |
+|---|---|---|
+| 1 TB | ~880 MB | ~8.6 MB |
+| 10 TB | ~8.8 GB | ~8.6 MB |
+| 1 PB | ~880 GB | ~8.6 MB |
+
+**Scoping lifecycle:**
+1. **First piece for new segment** → `track_segment(cid, segment)`: scoped sync from peers (query coefficient vectors for that segment only), then start processing gossipsub events for it
+2. **Gossipsub events** → only process for tracked segments, discard the rest
+3. **Drop all pieces for segment** → `untrack_segment(cid, segment)`: delete PieceMap entries
+
+### HealthScan Logic
 
 ```
-rank = compute_rank(cid, segment)  // from PieceMap, independence check
-if rank < tier_target AND i_hold_pieces(cid, segment, ≥2):
-    schedule_repair(cid, segment, random_delay 0.5s–10s)
+every 30 seconds:
+  for each tracked segment (cid, segment):
+      rank = compute_rank(cid, segment)  // independence check on online nodes' coefficients
+      k = manifest.k_for_segment(segment)
+      target = ceil(tier_target * k)
+      deficit = target - rank
+
+      if deficit > 0:
+          // Deterministic repair — all nodes compute same provider ranking
+          providers = sort_by_piece_count_desc(providers_for(cid, segment))
+          if my_position_in(providers) < deficit:
+              create_orthogonal_piece(cid, segment)  // guaranteed independent
+              push_to_non_provider()
+
+      if rank > target AND !has_demand(cid) AND my_pieces(cid, segment) > 2:
+          drop_one_piece(cid, segment)
 ```
 
-During the delay, if a `PieceStored` arrives for that segment and rank recovers → cancel repair.
+### Why Periodic Instead of Event-Driven
 
-### On PieceStored(cid, segment):
+- **No feedback loops**: repair creating PieceStored doesn't trigger degradation, and vice versa
+- **No event tagging**: don't need to distinguish publish/distribution/repair/scaling/degradation events
+- **Less compute**: one scan every 30s vs checking on every gossipsub event
+- **Simple**: easy to reason about, test, and debug
 
-```
-// Cancel pending repair if rank recovered
-if pending_repair(cid, segment) AND rank >= tier_target:
-    cancel_repair(cid, segment)
+### Deterministic Repair (No Delays)
 
-// Check for degradation
-if rank > tier_target AND !has_demand(cid) AND i_hold_pieces(cid, segment, >2):
-    schedule_degradation(cid, segment, random_delay 0.5s–10s)
-```
+All nodes with the same PieceMap entries for a segment compute the **same provider ranking** (sorted by piece count descending, PeerId tiebreak). The top N providers (N = deficit) each create 1 piece. No coordination signals, no random delays — shared state IS the coordination.
 
-During the delay, if another `PieceDropped` arrives and rank drops to target → cancel degradation.
+### Orthogonal Piece Creation
+
+With the full coefficient matrix from PieceMap, repairing nodes compute a vector that is **guaranteed linearly independent** from all existing pieces. No random recombination, no ~1/256 dependence chance. Every repair action = +1 rank.
 
 ### What This Eliminates
 
 - `RepairSignal`, `RepairAnnouncement`, `RepairMessage`, `REPAIR_TOPIC`
 - `DegradationSignal`, `DegradationAnnouncement`, `DegradationMessage`, `DEGRADATION_TOPIC`
-- `RepairCoordinator`, `DegradationCoordinator`
+- `RepairCoordinator`, `DegradationCoordinator`, `HealthReactor`
 - Challenger emitting repair/degradation signals
-
-All replaced by a single **HealthReactor** that watches PieceMap changes per-segment and schedules repair/degradation with random delay coordination. The PieceStored/PieceDropped events themselves serve as both signal and announcement — when you repair and store a new piece, the PieceStored event tells everyone the rank improved.
+- Random delay coordination
+- Event-driven health checking
 
 ### Demand Awareness
 
-DemandSignal stays as a separate gossipsub topic (`datacraft/scaling/1.0.0`). Degradation checks `DemandSignalTracker.has_recent_signal(cid)` before scheduling drops.
+DemandSignal stays as a separate gossipsub topic (`datacraft/scaling/1.0.0`). HealthScan checks `DemandSignalTracker.has_recent_signal(cid)` before degrading.
 
 ## Burst Handling
 
@@ -253,15 +282,19 @@ Initial distribution of a 35MB file = ~140 PieceStored events ≈ 30KB total. Go
 | `compute_network_health()` aggregating peer_scorer | Compute rank from PieceMap via independence checking |
 | Separate `StorageMerkleTree` | Derive from PieceMap (own pieces) |
 | Large gossipsub announcements (>1MB) | Tiny per-event messages (~200 bytes) |
-| RepairSignal/Announcement + RepairCoordinator | HealthReactor on PieceDropped |
-| DegradationSignal/Announcement + DegradationCoordinator | HealthReactor on PieceStored |
-| Challenger-driven repair/degradation | Every node reacts independently |
+| RepairSignal/Announcement + RepairCoordinator | Periodic HealthScan with deterministic assignment |
+| DegradationSignal/Announcement + DegradationCoordinator | Periodic HealthScan |
+| Challenger-driven repair/degradation | Every node scans independently |
+| Random delay coordination | Deterministic provider ranking from shared PieceMap |
+| Full network PieceMap (RAM) | Scoped PieceMap on disk (only owned segments) |
 
 ## Migration Path
 
-1. Implement PieceMap + PieceEvent types + gossipsub topic
-2. Emit PieceStored/Dropped from existing store/drop code paths
-3. Build HealthReactor (reactive repair/degradation on PieceMap changes)
-4. Update health computation to use PieceMap with independence checking
-5. Update handler/challenger to read from PieceMap
-6. Remove old systems: announcements, inventory requests, peer_scorer.piece_counts, RepairCoordinator, DegradationCoordinator, StorageMerkleTree
+1. ✅ Implement PieceMap + PieceEvent types + gossipsub topic (Phase 1)
+2. ✅ Emit PieceStored/Dropped from existing store/drop code paths (Phase 1)
+3. Build HealthScan (periodic repair/degradation scanning owned segments)
+4. Make PieceMap scoped (track/untrack segments, disk storage, scoped sync on first piece)
+5. Implement orthogonal piece creation in craftec-erasure
+6. Update health computation to use PieceMap with independence checking
+7. Update handler/challenger to read from PieceMap
+8. Remove old systems: RepairCoordinator, DegradationCoordinator, HealthReactor, peer_scorer.piece_counts, inventory requests, announcements piece_counts, StorageMerkleTree
