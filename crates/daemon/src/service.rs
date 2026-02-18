@@ -408,7 +408,8 @@ pub async fn run_daemon_with_config(
     let pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>> = Arc::new(Mutex::new(HashMap::new()));
     challenger_mgr.set_pdp_ranks(pdp_ranks.clone());
     challenger_mgr.set_merkle_tree(merkle_tree.clone());
-    challenger_mgr.set_demand_tracker(demand_tracker.clone());
+    let demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>> = Arc::new(Mutex::new(crate::scaling::DemandSignalTracker::new()));
+    challenger_mgr.set_demand_signal_tracker(demand_signal_tracker.clone());
 
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
@@ -494,7 +495,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
@@ -785,6 +786,7 @@ async fn drive_swarm(
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     max_peer_connections: usize,
     degradation_coordinator: Arc<Mutex<crate::degradation::DegradationCoordinator>>,
+    demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -956,7 +958,7 @@ async fn drive_swarm(
                                 handle_gossipsub_storage_receipt(craft_event, &event_tx, &receipt_store).await;
                                 handle_gossipsub_repair(craft_event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
                                 handle_gossipsub_degradation(craft_event, &degradation_coordinator, &store_for_repair, &event_tx, &merkle_tree).await;
-                                handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker).await;
+                                handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker, &demand_signal_tracker).await;
                                 // Handle Kademlia events for DHT queries
                                 if let craftec_network::behaviour::CraftBehaviourEvent::Kademlia(ref kad_event) = craft_event {
                                     protocol.handle_kademlia_event(kad_event).await;
@@ -1844,6 +1846,7 @@ async fn handle_gossipsub_scaling(
     store: &Arc<Mutex<datacraft_store::FsStore>>,
     _max_storage_bytes: u64,
     content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    demand_signal_tracker: &Arc<Mutex<crate::scaling::DemandSignalTracker>>,
 ) {
     use libp2p::gossipsub;
     use craftec_network::behaviour::CraftBehaviourEvent;
@@ -1860,6 +1863,8 @@ async fn handle_gossipsub_scaling(
                         "Received scaling notice for {}: level={}, providers={}",
                         signal.content_id, signal.demand_level, signal.current_providers
                     );
+                    // Record demand signal for degradation awareness
+                    demand_signal_tracker.lock().await.record_signal(signal.content_id);
                     let store_guard = store.lock().await;
                     let mut coord = scaling_coordinator.lock().await;
                     // Only providers (nodes holding ≥2 pieces) will get Some(delay)

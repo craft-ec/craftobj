@@ -59,8 +59,8 @@ pub struct ChallengerManager {
     pdp_ranks: Option<Arc<Mutex<PdpRankData>>>,
     /// Storage Merkle tree for updating after healing.
     merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
-    /// Demand tracker for checking if content has active demand (skip degradation if so).
-    demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
+    /// Demand signal tracker for checking if content has network-wide demand (skip degradation if so).
+    demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
 }
 
 /// Shared PDP rank data: maps CID → (k, segment_index → rank).
@@ -84,12 +84,12 @@ impl ChallengerManager {
             peer_scorer: None,
             pdp_ranks: None,
             merkle_tree: None,
-            demand_tracker: None,
+            demand_signal_tracker: None,
         }
     }
 
-    pub fn set_demand_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandTracker>>) {
-        self.demand_tracker = Some(tracker);
+    pub fn set_demand_signal_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>) {
+        self.demand_signal_tracker = Some(tracker);
     }
 
     pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
@@ -397,10 +397,10 @@ impl ChallengerManager {
             None
         };
 
-        // Check for over-replication → emit degradation signals (skip if content has active demand)
-        let has_demand = if let Some(ref dt) = self.demand_tracker {
-            let mut dt = dt.lock().await;
-            dt.has_active_demand(&cid)
+        // Check for over-replication → emit degradation signals (skip if network-wide demand signal seen)
+        let has_demand = if let Some(ref dst) = self.demand_signal_tracker {
+            let dst = dst.lock().await;
+            dst.has_recent_signal(&cid)
         } else {
             false
         };

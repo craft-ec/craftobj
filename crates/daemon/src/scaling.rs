@@ -53,18 +53,6 @@ impl DemandTracker {
         self.fetches.entry(content_id).or_default().push(Instant::now());
     }
 
-    /// Check if a CID has any recent fetches (within the demand window).
-    /// Used by degradation to skip over-replication reduction for active content.
-    pub fn has_active_demand(&mut self, content_id: &ContentId) -> bool {
-        let cutoff = Instant::now() - Duration::from_secs(DEMAND_WINDOW_SECS);
-        if let Some(timestamps) = self.fetches.get_mut(content_id) {
-            timestamps.retain(|t| *t > cutoff);
-            !timestamps.is_empty()
-        } else {
-            false
-        }
-    }
-
     /// Return CIDs with demand above threshold in the current window.
     pub fn check_demand(&mut self) -> Vec<(ContentId, u32)> {
         let cutoff = Instant::now() - Duration::from_secs(DEMAND_WINDOW_SECS);
@@ -108,6 +96,41 @@ impl DemandTracker {
     pub fn cleanup(&mut self) {
         let cutoff = Instant::now() - Duration::from_secs(SIGNAL_COOLDOWN_SECS * 2);
         self.last_broadcast.retain(|_, t| *t > cutoff);
+    }
+}
+
+/// Tracks received DemandSignals from gossipsub.
+/// Used by the challenger to check if content has active network-wide demand
+/// before emitting degradation signals.
+#[derive(Default)]
+pub struct DemandSignalTracker {
+    /// Last time a DemandSignal was received per CID (from any peer via gossipsub).
+    last_signal: HashMap<ContentId, Instant>,
+}
+
+impl DemandSignalTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a DemandSignal was received for this CID.
+    pub fn record_signal(&mut self, content_id: ContentId) {
+        self.last_signal.insert(content_id, Instant::now());
+    }
+
+    /// Check if a DemandSignal was seen within the demand window (5 min).
+    pub fn has_recent_signal(&self, content_id: &ContentId) -> bool {
+        if let Some(last) = self.last_signal.get(content_id) {
+            last.elapsed() < Duration::from_secs(DEMAND_WINDOW_SECS)
+        } else {
+            false
+        }
+    }
+
+    /// Clean up stale entries.
+    pub fn cleanup(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(DEMAND_WINDOW_SECS * 2);
+        self.last_signal.retain(|_, t| *t > cutoff);
     }
 }
 
