@@ -514,6 +514,17 @@ pub async fn run_daemon_with_config(
     let degradation_coord = crate::degradation::DegradationCoordinator::new(local_peer_id, degradation_command_tx);
     let degradation_coordinator: Arc<Mutex<crate::degradation::DegradationCoordinator>> = Arc::new(Mutex::new(degradation_coord));
 
+    // HealthReactor — reactive repair & degradation on PieceMap changes
+    let health_reactor_command_tx = command_tx.clone();
+    let health_reactor = crate::health_reactor::HealthReactor::new(
+        piece_map.clone(),
+        store.clone(),
+        demand_signal_tracker.clone(),
+        local_peer_id,
+        health_reactor_command_tx,
+    );
+    let health_reactor: Arc<Mutex<crate::health_reactor::HealthReactor>> = Arc::new(Mutex::new(health_reactor));
+
     // Scaling: coordinator for demand-driven piece acquisition
     let scaling_command_tx = command_tx.clone();
     let mut scaling_coord = crate::scaling::ScalingCoordinator::new(local_peer_id, scaling_command_tx);
@@ -546,7 +557,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone(), piece_map.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), removal_cache.clone(), own_capabilities.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, repair_coordinator.clone(), store.clone(), scaling_coordinator.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, degradation_coordinator.clone(), demand_signal_tracker.clone(), piece_map.clone(), health_reactor.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
@@ -907,6 +918,7 @@ async fn drive_swarm(
     degradation_coordinator: Arc<Mutex<crate::degradation::DegradationCoordinator>>,
     demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
+    health_reactor: Arc<Mutex<crate::health_reactor::HealthReactor>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -1079,7 +1091,7 @@ async fn drive_swarm(
                                 handle_gossipsub_repair(craft_event, &repair_coordinator, &store_for_repair, &event_tx, &content_tracker).await;
                                 handle_gossipsub_degradation(craft_event, &degradation_coordinator, &store_for_repair, &event_tx, &merkle_tree, &piece_map, &command_tx).await;
                                 handle_gossipsub_scaling(craft_event, &scaling_coordinator, &store_for_repair, max_storage_bytes, &content_tracker, &demand_signal_tracker).await;
-                                handle_gossipsub_piece_event(craft_event, &piece_map).await;
+                                handle_gossipsub_piece_event(craft_event, &piece_map, &health_reactor).await;
                                 // Handle Kademlia events for DHT queries
                                 if let craftec_network::behaviour::CraftBehaviourEvent::Kademlia(ref kad_event) = craft_event {
                                     protocol.handle_kademlia_event(kad_event).await;
@@ -2113,6 +2125,7 @@ async fn handle_gossipsub_going_offline(
 async fn handle_gossipsub_piece_event(
     event: &craftec_network::behaviour::CraftBehaviourEvent,
     piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
+    health_reactor: &Arc<Mutex<crate::health_reactor::HealthReactor>>,
 ) {
     use craftec_network::behaviour::CraftBehaviourEvent;
     use libp2p::gossipsub;
@@ -2126,13 +2139,28 @@ async fn handle_gossipsub_piece_event(
             match bincode::deserialize::<datacraft_core::PieceEvent>(&message.data) {
                 Ok(piece_event) => {
                     // TODO: verify signature (requires resolving PeerId → pubkey)
-                    // For now, apply the event to the PieceMap
-                    let mut map = piece_map.lock().await;
-                    map.apply_event(&piece_event);
+                    let (cid, segment, is_stored) = match &piece_event {
+                        datacraft_core::PieceEvent::Stored(s) => (s.cid, s.segment, true),
+                        datacraft_core::PieceEvent::Dropped(d) => (d.cid, d.segment, false),
+                    };
+
+                    // Apply event to PieceMap
+                    {
+                        let mut map = piece_map.lock().await;
+                        map.apply_event(&piece_event);
+                    }
                     debug!(
                         "Applied PieceEvent from gossipsub: seq={}",
                         piece_event.seq(),
                     );
+
+                    // Notify HealthReactor
+                    let mut reactor = health_reactor.lock().await;
+                    if is_stored {
+                        reactor.on_piece_stored(cid, segment);
+                    } else {
+                        reactor.on_piece_dropped(cid, segment);
+                    }
                 }
                 Err(e) => {
                     debug!("Failed to parse PieceEvent from gossipsub: {}", e);
