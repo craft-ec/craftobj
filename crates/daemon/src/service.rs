@@ -435,6 +435,9 @@ pub async fn run_daemon_with_config(
                     if let Ok(segments) = store_guard.store().list_segments(&cid) {
                         for seg in segments {
                             if let Ok(pieces) = store_guard.store().list_pieces(&cid, seg) {
+                                if !pieces.is_empty() {
+                                    pm.track_segment(cid, seg);
+                                }
                                 for pid in pieces {
                                     if let Ok((_data, coefficients)) = store_guard.store().get_piece(&cid, seg, &pid) {
                                         let seq = pm.next_seq();
@@ -723,9 +726,10 @@ async fn eviction_maintenance_loop(
                 .collect();
             for cid in &all_removed {
                 // Content already deleted by eviction manager; emit drops from PieceMap state
-                // We can't list pieces from store anymore, so remove from PieceMap by querying it
                 let pieces: Vec<(u32, [u8; 32])> = map.pieces_for_cid_local(cid);
+                let mut segments_seen = std::collections::HashSet::new();
                 for (seg, pid) in pieces {
+                    segments_seen.insert(seg);
                     let seq = map.next_seq();
                     let dropped = datacraft_core::PieceDropped {
                         node: local_node.clone(),
@@ -744,6 +748,10 @@ async fn eviction_maintenance_loop(
                     if let Ok(data) = bincode::serialize(&event) {
                         let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
                     }
+                }
+                // Untrack all segments for this removed CID
+                for seg in segments_seen {
+                    map.untrack_segment(cid, seg);
                 }
             }
         }
@@ -840,7 +848,7 @@ async fn gc_loop(
                 continue; // Keep pinned, published, and storage provider content
             }
 
-            // Emit PieceDropped events before deletion
+            // Emit PieceDropped events before deletion and untrack segments
             {
                 let segments = s.list_segments(cid).unwrap_or_default();
                 let mut map = piece_map.lock().await;
@@ -867,6 +875,8 @@ async fn gc_loop(
                             let _ = command_tx.send(DataCraftCommand::BroadcastPieceEvent { event_data: data });
                         }
                     }
+                    // Untrack segment after dropping all pieces
+                    map.untrack_segment(cid, seg);
                 }
             }
 
@@ -1285,6 +1295,8 @@ async fn handle_incoming_transfer_request(
                     // Emit PieceStored event to PieceMap and gossipsub
                     {
                         let mut map = piece_map.lock().await;
+                        // Track segment if this is the first piece for it
+                        map.track_segment(content_id, segment_index);
                         let seq = map.next_seq();
                         let mut stored = datacraft_core::PieceStored {
                             node: map.local_node().to_vec(),

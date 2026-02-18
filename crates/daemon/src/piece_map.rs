@@ -1,7 +1,8 @@
-//! PieceMap — event-sourced materialized view of piece locations across the network.
+//! PieceMap — scoped, event-sourced materialized view of piece locations.
 //!
-//! Every node maintains the same PieceMap, built from PieceStored/PieceDropped events
-//! on gossipsub. This replaces the announcement-based system for tracking who holds what.
+//! Only tracks segments the local node holds pieces in (scoped PieceMap).
+//! Built from PieceStored/PieceDropped events on gossipsub.
+//! Events for untracked segments are discarded.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -11,7 +12,10 @@ use datacraft_core::{ContentId, ContentManifest, PieceEvent};
 use datacraft_core::{PieceStored, PieceDropped};
 use libp2p::PeerId;
 
-/// Materialized view of piece locations across the network.
+/// Scoped materialized view of piece locations across the network.
+///
+/// Only tracks segments where the local node holds at least one piece.
+/// Events for untracked segments are discarded.
 pub struct PieceMap {
     /// (node_bytes, cid, segment, piece_id) → coefficients
     pieces: HashMap<(Vec<u8>, ContentId, u32, [u8; 32]), Vec<u8>>,
@@ -25,6 +29,9 @@ pub struct PieceMap {
     local_seq: u64,
     /// Local node's PeerId bytes
     local_node: Vec<u8>,
+    /// Tracked segments — only segments where local node holds pieces.
+    /// Events for segments NOT in this set are discarded.
+    tracked_segments: HashSet<(ContentId, u32)>,
 }
 
 impl PieceMap {
@@ -37,13 +44,27 @@ impl PieceMap {
             node_last_seen: HashMap::new(),
             local_seq: 0,
             local_node: local_peer_id.to_bytes().to_vec(),
+            tracked_segments: HashSet::new(),
         }
     }
 
-    /// Apply a PieceEvent to the map. Skips if seq <= known seq for that node.
+    /// Apply a PieceEvent to the map.
+    ///
+    /// Skips if seq <= known seq for that node.
+    /// Skips events for untracked segments (unless the event is from the local node,
+    /// which auto-tracks via `track_segment`).
     pub fn apply_event(&mut self, event: &PieceEvent) {
         let node = event.node().to_vec();
         let seq = event.seq();
+        let (cid, segment) = match event {
+            PieceEvent::Stored(s) => (s.cid, s.segment),
+            PieceEvent::Dropped(d) => (d.cid, d.segment),
+        };
+
+        // Only process events for tracked segments
+        if !self.tracked_segments.contains(&(cid, segment)) {
+            return;
+        }
 
         // Skip if we've already seen this or a later seq from this node
         if let Some(&known) = self.node_seqs.get(&node) {
@@ -71,6 +92,30 @@ impl PieceMap {
     pub fn next_seq(&mut self) -> u64 {
         self.local_seq += 1;
         self.local_seq
+    }
+
+    /// Start tracking a segment. Called when node stores its first piece for a new segment.
+    /// Returns true if this is a newly tracked segment (first piece).
+    pub fn track_segment(&mut self, cid: ContentId, segment: u32) -> bool {
+        self.tracked_segments.insert((cid, segment))
+    }
+
+    /// Stop tracking a segment. Called when node drops all pieces for a segment.
+    /// Removes all PieceMap entries for that segment.
+    pub fn untrack_segment(&mut self, cid: &ContentId, segment: u32) {
+        self.tracked_segments.remove(&(*cid, segment));
+        // Remove all entries for this segment
+        self.pieces.retain(|(_, c, s, _), _| !(c == cid && *s == segment));
+    }
+
+    /// Check if a segment is being tracked.
+    pub fn is_tracked(&self, cid: &ContentId, segment: u32) -> bool {
+        self.tracked_segments.contains(&(*cid, segment))
+    }
+
+    /// Get all tracked segments.
+    pub fn tracked_segments(&self) -> &HashSet<(ContentId, u32)> {
+        &self.tracked_segments
     }
 
     /// Compute the rank (number of linearly independent coefficient vectors) for a segment.
@@ -264,6 +309,9 @@ mod tests {
         let node = vec![10u8; 32];
         let pid = [20u8; 32];
 
+        // Track segment first
+        map.track_segment(cid, 0);
+
         // Store
         map.apply_event(&make_stored(&node, cid, 0, pid, vec![1, 2, 3], 1));
         assert_eq!(map.total_pieces(&cid), 1);
@@ -275,6 +323,42 @@ mod tests {
     }
 
     #[test]
+    fn test_untracked_segment_ignored() {
+        let local = test_peer_id();
+        let mut map = PieceMap::new(local);
+        let cid = ContentId([1u8; 32]);
+        let node = vec![10u8; 32];
+        let pid = [20u8; 32];
+
+        // Don't track segment — event should be ignored
+        map.apply_event(&make_stored(&node, cid, 0, pid, vec![1, 2, 3], 1));
+        assert_eq!(map.total_pieces(&cid), 0);
+    }
+
+    #[test]
+    fn test_track_untrack_segment() {
+        let local = test_peer_id();
+        let mut map = PieceMap::new(local);
+        let cid = ContentId([1u8; 32]);
+        let node = vec![10u8; 32];
+
+        assert!(!map.is_tracked(&cid, 0));
+        assert!(map.track_segment(cid, 0));
+        assert!(map.is_tracked(&cid, 0));
+        // Second call returns false (already tracked)
+        assert!(!map.track_segment(cid, 0));
+
+        // Add a piece
+        map.apply_event(&make_stored(&node, cid, 0, [1u8; 32], vec![1], 1));
+        assert_eq!(map.total_pieces(&cid), 1);
+
+        // Untrack — removes all entries
+        map.untrack_segment(&cid, 0);
+        assert!(!map.is_tracked(&cid, 0));
+        assert_eq!(map.total_pieces(&cid), 0);
+    }
+
+    #[test]
     fn test_seq_dedup() {
         let local = test_peer_id();
         let mut map = PieceMap::new(local);
@@ -282,6 +366,8 @@ mod tests {
         let node = vec![10u8; 32];
         let pid1 = [20u8; 32];
         let pid2 = [30u8; 32];
+
+        map.track_segment(cid, 0);
 
         // Apply seq 5
         map.apply_event(&make_stored(&node, cid, 0, pid1, vec![1, 2, 3], 5));
@@ -305,6 +391,7 @@ mod tests {
         let local = test_peer_id();
         let mut map = PieceMap::new(local);
         let cid = ContentId([1u8; 32]);
+        map.track_segment(cid, 0);
 
         // Add 3 linearly independent vectors (identity-like for 3 dimensions)
         let node1 = vec![1u8; 32];
@@ -329,6 +416,7 @@ mod tests {
         let local = test_peer_id();
         let mut map = PieceMap::new(local);
         let cid = ContentId([1u8; 32]);
+        map.track_segment(cid, 0);
 
         let node1 = vec![1u8; 32];
         let node2 = vec![2u8; 32];
@@ -352,6 +440,8 @@ mod tests {
         let local = test_peer_id();
         let mut map = PieceMap::new(local);
         let cid = ContentId([1u8; 32]);
+        map.track_segment(cid, 0);
+        map.track_segment(cid, 1);
 
         let node1 = vec![1u8; 32];
         let node2 = vec![2u8; 32];
@@ -371,6 +461,7 @@ mod tests {
         let local_bytes = local.to_bytes().to_vec();
         let mut map = PieceMap::new(local);
         let cid = ContentId([1u8; 32]);
+        map.track_segment(cid, 0);
 
         map.apply_event(&make_stored(&local_bytes, cid, 0, [1u8; 32], vec![1], 1));
         map.apply_event(&make_stored(&local_bytes, cid, 0, [2u8; 32], vec![2], 2));
@@ -396,6 +487,8 @@ mod tests {
         let cid1 = ContentId([1u8; 32]);
         let cid2 = ContentId([2u8; 32]);
         let node = vec![10u8; 32];
+        map.track_segment(cid1, 0);
+        map.track_segment(cid2, 0);
 
         map.apply_event(&make_stored(&node, cid1, 0, [1u8; 32], vec![1], 1));
         map.apply_event(&make_stored(&node, cid2, 0, [2u8; 32], vec![2], 2));

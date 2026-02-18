@@ -334,6 +334,7 @@ mod tests {
             let s = store.lock().await;
             let mut map = pm.lock().await;
             map.set_node_online(&local_bytes, true);
+            map.track_segment(cid, 0);
 
             for i in 0..3u8 {
                 let mut coeff = vec![0u8; 3];
@@ -376,6 +377,7 @@ mod tests {
             let s = store.lock().await;
             let mut map = pm.lock().await;
             map.set_node_online(&local_bytes, true);
+            map.track_segment(cid, 0);
 
             for i in 0..3u8 {
                 let mut coeff = vec![0u8; 3];
