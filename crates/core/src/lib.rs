@@ -1,6 +1,6 @@
-//! DataCraft Core
+//! CraftOBJ Core
 //!
-//! Content types and protocol primitives for DataCraft:
+//! Content types and protocol primitives for CraftOBJ:
 //! content-addressed distributed storage with RLNC erasure coding.
 
 pub mod access;
@@ -32,10 +32,10 @@ impl ContentId {
     }
 
     /// Parse from hex string.
-    pub fn from_hex(s: &str) -> std::result::Result<Self, DataCraftError> {
-        let bytes = hex::decode(s).map_err(|e| DataCraftError::InvalidContentId(e.to_string()))?;
+    pub fn from_hex(s: &str) -> std::result::Result<Self, CraftObjError> {
+        let bytes = hex::decode(s).map_err(|e| CraftObjError::InvalidContentId(e.to_string()))?;
         if bytes.len() != 32 {
-            return Err(DataCraftError::InvalidContentId("expected 32 bytes".into()));
+            return Err(CraftObjError::InvalidContentId("expected 32 bytes".into()));
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(&bytes);
@@ -319,35 +319,35 @@ impl StorageReceipt {
     }
 }
 
-/// Wire protocol magic bytes: "DCRF" (DataCraft)
-pub const WIRE_MAGIC: [u8; 4] = [0x44, 0x43, 0x52, 0x46];
+/// Wire protocol magic bytes: "COBJ" (CraftOBJ)
+pub const WIRE_MAGIC: [u8; 4] = [0x43, 0x4F, 0x42, 0x4A];
 
 /// Transfer stream protocol ID.
-pub const TRANSFER_PROTOCOL: &str = "/datacraft/transfer/3.0.0";
+pub const TRANSFER_PROTOCOL: &str = "/craftobj/transfer/3.0.0";
 
 /// Manifest exchange protocol ID.
-pub const MANIFEST_PROTOCOL: &str = "/datacraft/manifest/2.0.0";
+pub const MANIFEST_PROTOCOL: &str = "/craftobj/manifest/2.0.0";
 
 /// PDP (Proof of Data Possession) protocol ID.
-pub const PDP_PROTOCOL: &str = "/datacraft/pdp/2.0.0";
+pub const PDP_PROTOCOL: &str = "/craftobj/pdp/2.0.0";
 
 /// DHT key prefix for content providers.
-pub const PROVIDERS_DHT_PREFIX: &str = "/datacraft/providers/";
+pub const PROVIDERS_DHT_PREFIX: &str = "/craftobj/providers/";
 
 /// DHT key prefix for content manifests.
-pub const MANIFEST_DHT_PREFIX: &str = "/datacraft/manifest/";
+pub const MANIFEST_DHT_PREFIX: &str = "/craftobj/manifest/";
 
 /// DHT key prefix for peer pubkey → PeerId records.
-pub const PEERS_DHT_PREFIX: &str = "/datacraft/peers/";
+pub const PEERS_DHT_PREFIX: &str = "/craftobj/peers/";
 
 /// DHT key prefix for access lists (per CID).
-pub const ACCESS_DHT_PREFIX: &str = "/datacraft/access/";
+pub const ACCESS_DHT_PREFIX: &str = "/craftobj/access/";
 
 /// DHT key prefix for re-encryption keys (per CID + recipient DID).
-pub const REKEY_DHT_PREFIX: &str = "/datacraft/rekey/";
+pub const REKEY_DHT_PREFIX: &str = "/craftobj/rekey/";
 
 /// DHT key prefix for content removal notices.
-pub const REMOVAL_DHT_PREFIX: &str = "/datacraft/removal/";
+pub const REMOVAL_DHT_PREFIX: &str = "/craftobj/removal/";
 
 /// Event-sourced piece tracking event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,9 +500,9 @@ pub struct DemandSignal {
     pub timestamp: u64,
 }
 
-/// Capabilities a DataCraft node can declare.
+/// Capabilities a CraftOBJ node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DataCraftCapability {
+pub enum CraftObjCapability {
     /// Publishes and fetches content.
     Client,
     /// Stores and serves content (participates in PDP).
@@ -511,7 +511,7 @@ pub enum DataCraftCapability {
     Aggregator,
 }
 
-impl std::fmt::Display for DataCraftCapability {
+impl std::fmt::Display for CraftObjCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Client => write!(f, "Client"),
@@ -527,7 +527,7 @@ pub struct CapabilityAnnouncement {
     /// Peer ID bytes of the announcing node.
     pub peer_id: Vec<u8>,
     /// Capabilities this node supports.
-    pub capabilities: Vec<DataCraftCapability>,
+    pub capabilities: Vec<CraftObjCapability>,
     /// Unix timestamp (seconds) when announcement was created.
     pub timestamp: u64,
     /// Signature over (peer_id || capabilities || timestamp) by the announcing node.
@@ -619,7 +619,7 @@ impl WireStatus {
 }
 
 #[derive(Error, Debug)]
-pub enum DataCraftError {
+pub enum CraftObjError {
     #[error("Invalid content ID: {0}")]
     InvalidContentId(String),
     #[error("Content not found: {0}")]
@@ -640,7 +640,7 @@ pub enum DataCraftError {
     ManifestError(String),
 }
 
-pub type Result<T> = std::result::Result<T, DataCraftError>;
+pub type Result<T> = std::result::Result<T, CraftObjError>;
 
 // ── Health History Snapshots ────────────────────────────────
 
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_content_id_from_bytes() {
-        let data = b"hello datacraft";
+        let data = b"hello craftobj";
         let cid = ContentId::from_bytes(data);
         assert_eq!(cid.0.len(), 32);
         let cid2 = ContentId::from_bytes(data);
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_wire_magic() {
-        assert_eq!(&WIRE_MAGIC, b"DCRF");
+        assert_eq!(&WIRE_MAGIC, b"COBJ");
     }
 
     #[test]
@@ -835,12 +835,12 @@ mod tests {
     #[test]
     fn test_capability_serde_roundtrip() {
         let caps = vec![
-            DataCraftCapability::Client,
-            DataCraftCapability::Storage,
-            DataCraftCapability::Aggregator,
+            CraftObjCapability::Client,
+            CraftObjCapability::Storage,
+            CraftObjCapability::Aggregator,
         ];
         let json = serde_json::to_string(&caps).unwrap();
-        let parsed: Vec<DataCraftCapability> = serde_json::from_str(&json).unwrap();
+        let parsed: Vec<CraftObjCapability> = serde_json::from_str(&json).unwrap();
         assert_eq!(caps, parsed);
     }
 
@@ -848,7 +848,7 @@ mod tests {
     fn test_capability_announcement_serde() {
         let ann = CapabilityAnnouncement {
             peer_id: vec![1, 2, 3],
-            capabilities: vec![DataCraftCapability::Storage, DataCraftCapability::Client],
+            capabilities: vec![CraftObjCapability::Storage, CraftObjCapability::Client],
             timestamp: 1700000000,
             signature: vec![0xAA, 0xBB],
             storage_committed_bytes: 10_000_000_000,
@@ -867,7 +867,7 @@ mod tests {
     fn test_capability_announcement_signable_data() {
         let ann = CapabilityAnnouncement {
             peer_id: vec![1, 2],
-            capabilities: vec![DataCraftCapability::Storage, DataCraftCapability::Client],
+            capabilities: vec![CraftObjCapability::Storage, CraftObjCapability::Client],
             timestamp: 100,
             signature: vec![],
             storage_committed_bytes: 0,
@@ -882,8 +882,8 @@ mod tests {
 
     #[test]
     fn test_capability_display() {
-        assert_eq!(DataCraftCapability::Storage.to_string(), "Storage");
-        assert_eq!(DataCraftCapability::Aggregator.to_string(), "Aggregator");
+        assert_eq!(CraftObjCapability::Storage.to_string(), "Storage");
+        assert_eq!(CraftObjCapability::Aggregator.to_string(), "Aggregator");
     }
 
     #[test]

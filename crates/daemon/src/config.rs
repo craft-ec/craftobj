@@ -197,15 +197,15 @@ impl DaemonConfig {
                 self.capabilities = caps;
             }
         }
-        if let Ok(val) = std::env::var("DATACRAFT_REANNOUNCE_INTERVAL") {
+        if let Ok(val) = std::env::var("CRAFTOBJ_REANNOUNCE_INTERVAL") {
             if let Ok(secs) = val.parse::<u64>() {
-                debug!("DATACRAFT_REANNOUNCE_INTERVAL={}", secs);
+                debug!("CRAFTOBJ_REANNOUNCE_INTERVAL={}", secs);
                 self.reannounce_interval_secs = secs;
             }
         }
-        if let Ok(val) = std::env::var("DATACRAFT_REANNOUNCE_THRESHOLD") {
+        if let Ok(val) = std::env::var("CRAFTOBJ_REANNOUNCE_THRESHOLD") {
             if let Ok(secs) = val.parse::<u64>() {
-                debug!("DATACRAFT_REANNOUNCE_THRESHOLD={}", secs);
+                debug!("CRAFTOBJ_REANNOUNCE_THRESHOLD={}", secs);
                 self.reannounce_threshold_secs = secs;
             }
         }

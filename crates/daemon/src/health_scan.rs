@@ -9,15 +9,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use datacraft_core::{ContentId, HealthAction, HealthSnapshot, SegmentSnapshot};
-use datacraft_store::merkle::MerkleDiff;
+use craftobj_core::{ContentId, HealthAction, HealthSnapshot, SegmentSnapshot};
+use craftobj_store::merkle::MerkleDiff;
 use std::io::{BufRead, Write};
-use datacraft_store::FsStore;
+use craftobj_store::FsStore;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::commands::DataCraftCommand;
+use crate::commands::CraftOBJCommand;
 use crate::piece_map::PieceMap;
 use crate::scaling::DemandSignalTracker;
 
@@ -76,7 +76,7 @@ pub struct HealthScan {
     demand_tracker: Arc<Mutex<DemandSignalTracker>>,
     local_peer_id: PeerId,
     tier_target: f64,
-    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
     scan_interval: Duration,
     data_dir: Option<PathBuf>,
     /// Cache of last-known Merkle roots from providers, keyed by (peer, cid).
@@ -90,7 +90,7 @@ impl HealthScan {
         store: Arc<Mutex<FsStore>>,
         demand_tracker: Arc<Mutex<DemandSignalTracker>>,
         local_peer_id: PeerId,
-        command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
     ) -> Self {
         Self {
             piece_map,
@@ -187,7 +187,7 @@ impl HealthScan {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .command_tx
-            .send(DataCraftCommand::ResolveProviders {
+            .send(CraftOBJCommand::ResolveProviders {
                 content_id: cid,
                 reply_tx: tx,
             })
@@ -225,9 +225,9 @@ impl HealthScan {
         content_id: ContentId,
         known_root: Option<[u8; 32]>,
     ) -> Option<MerklePullResponse> {
-        // TODO: Wire via DataCraftCommand::MerklePull or a new request-response protocol.
+        // TODO: Wire via CraftOBJCommand::MerklePull or a new request-response protocol.
         // For now, return None to skip all remote pulls.
-        // When wired, add a `MerklePull` variant to DataCraftCommand:
+        // When wired, add a `MerklePull` variant to CraftOBJCommand:
         //
         //   MerklePull {
         //       peer_id: PeerId,
@@ -494,7 +494,7 @@ impl HealthScan {
                 if let Ok((_data, coefficients)) = store_guard.get_piece(&cid, segment, &new_pid) {
                     let mut map = self.piece_map.lock().await;
                     let seq = map.next_seq();
-                    let stored = datacraft_core::PieceStored {
+                    let stored = craftobj_core::PieceStored {
                         node: local_node.to_vec(),
                         cid,
                         segment,
@@ -507,11 +507,11 @@ impl HealthScan {
                             .as_secs(),
                         signature: vec![],
                     };
-                    let event = datacraft_core::PieceEvent::Stored(stored);
+                    let event = craftobj_core::PieceEvent::Stored(stored);
                     map.apply_event(&event);
                     // Publish DHT provider record for this CID+segment
-                    let pkey = datacraft_routing::provider_key(&cid, segment);
-                    let _ = self.command_tx.send(DataCraftCommand::StartProviding { key: pkey });
+                    let pkey = craftobj_routing::provider_key(&cid, segment);
+                    let _ = self.command_tx.send(CraftOBJCommand::StartProviding { key: pkey });
                     info!(
                         "HealthScan repair complete for {}/seg{}: generated 1 new piece",
                         cid, segment
@@ -549,7 +549,7 @@ impl HealthScan {
         {
             let mut map = self.piece_map.lock().await;
             let seq = map.next_seq();
-            let dropped = datacraft_core::PieceDropped {
+            let dropped = craftobj_core::PieceDropped {
                 node: local_node.to_vec(),
                 cid,
                 segment,
@@ -561,7 +561,7 @@ impl HealthScan {
                     .as_secs(),
                 signature: vec![],
             };
-            let event = datacraft_core::PieceEvent::Dropped(dropped);
+            let event = craftobj_core::PieceEvent::Dropped(dropped);
             map.apply_event(&event);
         }
     }
@@ -660,9 +660,9 @@ pub async fn run_health_scan_loop(health_scan: Arc<Mutex<HealthScan>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datacraft_core::{ContentId, PieceEvent, PieceStored};
+    use craftobj_core::{ContentId, PieceEvent, PieceStored};
 
-    fn make_tx() -> mpsc::UnboundedSender<DataCraftCommand> {
+    fn make_tx() -> mpsc::UnboundedSender<CraftOBJCommand> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
     }
@@ -750,7 +750,7 @@ mod tests {
             for i in 0..3u8 {
                 let mut coeff = vec![0u8; 3];
                 coeff[i as usize] = 1;
-                let pid = datacraft_store::piece_id_from_coefficients(&coeff);
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
                 s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
                 let seq = map.next_seq();
                 map.apply_event(&PieceEvent::Stored(PieceStored {
@@ -798,7 +798,7 @@ mod tests {
             for i in 0..3u8 {
                 let mut coeff = vec![0u8; 3];
                 coeff[i as usize] = 1;
-                let pid = datacraft_store::piece_id_from_coefficients(&coeff);
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
                 s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
                 let seq = map.next_seq();
                 map.apply_event(&PieceEvent::Stored(PieceStored {
@@ -833,11 +833,11 @@ mod tests {
 
     /// Spawn a task that drains the command channel, replying with empty results
     /// so that resolve_providers doesn't hang in tests.
-    fn drain_commands(mut rx: mpsc::UnboundedReceiver<DataCraftCommand>) {
+    fn drain_commands(mut rx: mpsc::UnboundedReceiver<CraftOBJCommand>) {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    DataCraftCommand::ResolveProviders { reply_tx, .. } => {
+                    CraftOBJCommand::ResolveProviders { reply_tx, .. } => {
                         let _ = reply_tx.send(Ok(vec![]));
                     }
                     _ => {}
@@ -866,7 +866,7 @@ mod tests {
             for i in 0..2u8 {
                 let mut coeff = vec![0u8; 3];
                 coeff[i as usize] = 1;
-                let pid = datacraft_store::piece_id_from_coefficients(&coeff);
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
                 s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
                 let seq = map.next_seq();
                 map.apply_event(&PieceEvent::Stored(PieceStored {
@@ -917,7 +917,7 @@ mod tests {
             for i in 0..2u8 {
                 let mut coeff = vec![0u8; 4];
                 coeff[i as usize] = 1;
-                let pid = datacraft_store::piece_id_from_coefficients(&coeff);
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
                 s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
                 let seq = map.next_seq();
                 map.apply_event(&PieceEvent::Stored(PieceStored {

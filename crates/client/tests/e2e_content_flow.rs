@@ -1,4 +1,4 @@
-//! E2E integration tests for DataCraft's core content flow.
+//! E2E integration tests for CraftOBJ's core content flow.
 //!
 //! Tests the full lifecycle: publish → distribute → equalize → fetch,
 //! plus edge cases, error paths, encryption, integrity, and GC.
@@ -6,14 +6,14 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, PublishOptions};
-use datacraft_store::{piece_id_from_coefficients, FsStore, GarbageCollector, PinManager};
+use craftobj_client::CraftOBJClient;
+use craftobj_core::{ContentId, PublishOptions};
+use craftobj_store::{piece_id_from_coefficients, FsStore, GarbageCollector, PinManager};
 use rand::RngCore;
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir()
-        .join("datacraft-e2e-flow")
+        .join("craftobj-e2e-flow")
         .join(format!(
             "{}-{}",
             label,
@@ -49,7 +49,7 @@ fn publish_and_distribute_round_robin() {
     let dir_s1 = temp_dir("dist-s1");
     let dir_s2 = temp_dir("dist-s2");
 
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
+    let mut client = CraftOBJClient::new(&dir_pub).unwrap();
     let content = random_data(1_000_000);
     let file_path = dir_pub.join("testfile.bin");
     std::fs::write(&file_path, &content).unwrap();
@@ -100,7 +100,7 @@ fn push_with_mid_transfer_failure() {
     let dir_s1 = temp_dir("midfail-s1");
     let dir_s2 = temp_dir("midfail-s2");
 
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
+    let mut client = CraftOBJClient::new(&dir_pub).unwrap();
     let content = random_data(2_000_000);
     let file_path = dir_pub.join("test.bin");
     std::fs::write(&file_path, &content).unwrap();
@@ -153,7 +153,7 @@ fn push_with_single_storage_node() {
     let dir_pub = temp_dir("single-pub");
     let dir_s1 = temp_dir("single-s1");
 
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
+    let mut client = CraftOBJClient::new(&dir_pub).unwrap();
     let content = random_data(300_000);
     let file_path = dir_pub.join("test.bin");
     std::fs::write(&file_path, &content).unwrap();
@@ -184,7 +184,7 @@ fn push_with_single_storage_node() {
     assert_eq!(total_piece_count(&store_s1, &cid, seg_count), total_encoded);
 
     // Can still reconstruct from single node
-    let client_s1 = DataCraftClient::new(&dir_s1).unwrap();
+    let client_s1 = CraftOBJClient::new(&dir_s1).unwrap();
     let output = dir_s1.join("output.bin");
     client_s1.reconstruct(&cid, &output, None).unwrap();
     assert_eq!(std::fs::read(&output).unwrap(), content);
@@ -200,8 +200,8 @@ fn multiple_publishers_different_content() {
     let dir_b = temp_dir("multipub-b");
     let dir_store = temp_dir("multipub-store");
 
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
-    let mut client_b = DataCraftClient::new(&dir_b).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
+    let mut client_b = CraftOBJClient::new(&dir_b).unwrap();
 
     let content_a = random_data(200_000);
     let content_b = random_data(200_000);
@@ -255,8 +255,8 @@ fn same_content_published_by_two_clients_dedup() {
 
     let content = random_data(100_000);
 
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
-    let mut client_b = DataCraftClient::new(&dir_b).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
+    let mut client_b = CraftOBJClient::new(&dir_b).unwrap();
 
     let file_a = dir_a.join("same.bin");
     let file_b = dir_b.join("same.bin");
@@ -282,7 +282,7 @@ fn storage_node_at_capacity_refuses_via_gc() {
     let dir_pub = temp_dir("cap-pub");
     let dir_store = temp_dir("cap-store");
 
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
+    let mut client = CraftOBJClient::new(&dir_pub).unwrap();
     let content = random_data(200_000);
     let file_path = dir_pub.join("test.bin");
     std::fs::write(&file_path, &content).unwrap();
@@ -326,7 +326,7 @@ fn storage_node_at_capacity_refuses_via_gc() {
 #[test]
 fn tiny_file_less_than_one_piece() {
     let dir = temp_dir("tiny");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // 50 bytes — way smaller than 100KB piece size, so k=1
     let content = b"Hello, this is a tiny file for edge case testing!";
@@ -352,7 +352,7 @@ fn tiny_file_less_than_one_piece() {
 #[test]
 fn exact_one_segment_file() {
     let dir = temp_dir("exact-seg");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // 10MB = segment_size → exactly 1 segment, k = 10MB/100KB = 100
     let content = random_data(10_485_760);
@@ -376,7 +376,7 @@ fn exact_one_segment_file() {
 #[test]
 fn multi_segment_with_partial_last() {
     let dir = temp_dir("multi-seg");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // 15MB → 1 full segment (10MB) + 1 partial (5MB)
     let content = random_data(15_000_000);
@@ -402,7 +402,7 @@ fn multi_segment_with_partial_last() {
 #[test]
 fn empty_file_rejected() {
     let dir = temp_dir("empty");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let result = client.publish_bytes(b"", &PublishOptions::default());
     assert!(result.is_err(), "empty data should be rejected");
@@ -420,7 +420,7 @@ fn publish_and_distribute(
     stores: &[&FsStore],
 ) -> (ContentId, usize, Vec<u8>) {
     let dir_pub = temp_dir("eq-helper-pub");
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
+    let mut client = CraftOBJClient::new(&dir_pub).unwrap();
     let content = random_data(content_size);
     let file_path = dir_pub.join("test.bin");
     std::fs::write(&file_path, &content).unwrap();
@@ -711,7 +711,7 @@ fn fetch_from_distributed_network() {
         assert!(collected >= k);
     }
 
-    let client = DataCraftClient::new(&dir_client).unwrap();
+    let client = CraftOBJClient::new(&dir_client).unwrap();
     let output = dir_client.join("output.bin");
     client.reconstruct(&cid, &output, None).unwrap();
     assert_eq!(std::fs::read(&output).unwrap(), content);
@@ -756,14 +756,14 @@ fn fetch_with_some_providers_offline() {
     }
 
     if can_reconstruct {
-        let client = DataCraftClient::new(&dir_client).unwrap();
+        let client = CraftOBJClient::new(&dir_client).unwrap();
         let output = dir_client.join("output.bin");
         client.reconstruct(&cid, &output, None).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), content);
     } else {
         // If s1 doesn't have enough for any segment, that's expected with 2-node split
         // The point: we don't crash, we handle gracefully
-        let client = DataCraftClient::new(&dir_client).unwrap();
+        let client = CraftOBJClient::new(&dir_client).unwrap();
         let output = dir_client.join("output.bin");
         assert!(client.reconstruct(&cid, &output, None).is_err());
     }
@@ -776,7 +776,7 @@ fn fetch_with_some_providers_offline() {
 #[test]
 fn fetch_tiny_file_k1() {
     let dir = temp_dir("fetch-tiny");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = b"tiny content";
     let file = dir.join("tiny.txt");
@@ -796,7 +796,7 @@ fn fetch_tiny_file_k1() {
 #[test]
 fn fetch_multi_segment() {
     let dir = temp_dir("fetch-multi");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // 15MB → 2 segments (10+5)
     let content = random_data(15_000_000);
@@ -816,7 +816,7 @@ fn fetch_multi_segment() {
 #[test]
 fn fetch_with_redundant_pieces_discards_extras() {
     let dir = temp_dir("fetch-redundant");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // Use 5MB so k=20 (256KiB pieces), parity 1.2 → 24 pieces total > k
     let content = random_data(5_000_000);
@@ -849,7 +849,7 @@ fn fetch_with_redundant_pieces_discards_extras() {
 #[test]
 fn publish_encrypted_cid_is_hash_of_ciphertext() {
     let dir = temp_dir("enc-cid");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = b"secret data for encrypted CID test";
     let file = dir.join("secret.txt");
@@ -875,7 +875,7 @@ fn publish_encrypted_cid_is_hash_of_ciphertext() {
 #[test]
 fn publish_encrypted_fetch_decrypt_roundtrip() {
     let dir = temp_dir("enc-rt");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = random_data(200_000);
     let file = dir.join("secret.bin");
@@ -903,7 +903,7 @@ fn publish_encrypted_fetch_decrypt_roundtrip() {
 #[test]
 fn unpin_gc_sweep_removes_content() {
     let dir = temp_dir("gc");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = random_data(100_000);
     let file = dir.join("test.bin");
@@ -933,7 +933,7 @@ fn unpin_gc_sweep_removes_content() {
 #[test]
 fn gc_does_not_remove_pinned_content() {
     let dir = temp_dir("gc-pinned");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = random_data(100_000);
     let file = dir.join("test.bin");
@@ -957,7 +957,7 @@ fn gc_does_not_remove_pinned_content() {
 #[test]
 fn delete_content_removes_pieces_and_manifest() {
     let dir = temp_dir("delete");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = random_data(200_000);
     let file = dir.join("test.bin");
@@ -987,7 +987,7 @@ fn delete_content_removes_pieces_and_manifest() {
 #[test]
 fn corrupt_piece_detected_by_verify_integrity() {
     let dir = temp_dir("corrupt");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = random_data(200_000);
     let file = dir.join("test.bin");
@@ -1062,7 +1062,7 @@ fn partial_push_retry_full_scenario() {
     let dir_pub = temp_dir("retry-pub");
     let dir_storage = temp_dir("retry-storage");
 
-    let mut client = DataCraftClient::new(&dir_pub).unwrap();
+    let mut client = CraftOBJClient::new(&dir_pub).unwrap();
     let content = random_data(500_000);
     let file = dir_pub.join("test.bin");
     std::fs::write(&file, &content).unwrap();
@@ -1116,7 +1116,7 @@ fn partial_push_retry_full_scenario() {
     assert_eq!(total_piece_count(&store_pub, &cid, seg_count), 0);
 
     // Storage can reconstruct
-    let client_storage = DataCraftClient::new(&dir_storage).unwrap();
+    let client_storage = CraftOBJClient::new(&dir_storage).unwrap();
     let output = dir_storage.join("output.bin");
     client_storage.reconstruct(&cid, &output, None).unwrap();
     assert_eq!(std::fs::read(&output).unwrap(), content);
@@ -1133,7 +1133,7 @@ fn partial_push_retry_full_scenario() {
 #[test]
 fn reconstruct_nonexistent_content_fails() {
     let dir = temp_dir("noexist");
-    let client = DataCraftClient::new(&dir).unwrap();
+    let client = CraftOBJClient::new(&dir).unwrap();
 
     let fake_cid = ContentId([0xAB; 32]);
     let output = dir.join("output.bin");
@@ -1145,7 +1145,7 @@ fn reconstruct_nonexistent_content_fails() {
 #[test]
 fn publish_same_content_twice_idempotent() {
     let dir = temp_dir("idempotent");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let content = random_data(50_000);
     let file = dir.join("test.bin");
@@ -1171,7 +1171,7 @@ fn disk_usage_increases_with_content() {
     let store = FsStore::new(&dir).unwrap();
     let before = store.disk_usage().unwrap();
 
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
     let content = random_data(100_000);
     let file = dir.join("test.bin");
     std::fs::write(&file, &content).unwrap();
@@ -1187,7 +1187,7 @@ fn disk_usage_increases_with_content() {
 #[test]
 fn list_and_status_reflect_multiple_contents() {
     let dir = temp_dir("liststatus");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     for i in 0..3 {
         let content = random_data(50_000 + i * 10_000);
@@ -1213,7 +1213,7 @@ fn list_and_status_reflect_multiple_contents() {
 #[test]
 fn gc_sweep_removes_only_unpinned_when_over_threshold() {
     let dir = temp_dir("gc-selective");
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // Publish 3 files
     let mut cids = Vec::new();

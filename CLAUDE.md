@@ -1,10 +1,10 @@
-# CLAUDE.md — DataCraft
+# CLAUDE.md — CraftOBJ
 
 Read the parent [CLAUDE.md](../CLAUDE.md) first for ecosystem conventions.
 
 ## Design Docs (READ THESE FIRST)
 
-- [DataCraft Design](../docs/DATACRAFT_DESIGN.md) — Protocol spec, node model, economics
+- [CraftOBJ Design](../docs/CRAFTOBJ_DESIGN.md) — Protocol spec, node model, economics
 - [Craftec Ecosystem](../docs/CRAFTEC_ECOSYSTEM.md) — Shared infra, capabilities, cross-craft architecture
 
 **Design docs are the source of truth.** They evolve during conversation with the human. Always read the latest version before starting work — stale assumptions break things.
@@ -59,7 +59,7 @@ crates/
 - **Priority serving**: Creator subscriber > Platform subscriber > Free user. On-chain subscription proofs, cached by storage nodes.
 - **No separate egress revenue**: PDP covers everything. Holding data IS the service.
 - **Capabilities, not roles**: Nodes declare capabilities (Storage, Relay, Client, Aggregator).
-- **Separate DHTs**: DataCraft runs its own Kademlia instance.
+- **Separate DHTs**: CraftOBJ runs its own Kademlia instance.
 - **Bounded redundancy**: Base (pool-funded) → demand-driven scaling → max (hard ceiling). Tiers: Free(1.5x/3x), Lite(2x/4x), Standard(3x/6x), Pro(5x/10x), Enterprise(10x/20x).
 
 ## RS → RLNC Refactoring
@@ -72,27 +72,27 @@ The existing codebase is built on Reed-Solomon erasure coding. The design has mo
 - **`crates/erasure/Cargo.toml`**: Depends on `reed-solomon-erasure`. Replace with RLNC library or custom implementation.
 - **`ErasureConfig`**: Currently has `data_shards`/`parity_shards`. Replace with `piece_size`/`segment_size`/`initial_parity`.
 
-### datacraft/crates/core/
+### craftobj/crates/core/
 - **`src/lib.rs`**: Defines `ChunkManifest` (rename to `ContentManifest`), uses `ErasureConfig` from craftec-erasure. Update struct fields.
 - **`src/signing.rs`**: Tests reference `shard_index` in StorageReceipt. Update to use `piece_id` (SHA-256 of coefficient vector).
 - **`src/economics.rs`**: References `shard_index` in test receipts, has `PROTOCOL_EGRESS_PRICE_PER_BYTE` (remove).
 
-### datacraft/crates/store/
+### craftobj/crates/store/
 - **`src/lib.rs`**: Stores shards at `chunks/<cid>/<chunk_index>/<shard_index>`. Change to segment/piece model with coefficient vector identification.
 
-### datacraft/crates/transfer/
+### craftobj/crates/transfer/
 - **`src/lib.rs`**: Wire protocol uses `[content_id:32][chunk_index:4][shard_index:1]`. Replace with segment-based "any piece" request model.
 
-### datacraft/crates/routing/
+### craftobj/crates/routing/
 - **`src/lib.rs`**: References `ChunkManifest`. Rename to `ContentManifest`.
 
-### datacraft/crates/client/
+### craftobj/crates/client/
 - **`src/lib.rs`**: Publish flow uses RS encode. Update to RLNC segment/piece model.
 - **`src/extension.rs`**: Fetch reconstruction uses `data_shards` and RS decode. Replace with RLNC Gaussian elimination.
 - **`tests/e2e.rs`, `tests/e2e_two_node.rs`**: Reference RS concepts. Update tests.
 
-### datacraft/crates/daemon/ (many files)
-- **`src/commands.rs`**: `DataCraftCommand` variants use `ChunkManifest`, `shard_index`. Update.
+### craftobj/crates/daemon/ (many files)
+- **`src/commands.rs`**: `CraftOBJCommand` variants use `ChunkManifest`, `shard_index`. Update.
 - **`src/service.rs`**: References `ChunkManifest`, `shard_index` in command handling. Update.
 - **`src/protocol.rs`**: Uses `ChunkManifest`, `shard_index`, `TransferReceipt`. Update wire protocol.
 - **`src/handler.rs`**: Publish handler uses `data_shards`/`parity_shards`. Update to RLNC.

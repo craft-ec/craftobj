@@ -1,8 +1,8 @@
-# DataCraft Network Health & Peer Scoring Design
+# CraftOBJ Network Health & Peer Scoring Design
 
 ## Overview
 
-DataCraft uses **client-side peer scoring** to track peer reliability. Nodes respond to requests; nobody assigns them load. "Reducing load on a bad peer" means clients stop asking it, not the node self-removing.
+CraftOBJ uses **client-side peer scoring** to track peer reliability. Nodes respond to requests; nobody assigns them load. "Reducing load on a bad peer" means clients stop asking it, not the node self-removing.
 
 ## Design Principles
 

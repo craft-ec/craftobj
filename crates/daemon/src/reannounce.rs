@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
-use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, DataCraftCapability};
+use craftobj_client::CraftOBJClient;
+use craftobj_core::{ContentId, CraftOBJCapability};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::commands::DataCraftCommand;
+use crate::commands::CraftOBJCommand;
 use crate::content_tracker::ContentTracker;
 use crate::events::{DaemonEvent, EventSender};
 use crate::peer_scorer::PeerScorer;
@@ -19,8 +19,8 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
 pub async fn content_maintenance_loop(
     tracker: Arc<Mutex<ContentTracker>>,
-    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
-    client: Arc<Mutex<DataCraftClient>>,
+    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
+    client: Arc<Mutex<CraftOBJClient>>,
     interval_secs: u64,
     event_tx: EventSender,
     peer_scorer: Arc<Mutex<PeerScorer>>,
@@ -37,8 +37,8 @@ pub async fn content_maintenance_loop(
 
 pub async fn run_maintenance_cycle(
     tracker: &Arc<Mutex<ContentTracker>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
-    client: &Arc<Mutex<DataCraftClient>>,
+    command_tx: &mpsc::UnboundedSender<CraftOBJCommand>,
+    client: &Arc<Mutex<CraftOBJClient>>,
     event_tx: &EventSender,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
 ) {
@@ -94,8 +94,8 @@ pub async fn run_maintenance_cycle(
 async fn reannounce_content(
     content_id: &ContentId,
     tracker: &Arc<Mutex<ContentTracker>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
-    client: &Arc<Mutex<DataCraftClient>>,
+    command_tx: &mpsc::UnboundedSender<CraftOBJCommand>,
+    client: &Arc<Mutex<CraftOBJClient>>,
     event_tx: &EventSender,
 ) {
     let manifest = {
@@ -110,7 +110,7 @@ async fn reannounce_content(
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let cmd = DataCraftCommand::AnnounceProvider {
+    let cmd = CraftOBJCommand::AnnounceProvider {
         content_id: *content_id,
         manifest,
         reply_tx,
@@ -142,10 +142,10 @@ async fn reannounce_content(
 async fn check_providers(
     content_id: &ContentId,
     tracker: &Arc<Mutex<ContentTracker>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
+    command_tx: &mpsc::UnboundedSender<CraftOBJCommand>,
 ) {
     let (reply_tx, reply_rx) = oneshot::channel();
-    let cmd = DataCraftCommand::ResolveProviders {
+    let cmd = CraftOBJCommand::ResolveProviders {
         content_id: *content_id,
         reply_tx,
     };
@@ -176,8 +176,8 @@ async fn check_providers(
 pub async fn run_initial_push(
     content_id: &ContentId,
     tracker: &Arc<Mutex<ContentTracker>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
-    client: &Arc<Mutex<DataCraftClient>>,
+    command_tx: &mpsc::UnboundedSender<CraftOBJCommand>,
+    client: &Arc<Mutex<CraftOBJClient>>,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
     event_tx: &EventSender,
 ) {
@@ -191,7 +191,7 @@ pub async fn run_initial_push(
         }
         all_peers
             .into_iter()
-            .filter(|(_, score)| score.capabilities.contains(&DataCraftCapability::Storage))
+            .filter(|(_, score)| score.capabilities.contains(&CraftOBJCapability::Storage))
             .map(|(peer_id, _)| *peer_id)
             .collect()
     };
@@ -234,7 +234,7 @@ pub async fn run_initial_push(
         let mut manifest_futs = Vec::new();
         for &peer in &ranked_peers {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let cmd = DataCraftCommand::PushManifest {
+            let cmd = CraftOBJCommand::PushManifest {
                 peer_id: peer,
                 content_id: *content_id,
                 manifest_json: manifest_json.clone(),
@@ -304,7 +304,7 @@ pub async fn run_initial_push(
         };
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        let cmd = DataCraftCommand::PushPiece {
+        let cmd = CraftOBJCommand::PushPiece {
             peer_id: peer,
             content_id: cid,
             segment_index: *seg_idx,
@@ -385,8 +385,8 @@ pub async fn run_initial_push(
 /// After successful push, delete the pushed pieces locally (pieces are UNIQUE).
 async fn equalize_pressure(
     tracker: &Arc<Mutex<ContentTracker>>,
-    command_tx: &mpsc::UnboundedSender<DataCraftCommand>,
-    client: &Arc<Mutex<DataCraftClient>>,
+    command_tx: &mpsc::UnboundedSender<CraftOBJCommand>,
+    client: &Arc<Mutex<CraftOBJClient>>,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
     event_tx: &EventSender,
 ) {
@@ -394,7 +394,7 @@ async fn equalize_pressure(
         let scorer = peer_scorer.lock().await;
         scorer
             .iter()
-            .filter(|(_, score)| score.capabilities.contains(&DataCraftCapability::Storage))
+            .filter(|(_, score)| score.capabilities.contains(&CraftOBJCapability::Storage))
             .map(|(peer_id, _)| *peer_id)
             .collect()
     };
@@ -465,7 +465,7 @@ async fn equalize_pressure(
         };
         for &peer in &candidates {
             let (reply_tx, _reply_rx) = oneshot::channel();
-            let _ = command_tx.send(DataCraftCommand::PushManifest {
+            let _ = command_tx.send(CraftOBJCommand::PushManifest {
                 peer_id: peer,
                 content_id,
                 manifest_json: manifest_json.clone(),
@@ -488,7 +488,7 @@ async fn equalize_pressure(
             };
 
             let (reply_tx, reply_rx) = oneshot::channel();
-            let cmd = DataCraftCommand::PushPiece {
+            let cmd = CraftOBJCommand::PushPiece {
                 peer_id: peer,
                 content_id,
                 segment_index: *seg,

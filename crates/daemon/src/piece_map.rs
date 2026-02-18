@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use datacraft_core::{ContentId, ContentManifest, PieceEvent};
+use craftobj_core::{ContentId, ContentManifest, PieceEvent};
 #[cfg(test)]
-use datacraft_core::{PieceStored, PieceDropped};
+use craftobj_core::{PieceStored, PieceDropped};
 use libp2p::PeerId;
 
 /// Scoped materialized view of piece locations across the network.
@@ -275,7 +275,7 @@ impl PieceMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datacraft_core::ContentId;
+    use craftobj_core::ContentId;
 
     fn test_peer_id() -> PeerId {
         PeerId::random()

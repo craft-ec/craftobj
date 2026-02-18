@@ -1,6 +1,6 @@
-//! DataCraft Store
+//! CraftOBJ Store
 //!
-//! Filesystem content-addressed storage for DataCraft.
+//! Filesystem content-addressed storage for CraftOBJ.
 //!
 //! Layout:
 //! ```text
@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use datacraft_core::{ContentId, ContentManifest, DataCraftError, Result};
+use craftobj_core::{ContentId, ContentManifest, CraftObjError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -89,7 +89,7 @@ impl FsStore {
         let data_path = dir.join(format!("{id_hex}.data"));
         let coeff_path = dir.join(format!("{id_hex}.coeff"));
         if !data_path.exists() {
-            return Err(DataCraftError::ContentNotFound(format!(
+            return Err(CraftObjError::ContentNotFound(format!(
                 "piece {}/{}/{}",
                 content_id, segment_index, &id_hex[..8]
             )));
@@ -171,7 +171,7 @@ impl FsStore {
             .join("manifests")
             .join(format!("{}.json", manifest.content_id.to_hex()));
         let json = serde_json::to_string_pretty(manifest)
-            .map_err(|e| DataCraftError::ManifestError(e.to_string()))?;
+            .map_err(|e| CraftObjError::ManifestError(e.to_string()))?;
         std::fs::write(&path, json)?;
         debug!("Stored manifest for {}", manifest.content_id);
         Ok(())
@@ -184,14 +184,14 @@ impl FsStore {
             .join("manifests")
             .join(format!("{}.json", content_id.to_hex()));
         if !path.exists() {
-            return Err(DataCraftError::ContentNotFound(format!(
+            return Err(CraftObjError::ContentNotFound(format!(
                 "manifest for {}",
                 content_id
             )));
         }
         let json = std::fs::read_to_string(&path)?;
         serde_json::from_str(&json)
-            .map_err(|e| DataCraftError::ManifestError(e.to_string()))
+            .map_err(|e| CraftObjError::ManifestError(e.to_string()))
     }
 
     /// Check if a manifest exists.
@@ -467,7 +467,7 @@ impl PinManager {
 
     fn save(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.pins)
-            .map_err(|e| DataCraftError::StorageError(e.to_string()))?;
+            .map_err(|e| CraftObjError::StorageError(e.to_string()))?;
         std::fs::write(&self.pins_path, json)?;
         Ok(())
     }
@@ -536,7 +536,7 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         let dir = std::env::temp_dir()
-            .join("datacraft-store-test")
+            .join("craftobj-store-test")
             .join(uuid());
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -7,7 +7,7 @@
 
 use crate::settlement::SolanaClient;
 use craftec_prover::{BatchProof, ProverClient, ProverError};
-use datacraft_core::StorageReceipt;
+use craftobj_core::StorageReceipt;
 use tracing::{debug, info};
 
 /// Configuration for the settlement cycle.
@@ -120,7 +120,7 @@ pub enum SettlementCycleError {
 mod tests {
     use super::*;
     use crate::settlement::SettlementConfig;
-    use datacraft_core::ContentId;
+    use craftobj_core::ContentId;
 
     fn make_receipt(node: [u8; 32], challenger: [u8; 32], ts: u64) -> StorageReceipt {
         StorageReceipt {

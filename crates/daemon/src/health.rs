@@ -3,8 +3,8 @@
 //! Health = matrix rank per segment / k.
 //! Self-healing creates new pieces via RLNC recombination.
 
-use datacraft_core::{ContentId, ContentManifest, StorageReceipt};
-use datacraft_store::FsStore;
+use craftobj_core::{ContentId, ContentManifest, StorageReceipt};
+use craftobj_store::FsStore;
 use libp2p::PeerId;
 use tracing::info;
 
@@ -201,7 +201,7 @@ pub fn heal_segment(
     for _ in 0..pieces_needed {
         match craftec_erasure::create_piece_from_existing(&existing_pieces) {
             Ok(new_piece) => {
-                let new_pid = datacraft_store::piece_id_from_coefficients(&new_piece.coefficients);
+                let new_pid = craftobj_store::piece_id_from_coefficients(&new_piece.coefficients);
                 match store.store_piece(content_id, segment_index, &new_pid, &new_piece.data, &new_piece.coefficients) {
                     Ok(()) => {
                         info!("Generated healing piece for {}/seg{}", content_id, segment_index);
@@ -260,7 +260,7 @@ pub fn heal_content(
         for _ in 0..to_gen {
             match craftec_erasure::create_piece_from_existing(&existing_pieces) {
                 Ok(new_piece) => {
-                    let new_pid = datacraft_store::piece_id_from_coefficients(&new_piece.coefficients);
+                    let new_pid = craftobj_store::piece_id_from_coefficients(&new_piece.coefficients);
                     match store.store_piece(
                         &manifest.content_id, seg_idx, &new_pid,
                         &new_piece.data, &new_piece.coefficients,

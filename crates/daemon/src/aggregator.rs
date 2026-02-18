@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use craftec_prover::{BatchProof, ProverClient, ProverError};
 use craftec_prover_guest_types::DistributionOutput;
-use datacraft_core::StorageReceipt;
+use craftobj_core::StorageReceipt;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -164,7 +164,7 @@ pub async fn run_aggregation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datacraft_core::ContentId;
+    use craftobj_core::ContentId;
 
     fn make_test_receipt(node_byte: u8, ts: u64) -> StorageReceipt {
         let mut storage_node = [0u8; 32];

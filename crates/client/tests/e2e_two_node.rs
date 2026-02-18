@@ -5,14 +5,14 @@
 
 use std::path::PathBuf;
 
-use datacraft_client::DataCraftClient;
-use datacraft_core::{ContentId, PublishOptions, WireStatus};
-use datacraft_store::{piece_id_from_coefficients, FsStore};
-use datacraft_transfer::{DataCraftRequest, DataCraftResponse, PiecePayload};
-use datacraft_transfer::wire;
+use craftobj_client::CraftOBJClient;
+use craftobj_core::{ContentId, PublishOptions, WireStatus};
+use craftobj_store::{piece_id_from_coefficients, FsStore};
+use craftobj_transfer::{CraftOBJRequest, CraftOBJResponse, PiecePayload};
+use craftobj_transfer::wire;
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("datacraft-e2e").join(format!(
+    let dir = std::env::temp_dir().join("craftobj-e2e").join(format!(
         "{}-{}",
         label,
         std::time::SystemTime::now()
@@ -32,7 +32,7 @@ async fn simulate_piece_sync(
     have_pieces: Vec<[u8; 32]>,
     max_pieces: u16,
 ) -> Vec<PiecePayload> {
-    let request = DataCraftRequest::PieceSync {
+    let request = CraftOBJRequest::PieceSync {
         content_id: *content_id,
         segment_index,
         merkle_root: [0u8; 32],
@@ -72,7 +72,7 @@ async fn simulate_piece_sync(
         _ => panic!("expected request frame"),
     }
 
-    let response = DataCraftResponse::PieceBatch { pieces: pieces.clone() };
+    let response = CraftOBJResponse::PieceBatch { pieces: pieces.clone() };
     let mut resp_buf = Vec::new();
     wire::write_response_frame(&mut futures::io::Cursor::new(&mut resp_buf), 1, &response)
         .await
@@ -80,7 +80,7 @@ async fn simulate_piece_sync(
     let resp_frame = wire::read_frame(&mut futures::io::Cursor::new(&resp_buf)).await.unwrap();
 
     match resp_frame {
-        wire::StreamFrame::Response { response: DataCraftResponse::PieceBatch { pieces }, .. } => pieces,
+        wire::StreamFrame::Response { response: CraftOBJResponse::PieceBatch { pieces }, .. } => pieces,
         _ => panic!("unexpected response frame"),
     }
 }
@@ -91,7 +91,7 @@ async fn test_two_node_publish_fetch_plaintext() {
     let dir_a = temp_dir("node-a");
     let dir_b = temp_dir("node-b");
 
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("input.bin");
     let original_content = b"Hello from Node A! This is test content for the two-node E2E test. \
         It needs to be long enough to exercise encoding with small piece sizes.";
@@ -120,7 +120,7 @@ async fn test_two_node_publish_fetch_plaintext() {
 
     store_b.store_manifest(&manifest).unwrap();
 
-    let client_b = DataCraftClient::new(&dir_b).unwrap();
+    let client_b = CraftOBJClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("output.bin");
     client_b
         .reconstruct(&content_id, &output_path, None)
@@ -139,7 +139,7 @@ async fn test_two_node_publish_fetch_encrypted() {
     let dir_a = temp_dir("node-a-enc");
     let dir_b = temp_dir("node-b-enc");
 
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("secret.txt");
     let original_content = b"This is encrypted content that should survive the full pipeline.";
     std::fs::write(&input_path, original_content).unwrap();
@@ -169,7 +169,7 @@ async fn test_two_node_publish_fetch_encrypted() {
 
     store_b.store_manifest(&manifest).unwrap();
 
-    let client_b = DataCraftClient::new(&dir_b).unwrap();
+    let client_b = CraftOBJClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("decrypted.txt");
     client_b
         .reconstruct(&content_id, &output_path, Some(&encryption_key))
@@ -188,7 +188,7 @@ async fn test_two_node_any_piece_request() {
     let dir_a = temp_dir("node-a-any");
     let dir_b = temp_dir("node-b-any");
 
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("data.bin");
     let original_content = b"Content for any-piece request test across two nodes.";
     std::fs::write(&input_path, original_content).unwrap();
@@ -217,7 +217,7 @@ async fn test_two_node_any_piece_request() {
 
     store_b.store_manifest(&manifest).unwrap();
 
-    let client_b = DataCraftClient::new(&dir_b).unwrap();
+    let client_b = CraftOBJClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("recovered.bin");
     client_b
         .reconstruct(&content_id, &output_path, None)

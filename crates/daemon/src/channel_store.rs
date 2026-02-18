@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use datacraft_core::payment_channel::{
+use craftobj_core::payment_channel::{
     ChannelId, PaymentChannel, PaymentChannelError, PaymentVoucher, verify_voucher,
 };
 use ed25519_dalek::VerifyingKey;
@@ -193,7 +193,7 @@ impl ChannelStore {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use datacraft_core::payment_channel::sign_voucher;
+    use craftobj_core::payment_channel::sign_voucher;
     use rand::rngs::OsRng;
 
     fn temp_dir() -> PathBuf {

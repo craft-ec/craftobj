@@ -1,4 +1,4 @@
-//! End-to-end integration tests for DataCraft.
+//! End-to-end integration tests for CraftOBJ.
 //!
 //! Covers the full content lifecycle: publish, fetch, encrypt, access control (PRE),
 //! revocation with key rotation, payment channels, and storage receipts.
@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use datacraft_client::DataCraftClient;
-use datacraft_core::{
+use craftobj_client::CraftOBJClient;
+use craftobj_core::{
     ContentId, PublishOptions, StorageReceipt,
     payment_channel::{
         PaymentChannel, PaymentChannelError, PaymentVoucher, sign_voucher, verify_voucher,
@@ -25,7 +25,7 @@ fn tmp_dir() -> PathBuf {
     let mut rng_bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut rng_bytes);
     let dir = std::env::temp_dir()
-        .join("datacraft-integration")
+        .join("craftobj-integration")
         .join(format!(
             "{}-{}",
             SystemTime::now()
@@ -55,9 +55,9 @@ fn write_test_file(dir: &PathBuf, name: &str, content: &[u8]) -> PathBuf {
 #[test]
 fn publish_fetch_plaintext() {
     let dir = tmp_dir();
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
-    let content = b"Hello DataCraft - plaintext lifecycle test with enough data to chunk.";
+    let content = b"Hello CraftOBJ - plaintext lifecycle test with enough data to chunk.";
     let file = write_test_file(&dir, "plain.txt", content);
 
     // Publish
@@ -90,7 +90,7 @@ fn publish_fetch_plaintext() {
 #[test]
 fn publish_fetch_large_content_multichunk() {
     let dir = tmp_dir();
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     // 200KB — will produce multiple chunks at 64KB default
     let content: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
@@ -115,7 +115,7 @@ fn publish_fetch_large_content_multichunk() {
 #[test]
 fn publish_encrypted_grant_fetch_decrypt() {
     let dir = tmp_dir();
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let creator = keygen();
     let recipient = keygen();
@@ -174,7 +174,7 @@ fn publish_encrypted_grant_fetch_decrypt() {
 #[test]
 fn pre_multiple_recipients_independent() {
     let dir = tmp_dir();
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let creator = keygen();
     let recipients: Vec<SigningKey> = (0..5).map(|_| keygen()).collect();
@@ -222,7 +222,7 @@ fn pre_multiple_recipients_independent() {
 #[test]
 fn revoke_and_rotate_denies_revoked_user() {
     let dir = tmp_dir();
-    let mut client = DataCraftClient::new(&dir).unwrap();
+    let mut client = CraftOBJClient::new(&dir).unwrap();
 
     let creator = keygen();
     let user_a = keygen();

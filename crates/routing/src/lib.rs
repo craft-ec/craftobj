@@ -1,15 +1,15 @@
-//! DataCraft Routing
+//! CraftOBJ Routing
 //!
 //! DHT-based content provider discovery built on craftec-network's Kademlia.
 //!
 //! DHT keys:
-//! - `/datacraft/providers/<cid_hex>` — provider records
-//! - `/datacraft/manifest/<cid_hex>` — serialized ContentManifest
+//! - `/craftobj/providers/<cid_hex>` — provider records
+//! - `/craftobj/manifest/<cid_hex>` — serialized ContentManifest
 
 use std::time::Duration;
 
-use datacraft_core::{
-    ContentManifest, ContentId, DataCraftError, RemovalNotice, Result,
+use craftobj_core::{
+    ContentManifest, ContentId, CraftObjError, RemovalNotice, Result,
     MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,
     REMOVAL_DHT_PREFIX,
     access::AccessList,
@@ -62,17 +62,17 @@ pub fn removal_dht_key(content_id: &ContentId) -> Vec<u8> {
 /// This is used for per-segment provider records so that fetchers can discover
 /// which nodes hold pieces for a given segment.
 ///
-/// Key = SHA-256("datacraft/provider/" || content_id_bytes || segment_index_be)
+/// Key = SHA-256("craftobj/provider/" || content_id_bytes || segment_index_be)
 pub fn provider_key(content_id: &ContentId, segment_index: u32) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(b"datacraft/provider/");
+    hasher.update(b"craftobj/provider/");
     hasher.update(&content_id.0);
     hasher.update(segment_index.to_be_bytes());
     hasher.finalize().to_vec()
 }
 
 /// Content router — wraps CraftBehaviour's generic DHT methods
-/// with DataCraft-specific key schemes.
+/// with CraftOBJ-specific key schemes.
 pub struct ContentRouter;
 
 impl ContentRouter {
@@ -104,7 +104,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = manifest_dht_key(&manifest.content_id);
         let value = serde_json::to_vec(manifest)
-            .map_err(|e| DataCraftError::ManifestError(e.to_string()))?;
+            .map_err(|e| CraftOBJError::ManifestError(e.to_string()))?;
         debug!(
             "Publishing manifest for {} ({} bytes)",
             manifest.content_id,
@@ -112,7 +112,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(MANIFEST_RECORD_TTL))
-            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch a manifest from the DHT.
@@ -133,7 +133,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = access_dht_key(&access_list.content_id);
         let value = bincode::serialize(access_list)
-            .map_err(|e| DataCraftError::EncryptionError(format!("serialize access list: {e}")))?;
+            .map_err(|e| CraftOBJError::EncryptionError(format!("serialize access list: {e}")))?;
         debug!(
             "Publishing access list for {} ({} bytes, {} entries)",
             access_list.content_id,
@@ -142,7 +142,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(ACCESS_RECORD_TTL))
-            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch an access list from the DHT.
@@ -164,7 +164,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = rekey_dht_key(content_id, &entry.recipient_did);
         let value = bincode::serialize(entry)
-            .map_err(|e| DataCraftError::EncryptionError(format!("serialize re-key: {e}")))?;
+            .map_err(|e| CraftOBJError::EncryptionError(format!("serialize re-key: {e}")))?;
         debug!(
             "Publishing re-key for {} → {} ({} bytes)",
             content_id,
@@ -173,7 +173,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(ACCESS_RECORD_TTL))
-            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch a re-encryption key entry from the DHT.
@@ -200,7 +200,7 @@ impl ContentRouter {
     ) -> Result<kad::QueryId> {
         let key = removal_dht_key(content_id);
         let value = bincode::serialize(notice)
-            .map_err(|e| DataCraftError::StorageError(format!("serialize removal notice: {e}")))?;
+            .map_err(|e| CraftOBJError::StorageError(format!("serialize removal notice: {e}")))?;
         debug!(
             "Publishing removal notice for {} ({} bytes)",
             content_id,
@@ -208,7 +208,7 @@ impl ContentRouter {
         );
         behaviour
             .put_record(&key, value, local_peer_id, Some(REMOVAL_RECORD_TTL))
-            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
     }
 
     /// Fetch a removal notice from the DHT.
@@ -240,38 +240,38 @@ impl ContentRouter {
         // Overwrite with empty value (tombstone)
         behaviour
             .put_record(&key, vec![], local_peer_id, Some(Duration::from_secs(1)))
-            .map_err(|e| DataCraftError::NetworkError(format!("put_record: {:?}", e)))
+            .map_err(|e| CraftOBJError::NetworkError(format!("put_record: {:?}", e)))
     }
 }
 
 /// Parse a manifest from a DHT record value.
 pub fn parse_manifest_record(value: &[u8]) -> Result<ContentManifest> {
     serde_json::from_slice(value)
-        .map_err(|e| DataCraftError::ManifestError(e.to_string()))
+        .map_err(|e| CraftOBJError::ManifestError(e.to_string()))
 }
 
 /// Parse an access list from a DHT record value.
 pub fn parse_access_list_record(value: &[u8]) -> Result<AccessList> {
     bincode::deserialize(value)
-        .map_err(|e| DataCraftError::EncryptionError(format!("deserialize access list: {e}")))
+        .map_err(|e| CraftOBJError::EncryptionError(format!("deserialize access list: {e}")))
 }
 
 /// Parse a removal notice from a DHT record value.
 pub fn parse_removal_record(value: &[u8]) -> Result<RemovalNotice> {
     if value.is_empty() {
-        return Err(DataCraftError::StorageError("removal record is empty".into()));
+        return Err(CraftOBJError::StorageError("removal record is empty".into()));
     }
     bincode::deserialize(value)
-        .map_err(|e| DataCraftError::StorageError(format!("deserialize removal notice: {e}")))
+        .map_err(|e| CraftOBJError::StorageError(format!("deserialize removal notice: {e}")))
 }
 
 /// Parse a re-key entry from a DHT record value.
 pub fn parse_rekey_record(value: &[u8]) -> Result<ReKeyEntry> {
     if value.is_empty() {
-        return Err(DataCraftError::EncryptionError("re-key record is tombstoned".into()));
+        return Err(CraftOBJError::EncryptionError("re-key record is tombstoned".into()));
     }
     bincode::deserialize(value)
-        .map_err(|e| DataCraftError::EncryptionError(format!("deserialize re-key: {e}")))
+        .map_err(|e| CraftOBJError::EncryptionError(format!("deserialize re-key: {e}")))
 }
 
 #[cfg(test)]
@@ -283,8 +283,8 @@ mod tests {
         let cid = ContentId::from_bytes(b"test");
         let key = providers_dht_key(&cid);
         let key_str = String::from_utf8(key).unwrap();
-        assert!(key_str.starts_with("/datacraft/providers/"));
-        assert_eq!(key_str.len(), "/datacraft/providers/".len() + 64);
+        assert!(key_str.starts_with("/craftobj/providers/"));
+        assert_eq!(key_str.len(), "/craftobj/providers/".len() + 64);
     }
 
     #[test]
@@ -292,7 +292,7 @@ mod tests {
         let cid = ContentId::from_bytes(b"test");
         let key = manifest_dht_key(&cid);
         let key_str = String::from_utf8(key).unwrap();
-        assert!(key_str.starts_with("/datacraft/manifest/"));
+        assert!(key_str.starts_with("/craftobj/manifest/"));
     }
 
     #[test]
@@ -300,8 +300,8 @@ mod tests {
         let cid = ContentId::from_bytes(b"test");
         let key = access_dht_key(&cid);
         let key_str = String::from_utf8(key).unwrap();
-        assert!(key_str.starts_with("/datacraft/access/"));
-        assert_eq!(key_str.len(), "/datacraft/access/".len() + 64);
+        assert!(key_str.starts_with("/craftobj/access/"));
+        assert_eq!(key_str.len(), "/craftobj/access/".len() + 64);
     }
 
     #[test]
@@ -310,8 +310,8 @@ mod tests {
         let recipient = [0xABu8; 32];
         let key = rekey_dht_key(&cid, &recipient);
         let key_str = String::from_utf8(key).unwrap();
-        assert!(key_str.starts_with("/datacraft/rekey/"));
-        let parts: Vec<&str> = key_str.strip_prefix("/datacraft/rekey/").unwrap().split('/').collect();
+        assert!(key_str.starts_with("/craftobj/rekey/"));
+        let parts: Vec<&str> = key_str.strip_prefix("/craftobj/rekey/").unwrap().split('/').collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].len(), 64);
         assert_eq!(parts[1].len(), 64);
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_parse_access_list_record() {
-        use datacraft_core::access::create_access_list;
+        use craftobj_core::access::create_access_list;
         use ed25519_dalek::SigningKey;
 
         let creator = SigningKey::generate(&mut rand::thread_rng());
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_parse_rekey_record() {
-        use datacraft_core::pre::{generate_re_key, ReKeyEntry};
+        use craftobj_core::pre::{generate_re_key, ReKeyEntry};
         use ed25519_dalek::SigningKey;
 
         let creator = SigningKey::generate(&mut rand::thread_rng());
@@ -358,8 +358,8 @@ mod tests {
         let cid = ContentId::from_bytes(b"removal test");
         let key = removal_dht_key(&cid);
         let key_str = String::from_utf8(key).unwrap();
-        assert!(key_str.starts_with("/datacraft/removal/"));
-        assert_eq!(key_str.len(), "/datacraft/removal/".len() + 64);
+        assert!(key_str.starts_with("/craftobj/removal/"));
+        assert_eq!(key_str.len(), "/craftobj/removal/".len() + 64);
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod tests {
 
         let keypair = SigningKey::generate(&mut rand::thread_rng());
         let cid = ContentId::from_bytes(b"removal parse test");
-        let notice = datacraft_core::RemovalNotice::sign(&keypair, cid, Some("test".into()));
+        let notice = craftobj_core::RemovalNotice::sign(&keypair, cid, Some("test".into()));
 
         let bytes = bincode::serialize(&notice).unwrap();
         let parsed = parse_removal_record(&bytes).unwrap();

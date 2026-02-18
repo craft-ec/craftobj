@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use datacraft_core::{ContentId, DemandSignal};
-use datacraft_store::FsStore;
+use craftobj_core::{ContentId, DemandSignal};
+use craftobj_store::FsStore;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::commands::DataCraftCommand;
+use crate::commands::CraftOBJCommand;
 use crate::peer_scorer::PeerScorer;
 use crate::push_target;
 
@@ -136,18 +136,18 @@ impl DemandSignalTracker {
 /// Push-based — same pattern as repair.
 pub struct ScalingCoordinator {
     local_peer_id: PeerId,
-    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
     /// Track which CIDs we've recently attempted scaling for (avoid duplicates).
     recent_scaling: HashMap<ContentId, Instant>,
     /// Storage Merkle tree for incremental updates on local store.
-    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    merkle_tree: Option<Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>>,
 }
 
 impl ScalingCoordinator {
     pub fn new(
         local_peer_id: PeerId,
-        command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
     ) -> Self {
         Self {
             local_peer_id,
@@ -158,7 +158,7 @@ impl ScalingCoordinator {
         }
     }
 
-    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>) {
         self.merkle_tree = Some(tree);
     }
 
@@ -287,7 +287,7 @@ impl ScalingCoordinator {
             }
         };
 
-        let new_pid = datacraft_store::piece_id_from_coefficients(&new_piece.coefficients);
+        let new_pid = craftobj_store::piece_id_from_coefficients(&new_piece.coefficients);
 
         info!("Scaling: created new piece for {}/seg{}, selecting push target", content_id, segment_index);
 
@@ -314,7 +314,7 @@ impl ScalingCoordinator {
 
         // Push piece to target node
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        if self.command_tx.send(DataCraftCommand::PushPiece {
+        if self.command_tx.send(CraftOBJCommand::PushPiece {
             peer_id: target_peer,
             content_id,
             segment_index,
@@ -365,7 +365,7 @@ pub fn create_demand_signal(
 mod tests {
     use super::*;
 
-    fn make_tx() -> mpsc::UnboundedSender<DataCraftCommand> {
+    fn make_tx() -> mpsc::UnboundedSender<CraftOBJCommand> {
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
     }
@@ -436,7 +436,7 @@ mod tests {
                 .as_secs(),
         };
 
-        let store = datacraft_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let store = craftobj_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
         assert!(coord.handle_scaling_notice(&signal, &store).is_none());
     }
 
@@ -453,7 +453,7 @@ mod tests {
             timestamp: 1000, // very old
         };
 
-        let store = datacraft_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let store = craftobj_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
         assert!(coord.handle_scaling_notice(&signal, &store).is_none());
     }
 
@@ -474,7 +474,7 @@ mod tests {
         };
 
         // Empty store — we're not a provider
-        let store = datacraft_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let store = craftobj_store::FsStore::new(tempfile::tempdir().unwrap().path()).unwrap();
         assert!(coord.handle_scaling_notice(&signal, &store).is_none());
     }
 
@@ -497,8 +497,8 @@ mod tests {
 
         // Create a store with manifest + ≥2 pieces so we count as a provider
         let tmp = tempfile::tempdir().unwrap();
-        let store = datacraft_store::FsStore::new(tmp.path()).unwrap();
-        let manifest = datacraft_core::ContentManifest {
+        let store = craftobj_store::FsStore::new(tmp.path()).unwrap();
+        let manifest = craftobj_core::ContentManifest {
             content_id: cid,
             content_hash: cid.0,
             segment_size: 10_485_760,
@@ -512,8 +512,8 @@ mod tests {
         let piece_data = vec![0u8; 100];
         let coeff1 = vec![1u8, 0, 0];
         let coeff2 = vec![0u8, 1, 0];
-        let pid1 = datacraft_store::piece_id_from_coefficients(&coeff1);
-        let pid2 = datacraft_store::piece_id_from_coefficients(&coeff2);
+        let pid1 = craftobj_store::piece_id_from_coefficients(&coeff1);
+        let pid2 = craftobj_store::piece_id_from_coefficients(&coeff2);
         store.store_piece(&cid, 0, &pid1, &piece_data, &coeff1).unwrap();
         store.store_piece(&cid, 0, &pid2, &piece_data, &coeff2).unwrap();
 

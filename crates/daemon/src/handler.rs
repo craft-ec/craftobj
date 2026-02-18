@@ -1,6 +1,6 @@
 //! IPC request handler
 //!
-//! Implements craftec_ipc::IpcHandler for DataCraft daemon.
+//! Implements craftec_ipc::IpcHandler for CraftOBJ daemon.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,23 +9,23 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use craftec_ipc::server::IpcHandler;
-use datacraft_client::DataCraftClient;
-use datacraft_core::PublishOptions;
+use craftobj_client::CraftOBJClient;
+use craftobj_core::PublishOptions;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::channel_store::ChannelStore;
-use datacraft_transfer;
-use crate::commands::DataCraftCommand;
+use craftobj_transfer;
+use crate::commands::CraftOBJCommand;
 use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
 use crate::events::{DaemonEvent, EventSender};
-use crate::protocol::DataCraftProtocol;
+use crate::protocol::CraftOBJProtocol;
 use crate::receipt_store::PersistentReceiptStore;
 use crate::settlement::SolanaClient;
 
-use datacraft_core::DataCraftCapability;
+use craftobj_core::CraftOBJCapability;
 use ed25519_dalek;
 
 use crate::peer_scorer::PeerScorer;
@@ -47,7 +47,7 @@ struct CidNetworkHealth {
     providers: Vec<Value>,
 }
 
-impl DataCraftHandler {
+impl CraftOBJHandler {
     /// Compute network health for a CID by aggregating local + remote pieces.
     /// `local_seg_pieces` should contain per-segment local piece counts.
     /// `manifest` provides segment count and per-segment k values.
@@ -55,7 +55,7 @@ impl DataCraftHandler {
         &self,
         cid_hex: &str,
         local_seg_pieces: &[usize],
-        manifest: &datacraft_core::ContentManifest,
+        manifest: &craftobj_core::ContentManifest,
         include_provider_details: bool,
     ) -> CidNetworkHealth {
         let seg_count = manifest.segment_count;
@@ -73,7 +73,7 @@ impl DataCraftHandler {
 
         // Add remote pieces from PieceMap (piece_counts removed from capability announcements)
         if let Some(ref pm) = self.piece_map {
-            if let Ok(cid) = datacraft_core::ContentId::from_hex(cid_hex) {
+            if let Ok(cid) = craftobj_core::ContentId::from_hex(cid_hex) {
                 let map = pm.lock().await;
                 // Count pieces per node per segment from PieceMap
                 let mut node_pieces: std::collections::HashMap<Vec<u8>, Vec<usize>> = std::collections::HashMap::new();
@@ -116,7 +116,7 @@ impl DataCraftHandler {
             let ps = scorer.lock().await;
             if include_provider_details {
                 if let Some(ref tracker) = self.content_tracker {
-                    if let Ok(cid) = datacraft_core::ContentId::from_hex(cid_hex) {
+                    if let Ok(cid) = craftobj_core::ContentId::from_hex(cid_hex) {
                         let t = tracker.lock().await;
                         let tracked = t.get_providers(&cid);
                         for peer in tracked {
@@ -192,17 +192,17 @@ impl DataCraftHandler {
     }
 }
 
-/// DataCraft IPC handler wrapping a DataCraftClient and protocol.
-pub struct DataCraftHandler {
-    client: Arc<Mutex<DataCraftClient>>,
-    _protocol: Option<Arc<DataCraftProtocol>>,
-    command_tx: Option<mpsc::UnboundedSender<DataCraftCommand>>,
+/// CraftOBJ IPC handler wrapping a CraftOBJClient and protocol.
+pub struct CraftOBJHandler {
+    client: Arc<Mutex<CraftOBJClient>>,
+    _protocol: Option<Arc<CraftOBJProtocol>>,
+    command_tx: Option<mpsc::UnboundedSender<CraftOBJCommand>>,
     peer_scorer: Option<SharedPeerScorer>,
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     channel_store: Option<Arc<Mutex<ChannelStore>>>,
     settlement_client: Option<Arc<Mutex<SolanaClient>>>,
     content_tracker: Option<Arc<Mutex<ContentTracker>>>,
-    own_capabilities: Vec<DataCraftCapability>,
+    own_capabilities: Vec<CraftOBJCapability>,
     daemon_config: Option<Arc<Mutex<DaemonConfig>>>,
     data_dir: Option<std::path::PathBuf>,
     event_sender: Option<EventSender>,
@@ -211,7 +211,7 @@ pub struct DataCraftHandler {
     /// Eviction manager for recording access on fetch.
     eviction_manager: Option<Arc<Mutex<crate::eviction::EvictionManager>>>,
     /// Storage Merkle tree for incremental updates on store operations.
-    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    merkle_tree: Option<Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>>,
     /// Local peer ID for filtering self from provider lists.
     pub local_peer_id: Option<libp2p::PeerId>,
     /// Challenger manager for PDP — register CIDs after publish/store.
@@ -224,11 +224,11 @@ pub struct DataCraftHandler {
     start_time: Instant,
 }
 
-impl DataCraftHandler {
+impl CraftOBJHandler {
     pub fn new(
-        client: Arc<Mutex<DataCraftClient>>,
-        protocol: Arc<DataCraftProtocol>,
-        command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+        client: Arc<Mutex<CraftOBJClient>>,
+        protocol: Arc<CraftOBJProtocol>,
+        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
         peer_scorer: SharedPeerScorer,
         receipt_store: Arc<Mutex<PersistentReceiptStore>>,
         channel_store: Arc<Mutex<ChannelStore>>,
@@ -269,7 +269,7 @@ impl DataCraftHandler {
         self.local_peer_id = Some(peer_id);
     }
 
-    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>) {
         self.merkle_tree = Some(tree);
     }
 
@@ -307,12 +307,12 @@ impl DataCraftHandler {
     }
 
     /// Set the node's own capabilities (for reporting via `node.capabilities` RPC).
-    pub fn set_own_capabilities(&mut self, caps: Vec<DataCraftCapability>) {
+    pub fn set_own_capabilities(&mut self, caps: Vec<CraftOBJCapability>) {
         self.own_capabilities = caps;
     }
 
     /// Create handler without protocol (for testing).
-    pub fn new_without_protocol(client: Arc<Mutex<DataCraftClient>>) -> Self {
+    pub fn new_without_protocol(client: Arc<Mutex<CraftOBJClient>>) -> Self {
         Self { 
             client, 
             _protocol: None,
@@ -338,7 +338,7 @@ impl DataCraftHandler {
     }
 
     /// Emit PieceDropped events for all pieces of a CID (used when deleting content).
-    async fn emit_pieces_dropped_for_content(&self, cid: &datacraft_core::ContentId) {
+    async fn emit_pieces_dropped_for_content(&self, cid: &craftobj_core::ContentId) {
         if let Some(ref pm) = self.piece_map {
             // Collect all local pieces for this CID from the store before deletion
             let client = self.client.lock().await;
@@ -357,7 +357,7 @@ impl DataCraftHandler {
                 };
                 for pid in pieces {
                     let seq = map.next_seq();
-                    let mut dropped = datacraft_core::PieceDropped {
+                    let mut dropped = craftobj_core::PieceDropped {
                         node: local_node.clone(),
                         cid: *cid,
                         segment: seg,
@@ -372,7 +372,7 @@ impl DataCraftHandler {
                     if let Some(ref key) = self.node_signing_key {
                         dropped.sign(key);
                     }
-                    let event = datacraft_core::PieceEvent::Dropped(dropped);
+                    let event = craftobj_core::PieceEvent::Dropped(dropped);
                     map.apply_event(&event);
                 }
             }
@@ -441,7 +441,7 @@ impl DataCraftHandler {
             debug!("Publishing manifest for {} to DHT (without provider announcement)", result.content_id);
             
             let (reply_tx, reply_rx) = oneshot::channel();
-            let command = DataCraftCommand::AnnounceProvider {
+            let command = CraftOBJCommand::AnnounceProvider {
                 content_id: result.content_id,
                 manifest,
                 reply_tx,
@@ -502,7 +502,7 @@ impl DataCraftHandler {
 
         // Trigger immediate distribution to push shards to storage peers
         if let Some(ref command_tx) = self.command_tx {
-            let _ = command_tx.send(DataCraftCommand::TriggerDistribution);
+            let _ = command_tx.send(CraftOBJCommand::TriggerDistribution);
         }
 
         let mut response = serde_json::json!({
@@ -528,7 +528,7 @@ impl DataCraftHandler {
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 let mut p = std::env::temp_dir();
-                p.push(format!("datacraft-{}", &cid_hex[..8.min(cid_hex.len())]));
+                p.push(format!("craftobj-{}", &cid_hex[..8.min(cid_hex.len())]));
                 p
             });
         let key = params
@@ -537,7 +537,7 @@ impl DataCraftHandler {
             .map(|s| hex::decode(s).unwrap_or_default());
 
         let cid =
-            datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+            craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
         // Try local-first fetch path: use locally cached manifest + peer scorer providers
         // This works even with few nodes where DHT routing tables are sparse
@@ -579,7 +579,7 @@ impl DataCraftHandler {
                 // Also resolve DHT providers and merge
                 {
                     let (reply_tx, reply_rx) = oneshot::channel();
-                    let command = DataCraftCommand::ResolveProviders {
+                    let command = CraftOBJCommand::ResolveProviders {
                         content_id: cid,
                         reply_tx,
                     };
@@ -637,7 +637,7 @@ impl DataCraftHandler {
                 info!("[handler.rs] Attempting DHT-only resolution for {}", cid);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let command = DataCraftCommand::ResolveProviders {
+                let command = CraftOBJCommand::ResolveProviders {
                     content_id: cid,
                     reply_tx,
                 };
@@ -648,7 +648,7 @@ impl DataCraftHandler {
                             info!("[handler.rs] Found {} providers for {} via DHT", providers.len(), cid);
 
                             let (manifest_tx, manifest_rx) = oneshot::channel();
-                            let command = DataCraftCommand::GetManifest {
+                            let command = CraftOBJCommand::GetManifest {
                                 content_id: cid,
                                 reply_tx: manifest_tx,
                             };
@@ -788,7 +788,7 @@ impl DataCraftHandler {
         let params = params.unwrap_or(serde_json::json!({}));
 
         let entries: Vec<&crate::receipt_store::ReceiptEntry> = if let Some(cid_hex) = params.get("cid").and_then(|v| v.as_str()) {
-            let cid = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+            let cid = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
             store.query_by_cid(&cid)
         } else if let Some(node_hex) = params.get("node").and_then(|v| v.as_str()) {
             let bytes = hex::decode(node_hex).map_err(|e| e.to_string())?;
@@ -830,9 +830,9 @@ impl DataCraftHandler {
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
         // Optional filters
-        let receipts: Vec<&datacraft_core::StorageReceipt> =
+        let receipts: Vec<&craftobj_core::StorageReceipt> =
             if let Some(cid_hex) = params.get("cid").and_then(|v| v.as_str()) {
-                let cid = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+                let cid = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
                 store.query_by_cid(&cid).into_iter().filter_map(|e| match e {
                     crate::receipt_store::ReceiptEntry::Storage(r) => Some(r),
                     _ => None,
@@ -935,7 +935,7 @@ impl DataCraftHandler {
         // Announce as provider
         if let Some(ref command_tx) = self.command_tx {
             let (tx, rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::AnnounceProvider {
+            command_tx.send(CraftOBJCommand::AnnounceProvider {
                 content_id: cid,
                 manifest,
                 reply_tx: tx,
@@ -958,10 +958,10 @@ impl DataCraftHandler {
     /// and discards dependent pieces.
     async fn fetch_missing_pieces_from_peers(
         &self,
-        content_id: &datacraft_core::ContentId,
-        manifest: &datacraft_core::ContentManifest,
+        content_id: &craftobj_core::ContentId,
+        manifest: &craftobj_core::ContentManifest,
         providers: &[libp2p::PeerId],
-        command_tx: &tokio::sync::mpsc::UnboundedSender<DataCraftCommand>,
+        command_tx: &tokio::sync::mpsc::UnboundedSender<CraftOBJCommand>,
     ) -> Result<(), String> {
         use std::collections::HashMap;
         use tokio::task::JoinSet;
@@ -1044,8 +1044,8 @@ impl DataCraftHandler {
                 info!("[handler.rs] Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
-                    let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
-                    let command = DataCraftCommand::PieceSync {
+                    let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftOBJResponse, String>>();
+                    let command = CraftOBJCommand::PieceSync {
                         peer_id: provider,
                         content_id: cid,
                         segment_index: seg_idx,
@@ -1058,7 +1058,7 @@ impl DataCraftHandler {
                         return (provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
                     }
                     match reply_rx.await {
-                        Ok(Ok(datacraft_transfer::DataCraftResponse::PieceBatch { pieces })) => {
+                        Ok(Ok(craftobj_transfer::CraftOBJResponse::PieceBatch { pieces })) => {
                             if pieces.is_empty() {
                                 (provider, Err("no pieces returned".into()), start.elapsed())
                             } else {
@@ -1095,7 +1095,7 @@ impl DataCraftHandler {
 
                             if new_rank > current_rank {
                                 // Independent piece — store it
-                                let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+                                let piece_id = craftobj_store::piece_id_from_coefficients(&coefficients);
 
                                 let stored = {
                                     let client_guard = client.lock().await;
@@ -1111,7 +1111,7 @@ impl DataCraftHandler {
                                         if let Some(ref pm) = piece_map {
                                             let mut map = pm.lock().await;
                                             let seq = map.next_seq();
-                                            let mut ps_event = datacraft_core::PieceStored {
+                                            let mut ps_event = craftobj_core::PieceStored {
                                                 node: map.local_node().to_vec(),
                                                 cid,
                                                 segment: seg_idx,
@@ -1127,13 +1127,13 @@ impl DataCraftHandler {
                                             if let Some(ref key) = signing_key {
                                                 ps_event.sign(key);
                                             }
-                                            let event = datacraft_core::PieceEvent::Stored(ps_event);
+                                            let event = craftobj_core::PieceEvent::Stored(ps_event);
                                             map.apply_event(&event);
                                         }
                                         // Publish DHT provider record for this CID+segment
                                         {
-                                            let pkey = datacraft_routing::provider_key(&cid, seg_idx);
-                                            let _ = command_tx.send(DataCraftCommand::StartProviding { key: pkey });
+                                            let pkey = craftobj_routing::provider_key(&cid, seg_idx);
+                                            let _ = command_tx.send(CraftOBJCommand::StartProviding { key: pkey });
                                         }
                                         coeff_matrix.push(coefficients);
                                         current_rank = new_rank;
@@ -1182,8 +1182,8 @@ impl DataCraftHandler {
                             let cmd_tx = command_tx.clone();
                             join_set.spawn(async move {
                                 let start = std::time::Instant::now();
-                                let (reply_tx, reply_rx) = oneshot::channel::<Result<datacraft_transfer::DataCraftResponse, String>>();
-                                let command = DataCraftCommand::PieceSync {
+                                let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftOBJResponse, String>>();
+                                let command = CraftOBJCommand::PieceSync {
                                     peer_id: next_provider,
                                     content_id: cid,
                                     segment_index: seg_idx,
@@ -1196,7 +1196,7 @@ impl DataCraftHandler {
                                     return (next_provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
                                 }
                                 match reply_rx.await {
-                                    Ok(Ok(datacraft_transfer::DataCraftResponse::PieceBatch { pieces })) => {
+                                    Ok(Ok(craftobj_transfer::CraftOBJResponse::PieceBatch { pieces })) => {
                                         if pieces.is_empty() {
                                             (next_provider, Err("no pieces returned".into()), start.elapsed())
                                         } else {
@@ -1257,7 +1257,7 @@ impl DataCraftHandler {
         let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
         let content_key_hex = params.get("content_key").and_then(|v| v.as_str()).ok_or("missing 'content_key'")?;
 
-        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
         let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
         if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
         let creator_key = ed25519_dalek::SigningKey::from_bytes(
@@ -1269,21 +1269,21 @@ impl DataCraftHandler {
         let content_key = hex::decode(content_key_hex).map_err(|e| e.to_string())?;
 
         // Generate re-key entry
-        let re_key = datacraft_core::pre::generate_re_key(&creator_key, &recipient_pubkey)
+        let re_key = craftobj_core::pre::generate_re_key(&creator_key, &recipient_pubkey)
             .map_err(|e| e.to_string())?;
-        let entry = datacraft_core::pre::ReKeyEntry {
+        let entry = craftobj_core::pre::ReKeyEntry {
             recipient_did: recipient_bytes,
             re_key,
         };
 
         // Also generate the re-encrypted key for the recipient
-        let re_encrypted = datacraft_core::pre::re_encrypt_with_content_key(&content_key, &entry.re_key)
+        let re_encrypted = craftobj_core::pre::re_encrypt_with_content_key(&content_key, &entry.re_key)
             .map_err(|e| e.to_string())?;
 
         // Store re-key in DHT
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::PutReKey {
+            command_tx.send(CraftOBJCommand::PutReKey {
                 content_id,
                 entry: entry.clone(),
                 reply_tx,
@@ -1314,12 +1314,12 @@ impl DataCraftHandler {
         let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
         let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
 
-        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
         let recipient_did = parse_pubkey(recipient_pubkey_hex)?;
 
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::RemoveReKey {
+            command_tx.send(CraftOBJCommand::RemoveReKey {
                 content_id,
                 recipient_did,
                 reply_tx,
@@ -1345,11 +1345,11 @@ impl DataCraftHandler {
         let params = params.ok_or("missing params")?;
         let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
 
-        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::GetAccessList {
+            command_tx.send(CraftOBJCommand::GetAccessList {
                 content_id,
                 reply_tx,
             }).map_err(|e| e.to_string())?;
@@ -1392,7 +1392,7 @@ impl DataCraftHandler {
             all_authorized.push(vk);
         }
 
-        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
         let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
         if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
         let creator_key = ed25519_dalek::SigningKey::from_bytes(
@@ -1406,7 +1406,7 @@ impl DataCraftHandler {
         // 1. Revoke: tombstone the old re-key
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::RemoveReKey {
+            command_tx.send(CraftOBJCommand::RemoveReKey {
                 content_id,
                 recipient_did: revoked_bytes,
                 reply_tx,
@@ -1431,7 +1431,7 @@ impl DataCraftHandler {
             // Store re-keys for remaining users
             for (entry, _re_enc) in &revocation.re_grants {
                 let (reply_tx, reply_rx) = oneshot::channel();
-                command_tx.send(DataCraftCommand::PutReKey {
+                command_tx.send(CraftOBJCommand::PutReKey {
                     content_id: revocation.new_content_id,
                     entry: entry.clone(),
                     reply_tx,
@@ -1446,7 +1446,7 @@ impl DataCraftHandler {
                     .map_err(|e| e.to_string())?
             };
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::AnnounceProvider {
+            command_tx.send(CraftOBJCommand::AnnounceProvider {
                 content_id: revocation.new_content_id,
                 manifest,
                 reply_tx,
@@ -1486,11 +1486,11 @@ impl DataCraftHandler {
         if cid_bytes.len() != 32 { return Err("CID must be 32 bytes".into()); }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&cid_bytes);
-        let cid = datacraft_core::ContentId(arr);
+        let cid = craftobj_core::ContentId(arr);
 
         let command_tx = self.command_tx.as_ref().ok_or("no command channel")?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        command_tx.send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
+        command_tx.send(CraftOBJCommand::ResolveProviders { content_id: cid, reply_tx: tx })
             .map_err(|e| format!("send error: {e}"))?;
         let providers = rx.await.map_err(|e| format!("recv error: {e}"))??;
         Ok(serde_json::json!({
@@ -1505,7 +1505,7 @@ impl DataCraftHandler {
     async fn handle_data_delete_local(&self, params: Option<Value>) -> Result<Value, String> {
         let params = params.ok_or("missing params")?;
         let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
-        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
         // Emit PieceDropped events before deletion
         self.emit_pieces_dropped_for_content(&content_id).await;
@@ -1533,7 +1533,7 @@ impl DataCraftHandler {
             .ok_or("missing 'creator_secret'")?;
         let reason = params.get("reason").and_then(|v| v.as_str()).map(String::from);
 
-        let content_id = datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
+        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
         let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
         if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
         let creator_key = ed25519_dalek::SigningKey::from_bytes(
@@ -1545,7 +1545,7 @@ impl DataCraftHandler {
             let client = self.client.lock().await;
             if let Ok(manifest) = client.store().get_manifest(&content_id) {
                 if !manifest.creator.is_empty() {
-                    let expected_did = datacraft_core::did_from_pubkey(&creator_key.verifying_key());
+                    let expected_did = craftobj_core::did_from_pubkey(&creator_key.verifying_key());
                     if manifest.creator != expected_did {
                         return Err("creator key does not match manifest creator".into());
                     }
@@ -1563,7 +1563,7 @@ impl DataCraftHandler {
         // Publish to DHT
         if let Some(ref command_tx) = self.command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(DataCraftCommand::PublishRemoval {
+            command_tx.send(CraftOBJCommand::PublishRemoval {
                 content_id,
                 notice: notice.clone(),
                 reply_tx,
@@ -1625,7 +1625,7 @@ impl DataCraftHandler {
             id
         };
 
-        let channel = datacraft_core::payment_channel::PaymentChannel::new(
+        let channel = craftobj_core::payment_channel::PaymentChannel::new(
             channel_id, sender, receiver, amount,
         );
 
@@ -1666,7 +1666,7 @@ impl DataCraftHandler {
             hex::decode(signature_hex).map_err(|e| e.to_string())?
         };
 
-        let voucher = datacraft_core::payment_channel::PaymentVoucher {
+        let voucher = craftobj_core::payment_channel::PaymentVoucher {
             channel_id,
             cumulative_amount: amount,
             nonce,
@@ -1788,8 +1788,8 @@ impl DataCraftHandler {
         // Build a minimal receipt for the claim
         let storage_node_hex = params.get("operator").and_then(|v| v.as_str()).ok_or("missing 'operator'")?;
         let storage_node = parse_pubkey(storage_node_hex)?;
-        let receipt = datacraft_core::StorageReceipt {
-            content_id: datacraft_core::ContentId::from_bytes(&[0u8; 32]),
+        let receipt = craftobj_core::StorageReceipt {
+            content_id: craftobj_core::ContentId::from_bytes(&[0u8; 32]),
             storage_node,
             challenger: [0u8; 32],
             segment_index: 0,
@@ -1930,7 +1930,7 @@ impl DataCraftHandler {
     /// Returns (min_rank, health_ratio, disk_usage).
     /// Health ratio = min per-segment ratio (pieces/k_for_segment), so the last
     /// segment (which has fewer source pieces) doesn't drag down the score.
-    async fn compute_cid_health(&self, cid: &datacraft_core::ContentId) -> Result<(usize, f64, u64), String> {
+    async fn compute_cid_health(&self, cid: &craftobj_core::ContentId) -> Result<(usize, f64, u64), String> {
         let client = self.client.lock().await;
         let store = client.store();
 
@@ -2080,10 +2080,10 @@ impl DataCraftHandler {
                 .as_millis() as u64 - 3_600_000
         });
 
-        let snapshots: Vec<datacraft_core::HealthSnapshot> = std::io::BufRead::lines(reader)
+        let snapshots: Vec<craftobj_core::HealthSnapshot> = std::io::BufRead::lines(reader)
             .filter_map(|line| line.ok())
             .filter_map(|line| serde_json::from_str(&line).ok())
-            .filter(|s: &datacraft_core::HealthSnapshot| s.timestamp >= cutoff)
+            .filter(|s: &craftobj_core::HealthSnapshot| s.timestamp >= cutoff)
             .collect();
 
         serde_json::to_value(&serde_json::json!({ "snapshots": snapshots }))
@@ -2095,7 +2095,7 @@ impl DataCraftHandler {
         let items = client.list().map_err(|e| e.to_string())?;
 
         // Collect local per-segment piece counts and manifests per CID
-        let mut cid_data: Vec<(datacraft_core::ContentId, Vec<usize>, Option<datacraft_core::ContentManifest>, u64)> = Vec::new();
+        let mut cid_data: Vec<(craftobj_core::ContentId, Vec<usize>, Option<craftobj_core::ContentManifest>, u64)> = Vec::new();
         for item in &items {
             let manifest = client.store().get_manifest(&item.content_id).ok();
             let seg_count = manifest.as_ref().map(|m| m.segment_count).unwrap_or(0);
@@ -2409,7 +2409,7 @@ fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
-impl IpcHandler for DataCraftHandler {
+impl IpcHandler for CraftOBJHandler {
     fn handle(
         &self,
         method: &str,
@@ -2478,11 +2478,11 @@ impl IpcHandler for DataCraftHandler {
     }
 }
 
-fn extract_cid(params: Option<Value>) -> Result<datacraft_core::ContentId, String> {
+fn extract_cid(params: Option<Value>) -> Result<craftobj_core::ContentId, String> {
     let params = params.ok_or("missing params")?;
     let cid_hex = params
         .get("cid")
         .and_then(|v| v.as_str())
         .ok_or("missing 'cid' param")?;
-    datacraft_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())
+    craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())
 }

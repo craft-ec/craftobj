@@ -1,4 +1,4 @@
-//! Simple stream-per-request transport for DataCraft.
+//! Simple stream-per-request transport for CraftOBJ.
 //!
 //! Each request opens a fresh yamux substream:
 //!   1. Open stream to peer
@@ -9,8 +9,8 @@
 //! Inbound: accept stream from peer, read request, write response, close.
 //! No persistent streams. No stream management. No contention.
 
-use datacraft_transfer::wire::{read_frame, write_request_frame, write_response_frame, StreamFrame};
-use datacraft_transfer::{DataCraftRequest, DataCraftResponse};
+use craftobj_transfer::wire::{read_frame, write_request_frame, write_response_frame, StreamFrame};
+use craftobj_transfer::{CraftOBJRequest, CraftOBJResponse};
 use libp2p::PeerId;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -19,7 +19,7 @@ use tracing::{info, warn};
 pub struct InboundMessage {
     pub peer: PeerId,
     pub seq_id: u64,
-    pub request: DataCraftRequest,
+    pub request: CraftOBJRequest,
     /// The stream to write the response on (same stream the request came from).
     pub stream: libp2p::Stream,
 }
@@ -27,14 +27,14 @@ pub struct InboundMessage {
 /// An outbound request to send to a peer.
 pub struct OutboundMessage {
     pub peer: PeerId,
-    pub request: DataCraftRequest,
+    pub request: CraftOBJRequest,
     /// Receives the response from the peer.
-    pub reply_tx: Option<tokio::sync::oneshot::Sender<DataCraftResponse>>,
+    pub reply_tx: Option<tokio::sync::oneshot::Sender<CraftOBJResponse>>,
 }
 
-/// Protocol for DataCraft transfer streams.
+/// Protocol for CraftOBJ transfer streams.
 pub fn transfer_stream_protocol() -> libp2p::StreamProtocol {
-    libp2p::StreamProtocol::new(datacraft_core::TRANSFER_PROTOCOL)
+    libp2p::StreamProtocol::new(craftobj_core::TRANSFER_PROTOCOL)
 }
 
 /// Manages peer addresses and provides stream-per-request transport.
@@ -125,8 +125,8 @@ impl StreamManager {
                     Ok(Err(e)) => {
                         warn!("[stream_mgr.rs] Failed to open stream to {}: {}", peer, e);
                         if let Some(tx) = msg.reply_tx {
-                            let _ = tx.send(DataCraftResponse::Ack {
-                                status: datacraft_core::WireStatus::Error,
+                            let _ = tx.send(CraftOBJResponse::Ack {
+                                status: craftobj_core::WireStatus::Error,
                             });
                         }
                         return;
@@ -134,8 +134,8 @@ impl StreamManager {
                     Err(_) => {
                         warn!("[stream_mgr.rs] Timeout opening stream to {}", peer);
                         if let Some(tx) = msg.reply_tx {
-                            let _ = tx.send(DataCraftResponse::Ack {
-                                status: datacraft_core::WireStatus::Error,
+                            let _ = tx.send(CraftOBJResponse::Ack {
+                                status: craftobj_core::WireStatus::Error,
                             });
                         }
                         return;
@@ -146,8 +146,8 @@ impl StreamManager {
                 if let Err(e) = write_request_frame(&mut stream, 0, &msg.request).await {
                     warn!("[stream_mgr.rs] Write to {} failed: {}", peer, e);
                     if let Some(tx) = msg.reply_tx {
-                        let _ = tx.send(DataCraftResponse::Ack {
-                            status: datacraft_core::WireStatus::Error,
+                        let _ = tx.send(CraftOBJResponse::Ack {
+                            status: craftobj_core::WireStatus::Error,
                         });
                     }
                     return;

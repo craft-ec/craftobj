@@ -224,8 +224,8 @@ Settlement can be done by anyone willing to pull all Merkle trees. The aggregato
 |---|---|
 | PieceStored/PieceDropped broadcast events | Local internal events + DHT provider records |
 | Broadcast-populated PieceMap | Merkle diff pull-populated PieceMap |
-| `datacraft/pieces/1.0.0` topic | DHT provider records + Merkle diff pulls |
-| `datacraft/demand/1.0.0` topic | Local fetch count |
+| `craftobj/pieces/1.0.0` topic | DHT provider records + Merkle diff pulls |
+| `craftobj/demand/1.0.0` topic | Local fetch count |
 | `DemandSignalTracker` | Local fetch count tracking |
 | Event-sourced sync protocol | Merkle tree diff protocol |
 | Multiple broadcast topics | DHT + PEX + direct P2P queries |

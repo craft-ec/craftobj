@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use datacraft_core::{ContentId, RemovalNotice};
+use craftobj_core::{ContentId, RemovalNotice};
 
 /// In-memory cache of removed CIDs and their removal notices.
 #[derive(Debug, Default)]

@@ -2,7 +2,7 @@
 //!
 //! On first start, generates a random 32-byte hex key and saves it to
 //! `<data-dir>/api_key`. On subsequent starts, reads the existing key.
-//! The key is also written to `~/.datacraft/api_key` for CraftStudio/CLI access.
+//! The key is also written to `~/.craftobj/api_key` for CraftStudio/CLI access.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub fn load_or_generate(data_dir: &Path) -> std::io::Result<String> {
         key
     };
 
-    // Also write to ~/.datacraft/api_key for CraftStudio/CLI
+    // Also write to ~/.craftobj/api_key for CraftStudio/CLI
     if let Some(well_known) = well_known_path() {
         if let Some(parent) = well_known.parent() {
             let _ = fs::create_dir_all(parent);
@@ -48,14 +48,14 @@ pub fn load_or_generate(data_dir: &Path) -> std::io::Result<String> {
     Ok(key)
 }
 
-/// Well-known path: `~/.datacraft/api_key`
+/// Well-known path: `~/.craftobj/api_key`
 fn well_known_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
-        .map(|h| PathBuf::from(h).join(".datacraft").join("api_key"))
+        .map(|h| PathBuf::from(h).join(".craftobj").join("api_key"))
 }
 
-/// Read the API key from the well-known path (`~/.datacraft/api_key`).
+/// Read the API key from the well-known path (`~/.craftobj/api_key`).
 ///
 /// Used by the CLI to authenticate with the daemon.
 pub fn read_from_well_known() -> Option<String> {

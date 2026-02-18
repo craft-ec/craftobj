@@ -3,14 +3,14 @@
 //! Commands sent from IPC handler to the swarm event loop for DHT operations
 //! and stream-based transfers.
 
-use datacraft_core::{ContentId, ContentManifest};
-use datacraft_transfer::DataCraftResponse;
+use craftobj_core::{ContentId, ContentManifest};
+use craftobj_transfer::CraftOBJResponse;
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
 /// Commands that can be sent to the swarm event loop.
 #[derive(Debug)]
-pub enum DataCraftCommand {
+pub enum CraftOBJCommand {
     /// Announce this node as a provider for a content ID.
     AnnounceProvider {
         content_id: ContentId,
@@ -35,19 +35,19 @@ pub enum DataCraftCommand {
         merkle_root: [u8; 32],
         have_pieces: Vec<[u8; 32]>,
         max_pieces: u16,
-        reply_tx: oneshot::Sender<Result<DataCraftResponse, String>>,
+        reply_tx: oneshot::Sender<Result<CraftOBJResponse, String>>,
     },
     /// Query a peer's PieceMap entries for a specific segment (lightweight sync).
     PieceMapQuery {
         peer_id: PeerId,
         content_id: ContentId,
         segment_index: u32,
-        reply_tx: oneshot::Sender<Result<DataCraftResponse, String>>,
+        reply_tx: oneshot::Sender<Result<CraftOBJResponse, String>>,
     },
     /// Store a re-encryption key in the DHT for access grant.
     PutReKey {
         content_id: ContentId,
-        entry: datacraft_core::pre::ReKeyEntry,
+        entry: craftobj_core::pre::ReKeyEntry,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Remove a re-encryption key from the DHT (revoke access).
@@ -58,24 +58,24 @@ pub enum DataCraftCommand {
     },
     /// Store an access list in the DHT.
     PutAccessList {
-        access_list: datacraft_core::access::AccessList,
+        access_list: craftobj_core::access::AccessList,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Fetch an access list from the DHT.
     GetAccessList {
         content_id: ContentId,
-        reply_tx: oneshot::Sender<Result<datacraft_core::access::AccessList, String>>,
+        reply_tx: oneshot::Sender<Result<craftobj_core::access::AccessList, String>>,
     },
     /// Publish a removal notice to DHT.
     PublishRemoval {
         content_id: ContentId,
-        notice: datacraft_core::RemovalNotice,
+        notice: craftobj_core::RemovalNotice,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Check if content has been removed (check local cache first, then DHT).
     CheckRemoval {
         content_id: ContentId,
-        reply_tx: oneshot::Sender<Result<Option<datacraft_core::RemovalNotice>, String>>,
+        reply_tx: oneshot::Sender<Result<Option<craftobj_core::RemovalNotice>, String>>,
     },
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,

@@ -17,11 +17,11 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-datacraft-core = { path = "crates/core" }
-datacraft-store = { path = "crates/store" }
-datacraft-routing = { path = "crates/routing" }
-datacraft-transfer = { path = "crates/transfer" }
-datacraft-client = { path = "crates/client" }
+craftobj-core = { path = "crates/core" }
+craftobj-store = { path = "crates/store" }
+craftobj-routing = { path = "crates/routing" }
+craftobj-transfer = { path = "crates/transfer" }
+craftobj-client = { path = "crates/client" }
 
 # craftec-core shared foundation
 craftec-core = { path = "../craftec-core/crates/core" }

@@ -5,12 +5,12 @@
 
 use std::path::PathBuf;
 
-use datacraft_client::DataCraftClient;
-use datacraft_core::PublishOptions;
-use datacraft_store::FsStore;
+use craftobj_client::CraftOBJClient;
+use craftobj_core::PublishOptions;
+use craftobj_store::FsStore;
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("datacraft-e2e-push").join(format!(
+    let dir = std::env::temp_dir().join("craftobj-e2e-push").join(format!(
         "{}-{}",
         label,
         std::time::SystemTime::now()
@@ -30,7 +30,7 @@ async fn test_push_distribute_and_reconstruct() {
     let dir_b = temp_dir("push-b");
 
     // Node A publishes
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("input.bin");
     let original = b"Push distribution test content. Needs to be long enough for RLNC encoding to produce multiple pieces per segment.";
     std::fs::write(&input_path, original).unwrap();
@@ -68,7 +68,7 @@ async fn test_push_distribute_and_reconstruct() {
     }
 
     // Node B reconstructs
-    let client_b = DataCraftClient::new(&dir_b).unwrap();
+    let client_b = CraftOBJClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("output.bin");
     client_b.reconstruct(&content_id, &output_path, None).unwrap();
 
@@ -87,7 +87,7 @@ async fn test_three_node_distribute_and_reconstruct() {
     let dir_b = temp_dir("3n-b");
     let dir_c = temp_dir("3n-c");
 
-    let mut client_a = DataCraftClient::new(&dir_a).unwrap();
+    let mut client_a = CraftOBJClient::new(&dir_a).unwrap();
     let input_path = dir_a.join("input.bin");
     let original = b"Three-node distribution test. Each storage node gets different pieces.";
     std::fs::write(&input_path, original).unwrap();
@@ -146,7 +146,7 @@ async fn test_three_node_distribute_and_reconstruct() {
         assert!(collected >= k, "Segment {}: need {} pieces, collected {}", seg_idx, k, collected);
     }
 
-    let client_d = DataCraftClient::new(&dir_d).unwrap();
+    let client_d = CraftOBJClient::new(&dir_d).unwrap();
     let output_path = dir_d.join("output.bin");
     client_d.reconstruct(&content_id, &output_path, None).unwrap();
 

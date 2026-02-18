@@ -1,15 +1,15 @@
 [package]
-name = "datacraft-client"
+name = "craftobj-client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-datacraft-core = { workspace = true }
-datacraft-store = { workspace = true }
-datacraft-routing = { workspace = true }
-datacraft-transfer = { workspace = true }
+craftobj-core = { workspace = true }
+craftobj-store = { workspace = true }
+craftobj-routing = { workspace = true }
+craftobj-transfer = { workspace = true }
 craftec-erasure = { workspace = true }
 craftec-crypto = { workspace = true }
 craftec-network = { workspace = true }

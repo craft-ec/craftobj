@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use datacraft_core::{ContentId, StorageReceipt};
+use craftobj_core::{ContentId, StorageReceipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

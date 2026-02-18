@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use datacraft_core::{ContentId, StorageReceipt};
-use datacraft_store::FsStore;
+use craftobj_core::{ContentId, StorageReceipt};
+use craftobj_store::FsStore;
 use ed25519_dalek::SigningKey;
 use libp2p::PeerId;
 use rand::seq::SliceRandom;
@@ -16,8 +16,8 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
-use datacraft_transfer;
-use crate::commands::DataCraftCommand;
+use craftobj_transfer;
+use crate::commands::CraftOBJCommand;
 use crate::health::{self, DutyCycleResult, TierInfo, PdpRoundResult, ProviderPdpResult};
 use crate::pdp::{
     ChallengerRotation, OnlineTimeTracker,
@@ -51,14 +51,14 @@ pub struct ChallengerManager {
     provided_cids: HashMap<ContentId, ProvidedCid>,
     rotation: ChallengerRotation,
     online_tracker: OnlineTimeTracker,
-    command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+    command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
     signing_key: Option<SigningKey>,
     persistent_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
     peer_scorer: Option<Arc<Mutex<PeerScorer>>>,
     /// Shared PDP rank data for eviction retirement checks.
     pdp_ranks: Option<Arc<Mutex<PdpRankData>>>,
     /// Storage Merkle tree for updating after healing.
-    merkle_tree: Option<Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>>,
+    merkle_tree: Option<Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>>,
     /// Demand signal tracker for checking if content has network-wide demand (skip degradation if so).
     demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
     /// PieceMap for reading coefficient vectors (replaces inventory requests).
@@ -72,7 +72,7 @@ impl ChallengerManager {
     pub fn new(
         local_peer_id: PeerId,
         local_pubkey: [u8; 32],
-        command_tx: mpsc::UnboundedSender<DataCraftCommand>,
+        command_tx: mpsc::UnboundedSender<CraftOBJCommand>,
     ) -> Self {
         Self {
             local_peer_id,
@@ -99,7 +99,7 @@ impl ChallengerManager {
         self.piece_map = Some(pm);
     }
 
-    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<datacraft_store::merkle::StorageMerkleTree>>) {
+    pub fn set_merkle_tree(&mut self, tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>) {
         self.merkle_tree = Some(tree);
     }
 
@@ -269,7 +269,7 @@ impl ChallengerManager {
                 match self.request_piece(peer, cid, segment_index, &any_piece).await {
                     Ok((coefficients, data)) => {
                         let latency = challenge_start.elapsed();
-                        let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+                        let piece_id = craftobj_store::piece_id_from_coefficients(&coefficients);
                         let byte_positions = crate::pdp::derive_byte_positions(&nonce, &piece_id, data.len() as u32, 16);
                         let proof_hash = compute_proof_hash(&data, &byte_positions, &coefficients, &nonce);
 
@@ -371,7 +371,7 @@ impl ChallengerManager {
             // Rebuild Merkle tree after healing added new pieces
             if result.pieces_generated > 0 {
                 if let Some(ref mt) = self.merkle_tree {
-                    if let Ok(new_tree) = datacraft_store::merkle::StorageMerkleTree::build_from_store(store) {
+                    if let Ok(new_tree) = craftobj_store::merkle::StorageMerkleTree::build_from_store(store) {
                         *mt.lock().await = new_tree;
                     }
                 }
@@ -387,7 +387,7 @@ impl ChallengerManager {
         let mut signed_receipts: Vec<StorageReceipt> = Vec::new();
         for mut receipt in round_result.receipts() {
             if let Some(ref key) = self.signing_key {
-                datacraft_core::signing::sign_storage_receipt(&mut receipt, key);
+                craftobj_core::signing::sign_storage_receipt(&mut receipt, key);
             }
             signed_receipts.push(receipt);
         }
@@ -402,7 +402,7 @@ impl ChallengerManager {
             0, own_piece_id, [0u8; 32], [0u8; 32],
         );
         if let Some(ref key) = self.signing_key {
-            datacraft_core::signing::sign_storage_receipt(&mut challenger_receipt, key);
+            craftobj_core::signing::sign_storage_receipt(&mut challenger_receipt, key);
         }
         signed_receipts.push(challenger_receipt.clone());
 
@@ -449,7 +449,7 @@ impl ChallengerManager {
     async fn resolve_providers(&self, cid: ContentId) -> Result<Vec<PeerId>, String> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(DataCraftCommand::ResolveProviders { content_id: cid, reply_tx: tx })
+            .send(CraftOBJCommand::ResolveProviders { content_id: cid, reply_tx: tx })
             .map_err(|e| format!("Failed to send resolve command: {}", e))?;
         rx.await.map_err(|e| format!("Channel closed: {}", e))?
     }
@@ -464,7 +464,7 @@ impl ChallengerManager {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(DataCraftCommand::PieceSync {
+            .send(CraftOBJCommand::PieceSync {
                 peer_id: peer,
                 content_id: cid,
                 segment_index,
@@ -476,7 +476,7 @@ impl ChallengerManager {
             .map_err(|e| format!("Failed to send PieceSync: {}", e))?;
         let response = rx.await.map_err(|e| format!("Channel closed: {}", e))??;
         match response {
-            datacraft_transfer::DataCraftResponse::PieceBatch { pieces } => {
+            craftobj_transfer::CraftOBJResponse::PieceBatch { pieces } => {
                 if let Some(piece) = pieces.into_iter().next() {
                     Ok((piece.coefficients, piece.data))
                 } else {
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_merkle_root_changes_on_piece_operations() {
-        use datacraft_store::merkle::StorageMerkleTree;
+        use craftobj_store::merkle::StorageMerkleTree;
 
         let mut tree = StorageMerkleTree::new();
         let initial_root = tree.root();
@@ -661,8 +661,8 @@ mod tests {
 
     #[test]
     fn test_merkle_root_in_capability_announcement() {
-        use datacraft_core::CapabilityAnnouncement;
-        use datacraft_store::merkle::StorageMerkleTree;
+        use craftobj_core::CapabilityAnnouncement;
+        use craftobj_store::merkle::StorageMerkleTree;
 
         let mut tree = StorageMerkleTree::new();
         tree.insert(&ContentId([1u8; 32]), 0, &[2u8; 32]);

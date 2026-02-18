@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use datacraft_core::{ContentId, StorageReceipt};
-use datacraft_store::FsStore;
+use craftobj_core::{ContentId, StorageReceipt};
+use craftobj_store::FsStore;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -409,13 +409,13 @@ pub fn create_signed_storage_receipt(
     let mut receipt = create_storage_receipt(
         content_id, storage_node, challenger, segment_index, piece_id, nonce, proof_hash,
     );
-    datacraft_core::signing::sign_storage_receipt(&mut receipt, signing_key);
+    craftobj_core::signing::sign_storage_receipt(&mut receipt, signing_key);
     receipt
 }
 
 /// Extract a 32-byte public key from a PeerId (best-effort, zero-padded).
 pub fn peer_id_to_local_pubkey(peer_id: &PeerId) -> [u8; 32] {
-    use datacraft_core::signing::peer_id_to_ed25519_pubkey;
+    use craftobj_core::signing::peer_id_to_ed25519_pubkey;
     peer_id_to_ed25519_pubkey(peer_id).unwrap_or_else(|| {
         let bytes = peer_id.to_bytes();
         let mut key = [0u8; 32];
@@ -512,7 +512,7 @@ mod tests {
         let cid = ContentId::from_bytes(b"pdp test content");
         let piece_data = b"actual piece bytes here";
         let coefficients = vec![1u8, 0, 0];
-        let piece_id = datacraft_store::piece_id_from_coefficients(&coefficients);
+        let piece_id = craftobj_store::piece_id_from_coefficients(&coefficients);
 
         store.store_piece(&cid, 0, &piece_id, piece_data, &coefficients).unwrap();
 
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_create_signed_storage_receipt() {
-        use datacraft_core::signing::verify_storage_receipt;
+        use craftobj_core::signing::verify_storage_receipt;
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
 

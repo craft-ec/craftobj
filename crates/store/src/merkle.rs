@@ -10,7 +10,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::FsStore;
-use datacraft_core::{ContentId, Result};
+use craftobj_core::{ContentId, Result};
 
 /// Compute a Merkle leaf from its components.
 pub fn compute_leaf(content_id: &ContentId, segment_index: u32, piece_id: &[u8; 32]) -> [u8; 32] {
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_build_from_store() {
         let dir = std::env::temp_dir()
-            .join("datacraft-merkle-test")
+            .join("craftobj-merkle-test")
             .join(format!(
                 "{}-{}",
                 std::time::SystemTime::now()

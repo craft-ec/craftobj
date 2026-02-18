@@ -1,4 +1,4 @@
-//! DataCraft Client
+//! CraftOBJ Client
 //!
 //! High-level orchestration API for publishing, fetching, pinning content.
 //!
@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 use craftec_erasure::{
     check_independence, segmenter, CodedPiece, ErasureConfig,
 };
-use datacraft_core::{
-    ContentId, ContentManifest, DataCraftError, PublishOptions, RemovalNotice, Result,
+use craftobj_core::{
+    ContentId, ContentManifest, CraftObjError, PublishOptions, RemovalNotice, Result,
     access::{self, AccessEntry},
     pre::{self, EncryptedContentKey, ReEncryptedKey, ReKeyEntry},
 };
-use datacraft_store::{piece_id_from_coefficients, FsStore, PinManager};
+use craftobj_store::{piece_id_from_coefficients, FsStore, PinManager};
 use tracing::info;
 
 /// Published content result.
@@ -74,16 +74,16 @@ pub struct RevocationResult {
     pub re_grants: Vec<(pre::ReKeyEntry, pre::ReEncryptedKey)>,
 }
 
-/// DataCraft client for local operations (publish, fetch, pin/unpin).
+/// CraftOBJ client for local operations (publish, fetch, pin/unpin).
 ///
 /// Network operations (announce to DHT, download from peers) are handled
 /// by the daemon, which wraps this client with a running swarm.
-pub struct DataCraftClient {
+pub struct CraftOBJClient {
     store: FsStore,
     pin_manager: PinManager,
 }
 
-impl DataCraftClient {
+impl CraftOBJClient {
     /// Create a new client with the given data directory.
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
@@ -101,7 +101,7 @@ impl DataCraftClient {
         options: &PublishOptions,
     ) -> Result<PublishResult> {
         if data.is_empty() {
-            return Err(DataCraftError::StorageError("empty data".into()));
+            return Err(CraftOBJError::StorageError("empty data".into()));
         }
 
         // Optionally encrypt
@@ -121,7 +121,7 @@ impl DataCraftClient {
 
         // Segment and RLNC encode
         let encoded_segments = segmenter::segment_and_encode(&content_bytes, &config)
-            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+            .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
 
         let segment_count = encoded_segments.len();
 
@@ -254,12 +254,12 @@ impl DataCraftClient {
             &config,
             manifest.total_size as usize,
         )
-        .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+        .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
 
         // Verify hash
         let expected_id = ContentId::from_bytes(&reconstructed);
         if expected_id != *content_id {
-            return Err(DataCraftError::ContentNotFound(
+            return Err(CraftOBJError::ContentNotFound(
                 "hash mismatch after reconstruction".into(),
             ));
         }
@@ -347,7 +347,7 @@ impl DataCraftClient {
         let content_key = result
             .encryption_key
             .as_ref()
-            .ok_or_else(|| DataCraftError::EncryptionError("no encryption key".into()))?;
+            .ok_or_else(|| CraftOBJError::EncryptionError("no encryption key".into()))?;
 
         let encrypted_ck = pre::encrypt_content_key(creator_keypair, content_key)?;
         Ok((result, encrypted_ck))
@@ -430,7 +430,7 @@ impl DataCraftClient {
             &config,
             manifest.total_size as usize,
         )
-        .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+        .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
 
         // Decrypt to get plaintext
         let plaintext = decrypt_content(&ciphertext, old_content_key)?;
@@ -442,7 +442,7 @@ impl DataCraftClient {
         let total_size = new_ciphertext.len() as u64;
 
         let encoded_segments = segmenter::segment_and_encode(&new_ciphertext, &config)
-            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+            .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
         let segment_count = encoded_segments.len();
 
         for (seg_idx, pieces) in &encoded_segments {
@@ -527,7 +527,7 @@ fn encrypt_content(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     };
 
     let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| DataCraftError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
@@ -535,7 +535,7 @@ fn encrypt_content(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 
     let ciphertext = cipher
         .encrypt(nonce, data)
-        .map_err(|e| DataCraftError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
 
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
@@ -551,17 +551,17 @@ fn decrypt_content(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     };
 
     if data.len() < 12 {
-        return Err(DataCraftError::EncryptionError("data too short".into()));
+        return Err(CraftOBJError::EncryptionError("data too short".into()));
     }
 
     let (nonce_bytes, ciphertext) = data.split_at(12);
     let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| DataCraftError::EncryptionError(e.to_string()))?;
+        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|e| DataCraftError::EncryptionError(e.to_string()))
+        .map_err(|e| CraftOBJError::EncryptionError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -573,7 +573,7 @@ mod tests {
         let mut rng_bytes = [0u8; 8];
         rand::thread_rng().fill_bytes(&mut rng_bytes);
         let dir = std::env::temp_dir()
-            .join("datacraft-client-test")
+            .join("craftobj-client-test")
             .join(format!(
                 "{}-{}",
                 std::time::SystemTime::now()
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt() {
         let key = generate_content_key();
-        let plaintext = b"hello datacraft encryption";
+        let plaintext = b"hello craftobj encryption";
         let encrypted = encrypt_content(plaintext, &key).unwrap();
         assert_ne!(&encrypted, plaintext);
         let decrypted = decrypt_content(&encrypted, &key).unwrap();
@@ -599,10 +599,10 @@ mod tests {
     #[test]
     fn test_publish_and_reconstruct() {
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let file_path = dir.join("input.txt");
-        let content = b"hello datacraft world! this is test content for publishing.";
+        let content = b"hello craftobj world! this is test content for publishing.";
         std::fs::write(&file_path, content).unwrap();
 
         let result = client
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn test_publish_encrypted() {
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let file_path = dir.join("secret.txt");
         std::fs::write(&file_path, b"secret data").unwrap();
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn test_publish_encrypted_fetch_without_key_gets_ciphertext() {
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let file_path = dir.join("secret2.txt");
         let plaintext = b"this is secret content that should be encrypted";
@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn test_pin_unpin() {
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
         let cid = ContentId::from_bytes(b"pin test");
 
         client.pin(&cid).unwrap();
@@ -708,7 +708,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let creator = SigningKey::generate(&mut rand::thread_rng());
         let recipient = SigningKey::generate(&mut rand::thread_rng());
@@ -759,7 +759,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let creator = SigningKey::generate(&mut rand::thread_rng());
         let user_a = SigningKey::generate(&mut rand::thread_rng());
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn test_list_and_status() {
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let file_path = dir.join("list_test.txt");
         std::fs::write(&file_path, b"list test content").unwrap();
@@ -879,7 +879,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
         let keypair = SigningKey::generate(&mut rand::thread_rng());
 
         let file_path = dir.join("signed_test.txt");
@@ -905,7 +905,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
         let keypair = SigningKey::generate(&mut rand::thread_rng());
 
         let file_path = dir.join("to_remove.txt");
@@ -930,7 +930,7 @@ mod tests {
     #[test]
     fn test_publish_bytes_directly() {
         let dir = test_dir();
-        let mut client = DataCraftClient::new(&dir).unwrap();
+        let mut client = CraftOBJClient::new(&dir).unwrap();
 
         let content = b"direct byte publish test";
         let result = client

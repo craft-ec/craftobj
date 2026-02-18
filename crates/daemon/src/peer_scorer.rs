@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use datacraft_core::DataCraftCapability;
+use craftobj_core::CraftOBJCapability;
 use libp2p::PeerId;
 use serde::Serialize;
 
@@ -41,7 +41,7 @@ pub struct PeerScorer {
 /// Per-peer scoring state.
 pub struct PeerScore {
     /// Known capabilities.
-    pub capabilities: Vec<DataCraftCapability>,
+    pub capabilities: Vec<CraftOBJCapability>,
     /// When the last capability announcement was received.
     pub last_announcement: Instant,
     /// Decayed success count.
@@ -79,7 +79,7 @@ pub struct PeerScore {
 }
 
 impl PeerScore {
-    fn new(capabilities: Vec<DataCraftCapability>, timestamp: Instant) -> Self {
+    fn new(capabilities: Vec<CraftOBJCapability>, timestamp: Instant) -> Self {
         Self {
             capabilities,
             last_announcement: timestamp,
@@ -284,7 +284,7 @@ impl PeerScorer {
     pub fn update_capabilities(
         &mut self,
         peer: &PeerId,
-        capabilities: Vec<DataCraftCapability>,
+        capabilities: Vec<CraftOBJCapability>,
         _timestamp: u64,
     ) {
         self.update_capabilities_with_storage(peer, capabilities, _timestamp, 0, 0, None);
@@ -294,7 +294,7 @@ impl PeerScorer {
     pub fn update_capabilities_with_storage(
         &mut self,
         peer: &PeerId,
-        capabilities: Vec<DataCraftCapability>,
+        capabilities: Vec<CraftOBJCapability>,
         _timestamp: u64,
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
@@ -307,7 +307,7 @@ impl PeerScorer {
     pub fn update_capabilities_full(
         &mut self,
         peer: &PeerId,
-        capabilities: Vec<DataCraftCapability>,
+        capabilities: Vec<CraftOBJCapability>,
         _timestamp: u64,
         storage_committed_bytes: u64,
         storage_used_bytes: u64,
@@ -337,7 +337,7 @@ impl PeerScorer {
         let mut total_used = 0u64;
         let mut storage_node_count = 0u64;
         for score in self.scores.values() {
-            if score.capabilities.contains(&DataCraftCapability::Storage) {
+            if score.capabilities.contains(&CraftOBJCapability::Storage) {
                 storage_node_count += 1;
                 total_committed += score.storage_committed_bytes;
                 total_used += score.storage_used_bytes;
@@ -513,13 +513,13 @@ mod tests {
         let mut scorer = PeerScorer::new();
         let peer = PeerId::random();
 
-        scorer.update_capabilities(&peer, vec![DataCraftCapability::Storage], 1000);
+        scorer.update_capabilities(&peer, vec![CraftOBJCapability::Storage], 1000);
         let entry = scorer.get(&peer).unwrap();
-        assert_eq!(entry.capabilities, vec![DataCraftCapability::Storage]);
+        assert_eq!(entry.capabilities, vec![CraftOBJCapability::Storage]);
 
         scorer.update_capabilities(
             &peer,
-            vec![DataCraftCapability::Storage, DataCraftCapability::Client],
+            vec![CraftOBJCapability::Storage, CraftOBJCapability::Client],
             2000,
         );
         let entry = scorer.get(&peer).unwrap();
@@ -532,7 +532,7 @@ mod tests {
         let fresh = PeerId::random();
         let stale = PeerId::random();
 
-        scorer.update_capabilities(&fresh, vec![DataCraftCapability::Client], 1000);
+        scorer.update_capabilities(&fresh, vec![CraftOBJCapability::Client], 1000);
 
         // Insert stale peer with old announcement time
         scorer.scores.insert(

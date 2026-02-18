@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use datacraft_core::ContentId;
-use datacraft_store::FsStore;
+use craftobj_core::ContentId;
+use craftobj_store::FsStore;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 

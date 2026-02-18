@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use craftec_erasure::{check_independence, CodedPiece};
-use datacraft_core::{ContentId, ContentManifest, DataCraftError, Result};
+use craftobj_core::{ContentId, ContentManifest, CraftOBJError, Result};
 use tracing::{debug, warn};
 
 /// Identifier for a provider (opaque, wraps a peer ID string).
@@ -441,7 +441,7 @@ impl ConnectionPool {
         // Check completeness
         for &seg_idx in segment_indices {
             if !completed_segments.contains(&seg_idx) {
-                return Err(DataCraftError::TransferError(format!(
+                return Err(CraftOBJError::TransferError(format!(
                     "failed to complete segment {} (got {}/{} independent pieces)",
                     seg_idx,
                     states[&seg_idx].rank,
@@ -525,7 +525,7 @@ pub async fn fetch_streaming(
                         &erasure_config,
                         seg_size,
                     )
-                    .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+                    .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
 
                     callback(seg_idx, decoded)?;
                 }
@@ -553,7 +553,7 @@ pub async fn fetch_streaming(
                         &erasure_config,
                         seg_size,
                     )
-                    .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+                    .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
 
                     callback(seg_idx, decoded)?;
                 }
@@ -629,7 +629,7 @@ pub async fn fetch_range(
                 &erasure_config,
                 actual_seg_size,
             )
-            .map_err(|e| DataCraftError::ErasureError(e.to_string()))?;
+            .map_err(|e| CraftOBJError::ErasureError(e.to_string()))?;
 
             // Calculate which bytes of this segment we need
             let seg_start_byte = seg_idx as u64 * seg_size as u64;
@@ -725,7 +725,7 @@ mod tests {
 
             // Check if provider should fail
             if self.fail_providers.lock().unwrap().contains(&provider.0) {
-                return Err(DataCraftError::TransferError("provider failed".into()));
+                return Err(CraftOBJError::TransferError("provider failed".into()));
             }
 
             // Apply delay
@@ -747,7 +747,7 @@ mod tests {
                 let (coeff, data) = &available[idx];
                 Ok((coeff.clone(), data.clone()))
             } else {
-                Err(DataCraftError::ContentNotFound(format!(
+                Err(CraftOBJError::ContentNotFound(format!(
                     "no pieces for segment {}",
                     segment_index
                 )))

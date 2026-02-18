@@ -1,8 +1,8 @@
-//! DataCraft Transfer
+//! CraftOBJ Transfer
 //!
-//! Piece exchange protocol for DataCraft using RLNC coding.
+//! Piece exchange protocol for CraftOBJ using RLNC coding.
 //!
-//! Protocol: `/datacraft/transfer/3.0.0`
+//! Protocol: `/craftobj/transfer/3.0.0`
 //!
 //! Uses `libp2p_stream` with persistent two-unidirectional streams per peer.
 //!
@@ -17,16 +17,16 @@
 
 pub mod wire;
 
-use datacraft_core::{ContentId, WireStatus};
+use craftobj_core::{ContentId, WireStatus};
 use serde::{Deserialize, Serialize};
 
 // ========================================================================
 // Request / Response types for request_response
 // ========================================================================
 
-/// A request in the DataCraft transfer protocol.
+/// A request in the CraftOBJ transfer protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DataCraftRequest {
+pub enum CraftObjRequest {
     /// Fetch pieces for a segment. Peer sends pieces NOT in `have_pieces`.
     PieceSync {
         content_id: ContentId,
@@ -75,9 +75,9 @@ pub struct PieceMapEntry {
     pub coefficients: Vec<u8>,
 }
 
-/// A response in the DataCraft transfer protocol.
+/// A response in the CraftOBJ transfer protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DataCraftResponse {
+pub enum CraftOBJResponse {
     /// Response to PieceSync: batch of pieces the peer has that we don't.
     PieceBatch { pieces: Vec<PiecePayload> },
     /// Ack for PiecePush or ManifestPush.
@@ -92,21 +92,21 @@ mod tests {
 
     #[test]
     fn test_request_variants() {
-        let _sync = DataCraftRequest::PieceSync {
+        let _sync = CraftOBJRequest::PieceSync {
             content_id: ContentId::from_bytes(b"test"),
             segment_index: 0,
             merkle_root: [0; 32],
             have_pieces: vec![],
             max_pieces: 10,
         };
-        let _push = DataCraftRequest::PiecePush {
+        let _push = CraftOBJRequest::PiecePush {
             content_id: ContentId::from_bytes(b"test"),
             segment_index: 0,
             piece_id: [0; 32],
             coefficients: vec![],
             data: vec![],
         };
-        let _manifest = DataCraftRequest::ManifestPush {
+        let _manifest = CraftOBJRequest::ManifestPush {
             content_id: ContentId::from_bytes(b"test"),
             manifest_json: vec![],
         };
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_response_variants() {
-        let _batch = DataCraftResponse::PieceBatch { pieces: vec![] };
-        let _ack = DataCraftResponse::Ack { status: WireStatus::Ok };
+        let _batch = CraftOBJResponse::PieceBatch { pieces: vec![] };
+        let _ack = CraftOBJResponse::Ack { status: WireStatus::Ok };
     }
 }

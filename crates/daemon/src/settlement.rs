@@ -565,7 +565,7 @@ impl SolanaClient {
     pub async fn claim_pdp(
         &self,
         pool: &[u8; 32],
-        receipt: &datacraft_core::StorageReceipt,
+        receipt: &craftobj_core::StorageReceipt,
         operator_weight: u64,
         merkle_proof: Vec<[u8; 32]>,
         leaf_index: u32,
@@ -897,8 +897,8 @@ mod tests {
     async fn test_claim_pdp() {
         let client = SolanaClient::new(test_config()).unwrap();
         let pool = [5u8; 32];
-        let receipt = datacraft_core::StorageReceipt {
-            content_id: datacraft_core::ContentId::from_bytes(&[6u8; 32]),
+        let receipt = craftobj_core::StorageReceipt {
+            content_id: craftobj_core::ContentId::from_bytes(&[6u8; 32]),
             storage_node: [7u8; 32],
             challenger: [8u8; 32],
             segment_index: 0,

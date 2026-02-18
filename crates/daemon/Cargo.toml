@@ -1,24 +1,24 @@
 [package]
-name = "datacraft-daemon"
+name = "craftobj-daemon"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "datacraft-daemon"
+name = "craftobj-daemon"
 path = "src/main.rs"
 
 [[bin]]
-name = "datacraft-cli"
+name = "craftobj-cli"
 path = "src/cli.rs"
 
 [dependencies]
-datacraft-core = { workspace = true }
-datacraft-client = { workspace = true }
-datacraft-store = { workspace = true }
-datacraft-routing = { workspace = true }
-datacraft-transfer = { workspace = true }
+craftobj-core = { workspace = true }
+craftobj-client = { workspace = true }
+craftobj-store = { workspace = true }
+craftobj-routing = { workspace = true }
+craftobj-transfer = { workspace = true }
 craftec-app = { workspace = true }
 craftec-core = { workspace = true }
 craftec-erasure = { workspace = true }

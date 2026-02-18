@@ -1,13 +1,13 @@
 [package]
-name = "datacraft-transfer"
+name = "craftobj-transfer"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-datacraft-core = { workspace = true }
-datacraft-store = { workspace = true }
+craftobj-core = { workspace = true }
+craftobj-store = { workspace = true }
 craftec-erasure = { workspace = true }
 craftec-network = { workspace = true }
 libp2p = { workspace = true }

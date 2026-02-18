@@ -1,7 +1,7 @@
-//! DataCraft CLI — connects to a running daemon via IPC
+//! CraftOBJ CLI — connects to a running daemon via IPC
 //!
 //! Usage:
-//!   datacraft-cli [--socket <PATH>] <COMMAND> [ARGS...]
+//!   craftobj-cli [--socket <PATH>] <COMMAND> [ARGS...]
 //!
 //! Commands:
 //!   status                          Show daemon status
@@ -15,12 +15,12 @@
 //!   access list <CID>               List authorized DIDs
 
 use craftec_ipc::IpcClient;
-use datacraft_daemon::service;
+use craftobj_daemon::service;
 
 fn usage() -> ! {
-    eprintln!("DataCraft CLI");
+    eprintln!("CraftOBJ CLI");
     eprintln!();
-    eprintln!("Usage: datacraft-cli [--socket <PATH>] <COMMAND> [ARGS...]");
+    eprintln!("Usage: craftobj-cli [--socket <PATH>] <COMMAND> [ARGS...]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  status                            Show daemon status");
@@ -73,7 +73,7 @@ async fn main() {
 
         "publish" => {
             if cmd_args.len() < 2 {
-                eprintln!("Usage: datacraft-cli publish <FILE> [--encrypted]");
+                eprintln!("Usage: craftobj-cli publish <FILE> [--encrypted]");
                 std::process::exit(1);
             }
             let path = &cmd_args[1];
@@ -87,7 +87,7 @@ async fn main() {
 
         "fetch" => {
             if cmd_args.len() < 3 {
-                eprintln!("Usage: datacraft-cli fetch <CID> <OUTPUT> [--key HEX]");
+                eprintln!("Usage: craftobj-cli fetch <CID> <OUTPUT> [--key HEX]");
                 std::process::exit(1);
             }
             let cid = &cmd_args[1];
@@ -105,7 +105,7 @@ async fn main() {
 
         "pin" => {
             if cmd_args.len() < 2 {
-                eprintln!("Usage: datacraft-cli pin <CID>");
+                eprintln!("Usage: craftobj-cli pin <CID>");
                 std::process::exit(1);
             }
             let params = serde_json::json!({ "cid": cmd_args[1] });
@@ -114,7 +114,7 @@ async fn main() {
 
         "unpin" => {
             if cmd_args.len() < 2 {
-                eprintln!("Usage: datacraft-cli unpin <CID>");
+                eprintln!("Usage: craftobj-cli unpin <CID>");
                 std::process::exit(1);
             }
             let params = serde_json::json!({ "cid": cmd_args[1] });
@@ -123,13 +123,13 @@ async fn main() {
 
         "access" => {
             if cmd_args.len() < 2 {
-                eprintln!("Usage: datacraft-cli access <list|grant> <CID> ...");
+                eprintln!("Usage: craftobj-cli access <list|grant> <CID> ...");
                 std::process::exit(1);
             }
             match cmd_args[1].as_str() {
                 "list" => {
                     if cmd_args.len() < 3 {
-                        eprintln!("Usage: datacraft-cli access list <CID>");
+                        eprintln!("Usage: craftobj-cli access list <CID>");
                         std::process::exit(1);
                     }
                     let params = serde_json::json!({ "cid": cmd_args[2] });
@@ -138,7 +138,7 @@ async fn main() {
                 "grant" => {
                     // access grant <CID> <CREATOR_SECRET> <RECIPIENT_PUBKEY> <CONTENT_KEY>
                     if cmd_args.len() < 6 {
-                        eprintln!("Usage: datacraft-cli access grant <CID> <CREATOR_SECRET> <RECIPIENT_PUBKEY> <CONTENT_KEY>");
+                        eprintln!("Usage: craftobj-cli access grant <CID> <CREATOR_SECRET> <RECIPIENT_PUBKEY> <CONTENT_KEY>");
                         std::process::exit(1);
                     }
                     let params = serde_json::json!({

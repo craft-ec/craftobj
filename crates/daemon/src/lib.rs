@@ -1,6 +1,6 @@
-//! DataCraft Daemon
+//! CraftOBJ Daemon
 //!
-//! Background service that runs the DataCraft node:
+//! Background service that runs the CraftOBJ node:
 //! - libp2p swarm event loop
 //! - IPC server for desktop/CLI clients
 //! - Content routing and transfer

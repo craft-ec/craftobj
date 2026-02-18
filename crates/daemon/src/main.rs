@@ -1,15 +1,15 @@
-//! DataCraft Daemon entry point
+//! CraftOBJ Daemon entry point
 //!
 //! Usage:
-//!   datacraft-daemon [OPTIONS]
+//!   craftobj-daemon [OPTIONS]
 //!
 //! Options:
 //!   --listen <ADDR>     Listen address (default: /ip4/0.0.0.0/tcp/0)
 //!   --data-dir <PATH>   Data directory (default: platform-specific)
-//!   --socket <PATH>     IPC socket path (default: /tmp/datacraft.sock)
+//!   --socket <PATH>     IPC socket path (default: /tmp/craftobj.sock)
 //!   --log-level <LEVEL> Log level: trace, debug, info, warn, error (default: info)
 
-use datacraft_daemon::service;
+use craftobj_daemon::service;
 use craftec_network::NetworkConfig;
 use libp2p::identity::Keypair;
 use tracing::info;
@@ -51,14 +51,14 @@ fn parse_args() -> (String, std::path::PathBuf, String, String, u16, Option<std:
                 if i < args.len() { config_path = Some(std::path::PathBuf::from(&args[i])); }
             }
             "--help" | "-h" => {
-                eprintln!("DataCraft Daemon");
+                eprintln!("CraftOBJ Daemon");
                 eprintln!();
-                eprintln!("Usage: datacraft-daemon [OPTIONS]");
+                eprintln!("Usage: craftobj-daemon [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --listen <ADDR>      Listen multiaddr (default: /ip4/0.0.0.0/tcp/0)");
                 eprintln!("  --data-dir <PATH>    Data directory");
-                eprintln!("  --socket <PATH>      IPC socket path (default: /tmp/datacraft.sock)");
+                eprintln!("  --socket <PATH>      IPC socket path (default: /tmp/craftobj.sock)");
                 eprintln!("  --log-level <LEVEL>  Log level (default: info)");
                 eprintln!("  --ws-port <PORT>     WebSocket server port (default: 9091, 0 to disable)");
                 eprintln!("  --config <PATH>      Config file path (default: <data-dir>/config.json)");
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_pubkey_hex = hex::encode(node_signing_key.public_key_bytes());
 
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
-    eprintln!("║  DataCraft Daemon                                          ║");
+    eprintln!("║  CraftOBJ Daemon                                          ║");
     eprintln!("╠══════════════════════════════════════════════════════════════╣");
     eprintln!("║  Peer ID:    {}  ║", &peer_id.to_string()[..46]);
     eprintln!("║  Pubkey:     {:<47}║", &node_pubkey_hex[..46]);
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
 
     let mut network_config = NetworkConfig {
-        protocol_prefix: "datacraft".to_string(),
+        protocol_prefix: "craftobj".to_string(),
         ..Default::default()
     };
 
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info!("DataCraft daemon starting with peer ID {}", peer_id);
+    info!("CraftOBJ daemon starting with peer ID {}", peer_id);
 
     // Convert craftec SigningKeypair to ed25519_dalek SigningKey
     let dalek_key = ed25519_dalek::SigningKey::from_bytes(&node_signing_key.secret_key_bytes());

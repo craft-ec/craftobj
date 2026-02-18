@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use datacraft_core::{ContentManifest, ContentId};
-use datacraft_store::FsStore;
+use craftobj_core::{ContentManifest, ContentId};
+use craftobj_store::FsStore;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};

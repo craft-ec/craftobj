@@ -1,12 +1,12 @@
 [package]
-name = "datacraft-routing"
+name = "craftobj-routing"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-datacraft-core = { workspace = true }
+craftobj-core = { workspace = true }
 craftec-network = { workspace = true }
 libp2p = { workspace = true }
 serde = { workspace = true }
