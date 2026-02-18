@@ -201,6 +201,8 @@ pub struct DataCraftHandler {
     pub local_peer_id: Option<libp2p::PeerId>,
     /// Challenger manager for PDP — register CIDs after publish/store.
     challenger: Option<Arc<Mutex<crate::challenger::ChallengerManager>>>,
+    /// Demand signal tracker for content demand status.
+    demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
     /// Start time for uptime calculation.
     start_time: Instant,
 }
@@ -231,9 +233,14 @@ impl DataCraftHandler {
             eviction_manager: None,
             merkle_tree: None,
             challenger: None,
+            demand_signal_tracker: None,
             local_peer_id: None,
             start_time: Instant::now(),
         }
+    }
+
+    pub fn set_demand_signal_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>) {
+        self.demand_signal_tracker = Some(tracker);
     }
 
     pub fn set_local_peer_id(&mut self, peer_id: libp2p::PeerId) {
@@ -301,6 +308,7 @@ impl DataCraftHandler {
             eviction_manager: None,
             merkle_tree: None,
             challenger: None,
+            demand_signal_tracker: None,
             local_peer_id: None,
             start_time: Instant::now(),
         }
@@ -1899,12 +1907,25 @@ impl DataCraftHandler {
         let cid_hex = cid.to_hex();
         let health = self.compute_network_health(&cid_hex, &local_seg_pieces, &manifest, true).await;
 
+        // Demand signal status
+        let has_demand = if let Some(ref dst) = self.demand_signal_tracker {
+            dst.lock().await.has_recent_signal(&cid)
+        } else {
+            false
+        };
+
+        // Tier min ratio (hardcoded 1.5 for now — later from on-chain tier data)
+        let tier_min_ratio: f64 = 1.5;
+
         // Build per-segment JSON with network data
         let mut segments_json: Vec<Value> = Vec::new();
         for seg_idx in 0..seg_count {
             let seg_k = manifest.k_for_segment(seg_idx);
             let local = local_seg_pieces.get(seg_idx).copied().unwrap_or(0);
             let network = health.seg_pieces.get(seg_idx).copied().unwrap_or(0);
+            let target = (tier_min_ratio * seg_k as f64).ceil() as usize;
+            let needs_repair = network < target;
+            let needs_degradation = network > target && !has_demand;
             segments_json.push(serde_json::json!({
                 "index": seg_idx,
                 "local_pieces": local,
@@ -1912,6 +1933,8 @@ impl DataCraftHandler {
                 "k": seg_k,
                 "network_pieces": network,
                 "network_reconstructable": network >= seg_k,
+                "needs_repair": needs_repair,
+                "needs_degradation": needs_degradation,
             }));
         }
 
@@ -1932,6 +1955,8 @@ impl DataCraftHandler {
             "role": role,
             "stage": stage,
             "local_disk_usage": disk_usage,
+            "has_demand": has_demand,
+            "tier_min_ratio": tier_min_ratio,
         }))
     }
 
@@ -1984,6 +2009,14 @@ impl DataCraftHandler {
                 }
             };
 
+            // Demand signal status
+            let has_demand = if let Some(ref dst) = self.demand_signal_tracker {
+                dst.lock().await.has_recent_signal(&item.content_id)
+            } else {
+                false
+            };
+            let tier_min_ratio: f64 = 1.5;
+
             let mut obj = serde_json::json!({
                 "content_id": cid_hex,
                 "total_size": item.total_size,
@@ -1994,6 +2027,8 @@ impl DataCraftHandler {
                 "provider_count": health.provider_count,
                 "network_total_pieces": health.total_pieces,
                 "local_disk_usage": disk_usage,
+                "has_demand": has_demand,
+                "tier_min_ratio": tier_min_ratio,
             });
 
             if let Some(ref td) = tracker_data {
