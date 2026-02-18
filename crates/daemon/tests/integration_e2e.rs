@@ -64,9 +64,9 @@ impl TestNode {
         // Generate unique socket path
         let socket_path = format!("/tmp/craftobj-test-{}-{}.sock", index, rand::random::<u32>());
         
-        // Use random ports to avoid conflicts
+        // Use random high ports to avoid conflicts
         let ws_port = 0; // OS assigns random port
-        let listen_port = 0; // OS assigns random port
+        let listen_port = 10000 + (rand::random::<u16>() % 50000); // random but known
         
         info!("Spawning test node {} with peer_id {} at {}", 
               index, peer_id, data_dir.path().display());
@@ -185,11 +185,14 @@ impl TestNode {
         self.rpc("status", None).await
     }
     
-    /// Publish content to this node
+    /// Publish content to this node (writes to temp file, then publishes via path)
     async fn publish(&self, content: &[u8]) -> Result<String, String> {
-        let content_base64 = base64_encode(content);
+        // Write content to a temp file in the data dir
+        let file_path = self.data_dir.path().join("test_publish_input");
+        std::fs::write(&file_path, content)
+            .map_err(|e| format!("Failed to write test file: {}", e))?;
         let params = json!({
-            "content": content_base64,
+            "path": file_path.to_string_lossy(),
             "encrypted": false
         });
         
@@ -218,30 +221,12 @@ impl TestNode {
     
     /// Get the listen addresses of this node
     async fn get_listen_addrs(&self) -> Result<Vec<String>, String> {
-        let status = self.status().await?;
-        let addrs = status["listen_addrs"].as_array()
-            .ok_or("No listen_addrs in status")?;
-        
-        let mut addr_strings = Vec::new();
-        for addr in addrs {
-            if let Some(addr_str) = addr.as_str() {
-                addr_strings.push(addr_str.to_string());
-            }
-        }
-        
-        Ok(addr_strings)
+        Ok(vec![format!("/ip4/127.0.0.1/tcp/{}", self.listen_port)])
     }
     
     /// Get the full multiaddr with peer ID for use as boot peer
     async fn get_boot_peer_addr(&self) -> Result<String, String> {
-        let listen_addrs = self.get_listen_addrs().await?;
-        for addr in listen_addrs {
-            if addr.contains("/tcp/") && addr.contains("127.0.0.1") {
-                return Ok(format!("{}/p2p/{}", addr, self.peer_id));
-            }
-        }
-        
-        Err("No suitable listen address found for boot peer".to_string())
+        Ok(format!("/ip4/127.0.0.1/tcp/{}/p2p/{}", self.listen_port, self.peer_id))
     }
     
     /// Shutdown the daemon
@@ -366,11 +351,11 @@ async fn test_single_node_publish_list() -> Result<(), String> {
         
         // Verify it appears in the list
         let list_response = node.list().await?;
-        let contents = list_response["contents"].as_array()
-            .ok_or("No contents array in list response")?;
+        let contents = list_response.as_array()
+            .ok_or("No array in list response")?;
         
         let found = contents.iter().any(|c| {
-            c["cid"].as_str().map_or(false, |id| id == cid)
+            c["content_id"].as_str().map_or(false, |id| id == cid)
         });
         if !found {
             return Err("Published content not found in list".to_string());
@@ -461,11 +446,11 @@ async fn test_publish_and_basic_functionality() -> Result<(), String> {
         
         // Verify both nodes can see the content exists (at least on node A)
         let list_a = node_a.list().await?;
-        let contents_a = list_a["contents"].as_array()
-            .ok_or("No contents array in list response from node A")?;
+        let contents_a = list_a.as_array()
+            .ok_or("No array in list response from node A")?;
         
         let found_on_a = contents_a.iter().any(|c| {
-            c["cid"].as_str().map_or(false, |id| id == cid)
+            c["content_id"].as_str().map_or(false, |id| id == cid)
         });
         
         if !found_on_a {

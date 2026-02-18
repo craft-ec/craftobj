@@ -82,7 +82,7 @@ impl CraftObjProtocol {
         &self,
         behaviour: &mut CraftBehaviour,
         content_id: &ContentId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Announcing as provider for {}", content_id);
         ContentRouter::announce(behaviour, content_id)?;
         Ok(())
@@ -94,7 +94,7 @@ impl CraftObjProtocol {
         behaviour: &mut CraftBehaviour,
         manifest: &ContentManifest,
         local_peer_id: &libp2p::PeerId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Publishing manifest for {} to DHT", manifest.content_id);
         ContentRouter::publish_manifest(behaviour, manifest, local_peer_id)?;
         Ok(())
@@ -105,7 +105,7 @@ impl CraftObjProtocol {
         &self,
         behaviour: &mut CraftBehaviour,
         content_id: &ContentId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Resolving providers for {}", content_id);
         let query_id = ContentRouter::resolve(behaviour, content_id);
 
@@ -122,7 +122,7 @@ impl CraftObjProtocol {
         &self,
         behaviour: &mut CraftBehaviour,
         content_id: &ContentId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Getting manifest for {}", content_id);
         let query_id = ContentRouter::get_manifest(behaviour, content_id);
 
@@ -139,7 +139,7 @@ impl CraftObjProtocol {
         &self,
         behaviour: &mut CraftBehaviour,
         content_id: &ContentId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Getting access list for {} from DHT", content_id);
         let query_id = ContentRouter::get_access_list(behaviour, content_id);
         let mut queries = self.pending_queries.lock().await;
