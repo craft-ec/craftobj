@@ -64,6 +64,10 @@ pub enum CraftObjRequest {
         segment_index: u32,
         since_root: [u8; 32],
     },
+    /// PEX: peer exchange — share known peers
+    PexExchange {
+        payload: Vec<u8>, // serialized PexMessage
+    },
     /// PDP challenge request: challenger sends nonce + byte positions for verification.
     PdpChallenge {
         content_id: ContentId,
@@ -113,6 +117,10 @@ pub enum CraftObjResponse {
         current_root: [u8; 32],
         added: Vec<PieceMapEntry>, // piece_id + coefficients for new pieces
         removed: Vec<u32>,          // piece_ids that were dropped (first 4 bytes as u32)
+    },
+    /// Response to PexExchange: return our own peer list
+    PexExchangeResponse {
+        payload: Vec<u8>, // serialized PexMessage
     },
     /// Response to PdpChallenge: proof of data possession.
     PdpProof {

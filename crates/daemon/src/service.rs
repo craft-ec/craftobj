@@ -820,6 +820,12 @@ async fn drive_swarm(
     let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // PEX — peer exchange
+    let mut pex_manager = crate::pex::PexManager::new();
+    let mut pex_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    pex_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // (pex inbound handled inline in the inbound_rx handler)
+
     // Peer heartbeat timer — checks connected peers every 60s
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -849,6 +855,8 @@ async fn drive_swarm(
                         stream_manager.ensure_opening(peer_id);
                         // Track for heartbeat
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
+                        // Track for PEX
+                        pex_manager.add_peer(peer_id, vec![endpoint.get_remote_address().clone()]);
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
                             peer_id: peer_id.to_string(),
                             address: endpoint.get_remote_address().to_string(),
@@ -868,6 +876,7 @@ async fn drive_swarm(
                         }
                         info!("[service.rs] Fully disconnected from {} — cleaning up", peer_id);
                         peer_scorer.lock().await.remove_peer(&peer_id);
+                        pex_manager.remove_peer(&peer_id);
                         peer_last_seen.remove(&peer_id);
                         stream_manager.on_peer_disconnected(&peer_id);
                         // Track for reconnection with last-known addresses from Kademlia routing table
@@ -990,6 +999,40 @@ async fn drive_swarm(
             // Process inbound messages from peer streams
             Some(msg) = inbound_rx.recv() => {
                 info!("[service.rs] Processing inbound from {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&msg.request));
+
+                // Handle PEX inline (needs pex_manager from main loop)
+                if let CraftObjRequest::PexExchange { ref payload } = msg.request {
+                    debug!("[PEX] Received PEX from {} ({} bytes)", msg.peer, payload.len());
+                    if let Ok(pex_msg) = crate::pex_wire::PexMessage::from_bytes(payload) {
+                        if let Ok(received_peers) = pex_msg.to_peers() {
+                            let new_peers = pex_manager.receive_pex(&msg.peer, received_peers);
+                            // Dial new peers
+                            for (new_peer, addrs) in &new_peers {
+                                for addr in addrs {
+                                    debug!("[PEX] Dialing new peer {} at {}", new_peer, addr);
+                                    let _ = swarm.dial(addr.clone());
+                                }
+                            }
+                            debug!("[PEX] Discovered {} new peers from {}", new_peers.len(), msg.peer);
+                        }
+                    }
+                    // Send our peer list back
+                    let our_peers = pex_manager.peers_to_share(&msg.peer);
+                    let response_msg = crate::pex_wire::PexMessage::from_peers(our_peers);
+                    let response_payload = response_msg.to_bytes().unwrap_or_default();
+                    let response = CraftObjResponse::PexExchangeResponse { payload: response_payload };
+                    let mut stream = msg.stream;
+                    let seq_id = msg.seq_id;
+                    let peer = msg.peer;
+                    tokio::spawn(async move {
+                        match craftobj_transfer::wire::write_response_frame(&mut stream, seq_id, &response).await {
+                            Ok(()) => debug!("[PEX] Sent response to {} seq={}", peer, seq_id),
+                            Err(e) => debug!("[PEX] Failed response to {} seq={}: {}", peer, seq_id, e),
+                        }
+                    });
+                    continue;
+                }
+
                 // Spawn handler as task to avoid blocking the swarm event loop
                 // while waiting for store lock (maintenance cycle may hold it).
                 let store_clone = store_for_repair.clone();
@@ -1054,6 +1097,33 @@ async fn drive_swarm(
                         }
                     }
                 }
+            }
+            // PEX — share known peers with connected peers
+            _ = pex_interval.tick() => {
+                let connected: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
+                for peer_id in &connected {
+                    if !pex_manager.should_send(peer_id) {
+                        continue;
+                    }
+                    let peers_to_share = pex_manager.peers_to_share(peer_id);
+                    if peers_to_share.is_empty() {
+                        pex_manager.mark_sent(peer_id);
+                        continue;
+                    }
+                    let msg = crate::pex_wire::PexMessage::from_peers(peers_to_share);
+                    if let Ok(bytes) = msg.to_bytes() {
+                        debug!("[PEX] Sending {} peers to {} ({} bytes)", msg.peers.len(), peer_id, bytes.len());
+                        let request = CraftObjRequest::PexExchange { payload: bytes };
+                        let _ = outbound_tx.send(crate::stream_manager::OutboundMessage {
+                            peer: *peer_id,
+                            request,
+                            reply_tx: None, // fire-and-forget
+                        }).await;
+                    }
+                    pex_manager.mark_sent(peer_id);
+                }
+                // Cleanup stale peers every PEX cycle
+                pex_manager.cleanup_stale_peers(std::time::Duration::from_secs(600));
             }
         }
     }
@@ -1335,6 +1405,11 @@ async fn handle_incoming_transfer_request(
                     }
                 }
             }
+        }
+        CraftObjRequest::PexExchange { .. } => {
+            // PEX is handled inline in the main event loop, not here.
+            // This arm exists for exhaustiveness only.
+            CraftObjResponse::Ack { status: craftobj_core::WireStatus::Ok }
         }
     }
 }
