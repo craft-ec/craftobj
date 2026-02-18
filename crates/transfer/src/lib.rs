@@ -64,6 +64,14 @@ pub enum CraftObjRequest {
         segment_index: u32,
         since_root: [u8; 32],
     },
+    /// PDP challenge request: challenger sends nonce + byte positions for verification.
+    PdpChallenge {
+        content_id: ContentId,
+        segment_index: u32,
+        piece_id: [u8; 32],
+        nonce: [u8; 32],
+        byte_positions: Vec<u32>,
+    },
 }
 
 /// A piece within a PieceBatch response.
@@ -105,6 +113,13 @@ pub enum CraftObjResponse {
         current_root: [u8; 32],
         added: Vec<PieceMapEntry>, // piece_id + coefficients for new pieces
         removed: Vec<u32>,          // piece_ids that were dropped (first 4 bytes as u32)
+    },
+    /// Response to PdpChallenge: proof of data possession.
+    PdpProof {
+        piece_id: [u8; 32],
+        coefficients: Vec<u8>,
+        challenged_bytes: Vec<u8>, // bytes at the challenged positions
+        proof_hash: [u8; 32],     // hash of (data_bytes + positions + coefficients + nonce)
     },
 }
 

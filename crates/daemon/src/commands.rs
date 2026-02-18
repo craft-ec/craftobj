@@ -128,4 +128,14 @@ pub enum CraftObjCommand {
         since_root: [u8; 32],
         reply_tx: oneshot::Sender<Option<MerkleDiffResult>>,
     },
+    /// Send PDP challenge to a peer for proof of data possession.
+    PdpChallenge {
+        peer_id: PeerId,
+        content_id: ContentId,
+        segment_index: u32,
+        piece_id: [u8; 32],
+        nonce: [u8; 32],
+        byte_positions: Vec<u32>,
+        reply_tx: oneshot::Sender<Option<CraftObjResponse>>,
+    },
 }

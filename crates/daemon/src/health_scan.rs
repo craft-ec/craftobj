@@ -58,11 +58,12 @@ pub struct MerklePullResponse {
 // Merkle root cache key
 // ---------------------------------------------------------------------------
 
-/// Cache key for last-known Merkle root per provider per CID.
+/// Cache key for last-known Merkle root per provider per CID per segment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MerkleCacheKey {
     peer_id: PeerId,
     content_id: ContentId,
+    segment_index: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +170,7 @@ impl HealthScan {
                 let cache_key = MerkleCacheKey {
                     peer_id,
                     content_id: cid,
+                    segment_index,
                 };
                 let known_root = self.merkle_root_cache.get(&cache_key).copied();
 
@@ -294,7 +296,7 @@ impl HealthScan {
                                 // Convert PieceMapEntry to leaf hash
                                 craftobj_store::merkle::compute_leaf(&content_id, segment_index, &entry.piece_id)
                             }).collect(),
-                            removed: diff_result.removed.iter().map(|&piece_id_prefix| {
+                            removed: diff_result.removed.iter().map(|&_piece_id_prefix| {
                                 // This is a limitation: we can't reconstruct the full piece_id from just the prefix.
                                 // In practice, the diff protocol would need to include full piece IDs.
                                 // For now, we'll use a placeholder approach.
@@ -327,7 +329,7 @@ impl HealthScan {
             }
             
             match rx.await {
-                Ok(Some((root, leaf_count))) => {
+                Ok(Some((root, _leaf_count))) => {
                     Some(MerklePullResponse {
                         root,
                         diff: None,

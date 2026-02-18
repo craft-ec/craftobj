@@ -18,11 +18,13 @@ const TYPE_MANIFEST_PUSH: u8 = 0x03;
 const TYPE_PIECE_MAP_QUERY: u8 = 0x04;
 const TYPE_MERKLE_ROOT: u8 = 0x05;
 const TYPE_MERKLE_DIFF: u8 = 0x06;
+const TYPE_PDP_CHALLENGE: u8 = 0x07;
 const TYPE_PIECE_BATCH: u8 = 0x81;
 const TYPE_ACK: u8 = 0x82;
 const TYPE_PIECE_MAP_ENTRIES: u8 = 0x83;
 const TYPE_MERKLE_ROOT_RESPONSE: u8 = 0x84;
 const TYPE_MERKLE_DIFF_RESPONSE: u8 = 0x85;
+const TYPE_PDP_PROOF: u8 = 0x86;
 
 /// Maximum frame payload (50 MB).
 const MAX_FRAME_PAYLOAD: usize = 50 * 1024 * 1024;
@@ -86,11 +88,11 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
     }
 
     match ty[0] {
-        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF => {
+        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE => {
             let request = deserialize_request(ty[0], &payload)?;
             Ok(StreamFrame::Request { seq_id, request })
         }
-        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE => {
+        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF => {
             let response = deserialize_response(ty[0], &payload)?;
             Ok(StreamFrame::Response { seq_id, response })
         }
@@ -196,6 +198,18 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_MERKLE_DIFF, payload))
         }
+        CraftObjRequest::PdpChallenge { content_id, segment_index, piece_id, nonce, byte_positions } => {
+            let inner = PdpChallengeWire {
+                content_id: *content_id,
+                segment_index: *segment_index,
+                piece_id: *piece_id,
+                nonce: *nonce,
+                byte_positions: byte_positions.clone(),
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_PDP_CHALLENGE, payload))
+        }
     }
 }
 
@@ -256,6 +270,17 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
                 since_root: inner.since_root,
             })
         }
+        TYPE_PDP_CHALLENGE => {
+            let inner: PdpChallengeWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjRequest::PdpChallenge {
+                content_id: inner.content_id,
+                segment_index: inner.segment_index,
+                piece_id: inner.piece_id,
+                nonce: inner.nonce,
+                byte_positions: inner.byte_positions,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown request type: 0x{:02x}", msg_type),
@@ -299,6 +324,17 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_MERKLE_DIFF_RESPONSE, payload))
         }
+        CraftObjResponse::PdpProof { piece_id, coefficients, challenged_bytes, proof_hash } => {
+            let inner = PdpProofWire {
+                piece_id: *piece_id,
+                coefficients: coefficients.clone(),
+                challenged_bytes: challenged_bytes.clone(),
+                proof_hash: *proof_hash,
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_PDP_PROOF, payload))
+        }
     }
 }
 
@@ -334,6 +370,16 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResp
                 current_root: inner.current_root,
                 added: inner.added,
                 removed: inner.removed,
+            })
+        }
+        TYPE_PDP_PROOF => {
+            let inner: PdpProofWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjResponse::PdpProof {
+                piece_id: inner.piece_id,
+                coefficients: inner.coefficients,
+                challenged_bytes: inner.challenged_bytes,
+                proof_hash: inner.proof_hash,
             })
         }
         _ => Err(io::Error::new(
@@ -400,6 +446,23 @@ struct MerkleDiffResponseWire {
     current_root: [u8; 32],
     added: Vec<PieceMapEntry>,
     removed: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PdpChallengeWire {
+    content_id: ContentId,
+    segment_index: u32,
+    piece_id: [u8; 32],
+    nonce: [u8; 32],
+    byte_positions: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PdpProofWire {
+    piece_id: [u8; 32],
+    coefficients: Vec<u8>,
+    challenged_bytes: Vec<u8>,
+    proof_hash: [u8; 32],
 }
 
 #[cfg(test)]

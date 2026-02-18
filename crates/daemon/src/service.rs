@@ -1286,6 +1286,53 @@ async fn handle_incoming_transfer_request(
                 }
             }
         }
+        CraftObjRequest::PdpChallenge { content_id, segment_index, piece_id, nonce, byte_positions } => {
+            info!("[service.rs] Handling PdpChallenge from {} for {}/seg{} piece {}", peer, content_id, segment_index, hex::encode(&piece_id[..8]));
+            
+            // Get the requested piece from local store
+            let store_guard = store.lock().await;
+            match store_guard.get_piece(&content_id, segment_index, &piece_id) {
+                Ok((data, coefficients)) => {
+                    // Extract bytes at challenged positions
+                    let mut challenged_bytes = Vec::new();
+                    for &pos in &byte_positions {
+                        if (pos as usize) < data.len() {
+                            challenged_bytes.push(data[pos as usize]);
+                        } else {
+                            // Position out of bounds - this is invalid, return empty proof
+                            warn!("[service.rs] PDP challenge position {} out of bounds for piece with {} bytes", pos, data.len());
+                            return CraftObjResponse::PdpProof {
+                                piece_id,
+                                coefficients: vec![],
+                                challenged_bytes: vec![],
+                                proof_hash: [0u8; 32],
+                            };
+                        }
+                    }
+                    
+                    // Compute proof hash: hash(challenged_bytes + positions + coefficients + nonce)
+                    let proof_hash = crate::pdp::compute_proof_hash(&data, &byte_positions, &coefficients, &nonce);
+                    
+                    CraftObjResponse::PdpProof {
+                        piece_id,
+                        coefficients,
+                        challenged_bytes,
+                        proof_hash,
+                    }
+                }
+                Err(e) => {
+                    debug!("[service.rs] PDP challenge: piece {}/seg{}/{} not found: {}", 
+                           content_id, segment_index, hex::encode(&piece_id[..8]), e);
+                    // Return empty proof to indicate piece not available
+                    CraftObjResponse::PdpProof {
+                        piece_id,
+                        coefficients: vec![],
+                        challenged_bytes: vec![],
+                        proof_hash: [0u8; 32],
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1660,6 +1707,40 @@ async fn handle_command(
                     }
                     Err(_) => {
                         warn!("[service.rs] MerkleDiff to {}: timed out after 10s", peer_id);
+                        let _ = reply_tx.send(None);
+                    }
+                }
+            });
+        }
+
+        CraftObjCommand::PdpChallenge { peer_id, content_id, segment_index, piece_id, nonce, byte_positions, reply_tx } => {
+            debug!("Handling PdpChallenge command: {}/seg{} piece {} to {}", content_id, segment_index, hex::encode(&piece_id[..8]), peer_id);
+            let request = craftobj_transfer::CraftObjRequest::PdpChallenge {
+                content_id,
+                segment_index,
+                piece_id,
+                nonce,
+                byte_positions,
+            };
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
+            let tx = outbound_tx.clone();
+            tokio::spawn(async move {
+                if tx.send(msg).await.is_err() {
+                    warn!("[service.rs] PdpChallenge to {}: outbound channel closed", peer_id);
+                    let _ = reply_tx.send(None);
+                    return;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+                    Ok(Ok(response)) => {
+                        let _ = reply_tx.send(Some(response));
+                    }
+                    Ok(Err(_)) => {
+                        warn!("[service.rs] PdpChallenge to {}: ack channel closed", peer_id);
+                        let _ = reply_tx.send(None);
+                    }
+                    Err(_) => {
+                        warn!("[service.rs] PdpChallenge to {}: timed out after 10s", peer_id);
                         let _ = reply_tx.send(None);
                     }
                 }
