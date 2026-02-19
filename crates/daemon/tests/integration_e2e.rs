@@ -79,12 +79,15 @@ impl TestNode {
         daemon_config.boot_peers = boot_peers;
         daemon_config.capabilities = vec!["client".to_string(), "storage".to_string()];
         
-        // Set shorter intervals for tests
-        daemon_config.reannounce_interval_secs = 30;
-        daemon_config.reannounce_threshold_secs = 60;
-        daemon_config.challenger_interval_secs = Some(60);
+        // Set shorter intervals for tests (but not too short to avoid publisher cleanup interference)
+        daemon_config.reannounce_interval_secs = 120;
+        daemon_config.reannounce_threshold_secs = 240;
+        daemon_config.challenger_interval_secs = Some(5);
         daemon_config.aggregation_epoch_secs = Some(120);
         daemon_config.pex_interval_secs = 2; // Fast PEX for tests
+        daemon_config.health_scan_interval_secs = 10; // Fast HealthScan for tests
+        daemon_config.health_check_interval_secs = 30; // Health checks for tests
+        daemon_config.demand_threshold = 3; // Low threshold for test demand detection
         
         // Save config to data dir
         daemon_config.save(data_dir.path())
@@ -1233,7 +1236,6 @@ async fn test_new_node_join_equalization() -> Result<(), String> {
 /// Test 3: Node churn triggers repair — 3 nodes with content, kill one,
 /// verify remaining nodes detect health drop via HealthScan.
 #[tokio::test]
-#[ignore = "HealthScan repair requires longer scan intervals and complex setup; run manually"]
 async fn test_node_churn_repair() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_node_churn_repair ===");
@@ -1293,7 +1295,6 @@ async fn test_node_churn_repair() -> Result<(), String> {
 /// Test 4: Demand triggers scaling — content at base redundancy,
 /// simulate fetch demand, verify additional pieces are created.
 #[tokio::test]
-#[ignore = "Demand-based scaling requires DemandSignalTracker to trigger extend; needs longer runtime"]
 async fn test_demand_triggers_scaling() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_demand_triggers_scaling ===");
@@ -1312,9 +1313,9 @@ async fn test_demand_triggers_scaling() -> Result<(), String> {
         let cid = node_a.publish(content).await?;
         sleep(Duration::from_secs(15)).await;
         
-        // Get initial health/piece count
-        let initial_health = node_a.content_health(&cid).await?;
-        info!("Initial health: {}", initial_health);
+        // Get initial health/piece count (check on node_b since publisher may clean up local pieces after distribution)
+        let initial_health = node_b.content_health(&cid).await?;
+        info!("Initial health (B): {}", initial_health);
         
         // Simulate demand: multiple fetch requests from Node B
         let fetch_base = node_b.data_dir.path().join("demand_fetch");
@@ -1327,8 +1328,8 @@ async fn test_demand_triggers_scaling() -> Result<(), String> {
         // Wait for demand signal to trigger scaling
         sleep(Duration::from_secs(30)).await;
         
-        let final_health = node_a.content_health(&cid).await?;
-        info!("Health after demand: {}", final_health);
+        let final_health = node_b.content_health(&cid).await?;
+        info!("Health after demand (B): {}", final_health);
         
         info!("✓ Demand triggers scaling test passed");
         
@@ -1388,7 +1389,6 @@ async fn test_homomorphic_hash_verification() -> Result<(), String> {
 
 /// Test 6: PDP challenge-response — Node A challenges Node B for a piece.
 #[tokio::test]
-#[ignore = "PDP challenge requires challenger_interval_secs to be very short; run manually with RUST_LOG=debug"]
 async fn test_pdp_challenge_response() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_pdp_challenge_response ===");

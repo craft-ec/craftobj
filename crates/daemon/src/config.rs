@@ -74,6 +74,11 @@ pub struct DaemonConfig {
     pub stream_open_timeout_secs: u64,
     /// Content health check interval in seconds (default: 300).
     pub health_check_interval_secs: u64,
+    /// HealthScan periodic scan interval in seconds (default: 300).
+    /// Controls how often the HealthScan loop runs to detect repair/degradation needs.
+    pub health_scan_interval_secs: u64,
+    /// Minimum fetches in the demand window to consider content "hot" (default: 10).
+    pub demand_threshold: u32,
 
     // ── Bootstrap ─────────────────────────────────────────────
     /// Bootstrap peer multiaddrs (e.g. ["/ip4/1.2.3.4/tcp/9000/p2p/12D3KooW..."]).
@@ -108,6 +113,8 @@ impl Default for DaemonConfig {
             piece_timeout_secs: 30,
             stream_open_timeout_secs: 10,
             health_check_interval_secs: 300,
+            health_scan_interval_secs: 300,
+            demand_threshold: 10,
             max_storage_bytes: 0,
             gc_interval_secs: 3600,
             max_peer_connections: 50,

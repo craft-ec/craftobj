@@ -234,7 +234,7 @@ pub async fn run_daemon_with_config(
     ));
 
     // Create demand tracker
-    let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::new()));
+    let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::with_threshold(daemon_config.demand_threshold)));
 
     // Eviction manager
     let eviction_config = crate::eviction::EvictionConfig {
@@ -456,13 +456,14 @@ pub async fn run_daemon_with_config(
 
     // HealthScan — periodic scan of owned segments for repair/degradation
     let health_scan_command_tx = command_tx.clone();
-    let health_scan = crate::health_scan::HealthScan::new(
+    let mut health_scan = crate::health_scan::HealthScan::new(
         piece_map.clone(),
         store.clone(),
         demand_signal_tracker.clone(),
         local_peer_id,
         health_scan_command_tx,
     );
+    health_scan.set_scan_interval(std::time::Duration::from_secs(daemon_config.health_scan_interval_secs));
     let health_scan: Arc<Mutex<crate::health_scan::HealthScan>> = Arc::new(Mutex::new(health_scan));
 
     // Derive ed25519 signing key for capability announcement signing
@@ -503,7 +504,7 @@ pub async fn run_daemon_with_config(
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
             info!("[service.rs] Protocol events handler ended");
         }
-        _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone()) => {
+        _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone(), daemon_config.challenger_interval_secs) => {
             info!("[service.rs] Challenger loop ended");
         }
         _ = crate::reannounce::content_maintenance_loop(
@@ -2205,13 +2206,15 @@ async fn run_challenger_loop(
     challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
     store: Arc<Mutex<craftobj_store::FsStore>>,
     event_tx: EventSender,
+    challenger_interval_secs: Option<u64>,
 ) {
     use std::time::Duration;
 
     // Initial delay
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    let mut interval = tokio::time::interval(crate::challenger::CHALLENGE_INTERVAL);
+    let interval_duration = Duration::from_secs(challenger_interval_secs.unwrap_or(crate::challenger::CHALLENGE_INTERVAL.as_secs()));
+    let mut interval = tokio::time::interval(interval_duration);
     loop {
         interval.tick().await;
         // Create a temporary FsStore for the challenger to avoid holding the

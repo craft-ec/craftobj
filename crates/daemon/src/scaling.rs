@@ -34,17 +34,36 @@ const MAX_SIGNAL_AGE: Duration = Duration::from_secs(300);
 const BASE_SCALING_DELAY: Duration = Duration::from_secs(10);
 
 /// Tracks fetch request rates per CID to detect demand.
-#[derive(Default)]
 pub struct DemandTracker {
     /// Fetch timestamps per content ID.
     fetches: HashMap<ContentId, Vec<Instant>>,
     /// Last time we broadcast a demand signal per CID.
     last_broadcast: HashMap<ContentId, Instant>,
+    /// Minimum fetches in the demand window to consider content "hot".
+    threshold: u32,
+}
+
+impl Default for DemandTracker {
+    fn default() -> Self {
+        Self {
+            fetches: HashMap::new(),
+            last_broadcast: HashMap::new(),
+            threshold: DEMAND_THRESHOLD,
+        }
+    }
 }
 
 impl DemandTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new DemandTracker with a custom threshold.
+    pub fn with_threshold(threshold: u32) -> Self {
+        Self {
+            threshold,
+            ..Self::default()
+        }
     }
 
     /// Record that we served a piece for this content.
@@ -64,7 +83,7 @@ impl DemandTracker {
                 return false;
             }
             let count = timestamps.len() as u32;
-            if count >= DEMAND_THRESHOLD {
+            if count >= self.threshold {
                 hot.push((*cid, count));
             }
             true
