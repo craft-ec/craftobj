@@ -16,7 +16,6 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::channel_store::ChannelStore;
-use craftobj_transfer;
 use crate::commands::CraftObjCommand;
 use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
@@ -994,10 +993,7 @@ impl CraftObjHandler {
         providers: &[libp2p::PeerId],
         command_tx: &tokio::sync::mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Result<(), String> {
-        use std::collections::HashMap;
         use tokio::task::JoinSet;
-
-        const MAX_CONCURRENT: usize = 20;
 
         info!("[handler.rs] Fetching pieces for {} from {} providers", content_id, providers.len());
 

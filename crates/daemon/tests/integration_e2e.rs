@@ -1605,51 +1605,78 @@ async fn test_degradation() -> Result<(), String> {
             info!("Node B health before departure: {}", health);
         }
         
-        // Kill Node C to simulate churn — B detects departure, C's pieces go offline
+        // Kill Node C to simulate churn — B detects departure, C's pieces go offline.
+        // B's HealthScan will see under-replication → repair (generate new pieces).
+        // Once B's pieces exceed target(6), HealthScan detects over-replication → degrades.
         info!("Shutting down Node C to trigger health change...");
         node_c.shutdown().await?;
         
-        // Wait for B to detect C's departure (connection timeout)
-        sleep(Duration::from_secs(5)).await;
+        // Phase 1: Wait for repair to push B's pieces above target(6).
+        // After C leaves, B sees network_pieces < target → repairs by generating new pieces.
+        info!("Phase 1: Waiting for repair to push pieces above target(6)...");
+        let mut peak_pieces: usize = pieces_b;
+        let mut above_target = false;
+        for attempt in 0..60 {
+            sleep(Duration::from_secs(1)).await;
+            if let Ok(health) = node_b.content_health(&cid).await {
+                let p: usize = health["segments"].as_array()
+                    .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+                    .unwrap_or(0);
+                if p > peak_pieces {
+                    peak_pieces = p;
+                    info!("Repair at {}s: B pieces increased to {}", attempt + 1, peak_pieces);
+                }
+                if peak_pieces > 6 {
+                    above_target = true;
+                    info!("Repair complete at {}s: B has {} pieces (> target 6)", attempt + 1, peak_pieces);
+                    break;
+                }
+            }
+        }
         
-        // Poll for degradation on B: HealthScan runs every 10s.
-        // B should see: local pieces + A's pieces (from SyncPieceMap) = network_pieces.
-        // If network_pieces > target(6), B degrades.
-        info!("Polling for HealthScan degradation on B...");
-        let mut min_seen = pieces_b;
+        if !above_target {
+            if let Ok(health) = node_b.content_health(&cid).await {
+                info!("Final B health after repair phase: {}", health);
+            }
+            return Err(format!("Repair phase failed: expected B > 6 pieces, got {}", peak_pieces));
+        }
+        
+        // Phase 2: Wait for degradation to drop pieces back down.
+        // HealthScan sees network_pieces > target → drops excess pieces.
+        info!("Phase 2: Waiting for degradation (pieces should drop from {})...", peak_pieces);
+        let mut min_seen = peak_pieces;
         let mut degradation_observed = false;
         for attempt in 0..60 {
             sleep(Duration::from_secs(1)).await;
             if let Ok(health) = node_b.content_health(&cid).await {
                 let p: usize = health["segments"].as_array()
                     .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
-                    .unwrap_or(pieces_b);
+                    .unwrap_or(peak_pieces);
+                // Track peak in case repair is still adding pieces
+                if p > peak_pieces {
+                    peak_pieces = p;
+                }
                 if p < min_seen {
                     min_seen = p;
-                    info!("Degradation at {}s: B pieces dropped to {} (was {})", attempt + 1, p, pieces_b);
+                    info!("Degradation at {}s: B pieces dropped to {} (peak was {})", attempt + 1, p, peak_pieces);
                     degradation_observed = true;
                     break;
-                }
-                // Log HealthScan state periodically
-                if attempt % 10 == 0 && attempt > 0 {
-                    info!("Still waiting at {}s: B local_pieces={}", attempt + 1, p);
                 }
             }
         }
         
         if !degradation_observed {
-            // Log final state for debugging
             if let Ok(health) = node_b.content_health(&cid).await {
                 info!("Final B health: {}", health);
             }
             return Err(format!(
-                "Expected degradation from {}, but min seen was {}. Check HealthScan logs for network_pieces vs target.",
-                pieces_b, min_seen
+                "Expected degradation: peak was {}, min seen was {}",
+                peak_pieces, min_seen
             ));
         }
         
-        info!("=== test_degradation === ✓ PASSED in {:.1}s — pieces: {} → {}",
-              start.elapsed().as_secs_f64(), pieces_b, min_seen);
+        info!("=== test_degradation === ✓ PASSED in {:.1}s — repair: {} → {}, then degradation → {}",
+              start.elapsed().as_secs_f64(), pieces_b, peak_pieces, min_seen);
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
