@@ -2,7 +2,8 @@
 //!
 //! Wire format: `[seq_id: u64 BE][type: u8][len: u32 BE][payload: bytes]`
 //!
-//! Flush after every write — yamux buffers data, flush pushes it to the wire.
+//! Generic frame read/write is provided by `craftec_network::wire`.
+//! This module adds CraftObj-specific message serialization on top.
 
 use std::io;
 
@@ -10,6 +11,7 @@ use futures::prelude::*;
 
 use crate::{CraftObjRequest, CraftObjResponse, PieceMapEntry, PiecePayload};
 use craftobj_core::{ContentId, WireStatus};
+use craftec_network::wire::{read_raw_frame, write_raw_frame};
 
 // Type discriminants (matching existing codec)
 const TYPE_PIECE_SYNC: u8 = 0x01;
@@ -29,9 +31,6 @@ const TYPE_PDP_PROOF: u8 = 0x86;
 const TYPE_PEX_EXCHANGE_RESPONSE: u8 = 0x87;
 const TYPE_CAPABILITY_REQUEST: u8 = 0x09;
 const TYPE_CAPABILITY_RESPONSE: u8 = 0x88;
-
-/// Maximum frame payload (50 MB).
-const MAX_FRAME_PAYLOAD: usize = 50 * 1024 * 1024;
 
 /// A parsed frame from a persistent stream.
 #[derive(Debug)]
@@ -64,45 +63,20 @@ pub async fn write_response_frame<T: AsyncWrite + Unpin>(
 
 /// Read a single frame from a persistent stream.
 pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFrame> {
-    // Read seq_id (8 bytes)
-    let mut seq_bytes = [0u8; 8];
-    io.read_exact(&mut seq_bytes).await?;
-    let seq_id = u64::from_be_bytes(seq_bytes);
+    let raw = read_raw_frame(io).await?;
 
-    // Read type (1 byte)
-    let mut ty = [0u8; 1];
-    io.read_exact(&mut ty).await?;
-
-    // Read length (4 bytes)
-    let mut len_bytes = [0u8; 4];
-    io.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-
-    if len > MAX_FRAME_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Frame payload too large: {} > {}", len, MAX_FRAME_PAYLOAD),
-        ));
-    }
-
-    // Read payload
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        io.read_exact(&mut payload).await?;
-    }
-
-    match ty[0] {
+    match raw.msg_type {
         TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE | TYPE_CAPABILITY_REQUEST => {
-            let request = deserialize_request(ty[0], &payload)?;
-            Ok(StreamFrame::Request { seq_id, request })
+            let request = deserialize_request(raw.msg_type, &raw.payload)?;
+            Ok(StreamFrame::Request { seq_id: raw.seq_id, request })
         }
         TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF | TYPE_PEX_EXCHANGE_RESPONSE | TYPE_CAPABILITY_RESPONSE => {
-            let response = deserialize_response(ty[0], &payload)?;
-            Ok(StreamFrame::Response { seq_id, response })
+            let response = deserialize_response(raw.msg_type, &raw.payload)?;
+            Ok(StreamFrame::Response { seq_id: raw.seq_id, response })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Unknown frame type: 0x{:02x}", ty[0]),
+            format!("Unknown frame type: 0x{:02x}", raw.msg_type),
         )),
     }
 }
@@ -110,34 +84,6 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
 // ========================================================================
 // Internal helpers
 // ========================================================================
-
-/// Write a raw frame atomically: build in memory, single write_all + flush.
-async fn write_raw_frame<T: AsyncWrite + Unpin>(
-    io: &mut T,
-    seq_id: u64,
-    msg_type: u8,
-    payload: &[u8],
-) -> io::Result<()> {
-    if payload.len() > MAX_FRAME_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Frame payload too large: {} > {}", payload.len(), MAX_FRAME_PAYLOAD),
-        ));
-    }
-
-    // [seq_id:8][type:1][len:4][payload:N]
-    let frame_len = 8 + 1 + 4 + payload.len();
-    let mut buf = Vec::with_capacity(frame_len);
-    buf.extend_from_slice(&seq_id.to_be_bytes());
-    buf.push(msg_type);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-
-    io.write_all(&buf).await?;
-    io.flush().await?;
-
-    Ok(())
-}
 
 fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
     match request {

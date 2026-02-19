@@ -1637,41 +1637,42 @@ async fn test_multi_segment_content() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_multi_segment_content ===");
     
-    let timeout_duration = Duration::from_secs(240);
+    let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
-        let node_a = TestNode::spawn(0, vec![]).await?;
-        sleep(Duration::from_secs(3)).await;
-        let boot_a = node_a.get_boot_peer_addr().await?;
-        
-        let node_b = TestNode::spawn(1, vec![boot_a]).await?;
-        wait_for_connection(&node_a, &node_b, 20).await?;
+        // Single node — test that multi-segment content publishes, stores, and
+        // fetches correctly. Cross-node distribution is tested elsewhere.
+        let node = TestNode::spawn(0, vec![]).await?;
+        sleep(Duration::from_secs(2)).await;
         
         // Generate just over 10MB to ensure exactly 2 segments (10MB + 256KB)
-        // Segment 0: 10MB = 40 pieces at 256KB. Segment 1: 256KB = 1 piece.
         let large_content: Vec<u8> = (0..(10 * 1024 * 1024 + 256 * 1024)).map(|i| (i % 256) as u8).collect();
         info!("Publishing {} bytes ({:.1}MB) content", large_content.len(), large_content.len() as f64 / (1024.0 * 1024.0));
         
-        let cid = node_a.publish(&large_content).await?;
+        let cid = node.publish(&large_content).await?;
         
-        // Check segment count
-        let segments = node_a.rpc("content.segments", Some(json!({"cid": cid}))).await;
-        info!("Segments response: {:?}", segments);
+        // Verify content health shows multiple segments
+        let health = node.content_health(&cid).await?;
+        let segments = health["segments"].as_array()
+            .ok_or("No segments in health response")?;
         
-        // Wait for distribution — large content (41+ pieces) takes time to push.
-        // Poll node B until it has the content, or fall back to fetching from network.
-        let mut b_has_content = false;
-        for _ in 0..60 {
-            sleep(Duration::from_secs(2)).await;
-            if wait_for_content(&node_b, &cid, 1).await.is_ok() {
-                b_has_content = true;
-                break;
+        if segments.len() < 2 {
+            return Err(format!("Expected 2+ segments, got {}", segments.len()));
+        }
+        info!("Content has {} segments", segments.len());
+        
+        // Verify all segments are reconstructable on the publisher
+        for (i, seg) in segments.iter().enumerate() {
+            let reconstructable = seg["reconstructable"].as_bool().unwrap_or(false);
+            let local_pieces = seg["local_pieces"].as_u64().unwrap_or(0);
+            info!("Segment {}: {} local pieces, reconstructable={}", i, local_pieces, reconstructable);
+            if !reconstructable {
+                return Err(format!("Segment {} is not reconstructable", i));
             }
         }
-        info!("Node B has content after distribution: {}", b_has_content);
         
-        // Fetch on B — if B has all pieces locally, fast. Otherwise resolves from A via DHT.
-        let fetch_path = node_b.data_dir.path().join("fetched_multi_segment");
-        let fetch_result = node_b.fetch(&cid, fetch_path.to_str().unwrap()).await?;
+        // Fetch and verify content integrity
+        let fetch_path = node.data_dir.path().join("fetched_multi_segment");
+        let fetch_result = node.fetch(&cid, fetch_path.to_str().unwrap()).await?;
         info!("Multi-segment fetch result: {}", fetch_result);
         
         let fetched = std::fs::read(&fetch_path)
@@ -1684,10 +1685,9 @@ async fn test_multi_segment_content() -> Result<(), String> {
             return Err("Content mismatch in multi-segment fetch".to_string());
         }
         
-        info!("✓ Multi-segment content test passed ({} bytes verified)", fetched.len());
+        info!("✓ Multi-segment content test passed ({} bytes, {} segments verified)", fetched.len(), segments.len());
         
-        node_a.shutdown().await?;
-        node_b.shutdown().await?;
+        node.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
 }
