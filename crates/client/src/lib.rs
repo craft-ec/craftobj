@@ -138,34 +138,8 @@ impl CraftObjClient {
             content_id, total_size, segment_count, config.piece_size,
         );
 
-        // Store all pieces and compute homomorphic hashes
-        let mut segment_hashes = Vec::with_capacity(encoded_segments.len());
+        // Store all pieces
         for (seg_idx, pieces) in &encoded_segments {
-            // Compute homomorphic hashes for original (source) pieces only
-            // Source pieces have identity coefficient vectors (exactly one 1, rest 0)
-            let k = config.k_for_segment(
-                if (*seg_idx as usize + 1) < segment_count {
-                    config.segment_size
-                } else {
-                    content_bytes.len() - *seg_idx as usize * config.segment_size
-                },
-            );
-            let source_pieces: Vec<&CodedPiece> = pieces.iter().take(k).collect();
-            let seed = {
-                let mut s = [0u8; 32];
-                use sha2::Digest;
-                let hash = sha2::Sha256::digest(
-                    &[&content_id.0[..], &seg_idx.to_le_bytes()[..]].concat(),
-                );
-                s.copy_from_slice(&hash);
-                s
-            };
-            let hashes = homomorphic::generate_segment_hashes(
-                seed,
-                &source_pieces.iter().map(|p| (*p).clone()).collect::<Vec<_>>(),
-            );
-            segment_hashes.push(hashes);
-
             for piece in pieces {
                 let pid = piece_id_from_coefficients(&piece.coefficients);
                 self.store.store_piece(
@@ -178,12 +152,11 @@ impl CraftObjClient {
             }
         }
 
-        // Store verification record (homomorphic hashes)
+        // Empty verification record — homomorphic hashes no longer in metadata
         let verification_record = ContentVerificationRecord {
             file_size: total_size,
-            segment_hashes,
+            segment_hashes: vec![],
         };
-        self.store.store_verification_record(&content_id, &verification_record)?;
 
         // Build and store content record
         let manifest = ContentManifest {

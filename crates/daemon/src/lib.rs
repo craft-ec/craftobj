@@ -24,6 +24,7 @@ pub mod handler;
 pub mod health;
 pub mod pdp;
 pub mod peer_reconnect;
+pub mod piece_transfer;
 pub mod peer_scorer;
 pub mod pex;
 pub mod pex_wire;

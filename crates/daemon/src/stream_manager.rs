@@ -81,6 +81,7 @@ impl StreamManager {
         mpsc::Receiver<InboundMessage>,
         mpsc::Sender<OutboundMessage>,
         mpsc::Sender<DistributionMessage>,
+        libp2p_stream::Control,  // for direct stream access (fetch)
     ) {
         let (inbound_tx, inbound_rx) = mpsc::channel(8192);
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(8192);
@@ -94,6 +95,7 @@ impl StreamManager {
         // Spawn inbound acceptor — accepts streams from peers
         tokio::spawn(Self::inbound_acceptor(control_clone, inbound_tx.clone()));
 
+        let control_for_fetch = control.clone();
         let mgr = Self {
             control,
             inbound_tx,
@@ -105,7 +107,7 @@ impl StreamManager {
         let mut mgr_clone = mgr.clone_for_distribution();
         tokio::spawn(Self::distribution_manager(mgr_clone, distribution_rx));
 
-        (mgr, inbound_rx, outbound_tx, distribution_tx)
+        (mgr, inbound_rx, outbound_tx, distribution_tx, control_for_fetch)
     }
 
     fn clone_for_distribution(&self) -> Self {
@@ -187,20 +189,28 @@ impl StreamManager {
         control: libp2p_stream::Control,
         mut rx: mpsc::Receiver<OutboundMessage>,
     ) {
+        let mut msg_count = 0u64;
         while let Some(msg) = rx.recv().await {
+            msg_count += 1;
             let mut ctrl = control.clone();
+            let msg_id = msg_count;
             tokio::spawn(async move {
+                let total_start = std::time::Instant::now();
                 let peer = msg.peer;
                 let req_desc = format!("{:?}", std::mem::discriminant(&msg.request));
 
                 // Open fresh stream
+                let open_start = std::time::Instant::now();
                 let mut stream = match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     ctrl.open_stream(peer, transfer_stream_protocol()),
                 ).await {
-                    Ok(Ok(s)) => s,
+                    Ok(Ok(s)) => {
+                        info!("[outbound] #{} open stream to {} in {:.1}ms", msg_id, &peer.to_string()[..8], open_start.elapsed().as_secs_f64() * 1000.0);
+                        s
+                    }
                     Ok(Err(e)) => {
-                        warn!("[stream_mgr.rs] Failed to open stream to {}: {}", peer, e);
+                        warn!("[outbound] #{} FAILED open stream to {}: {} ({:.1}ms)", msg_id, &peer.to_string()[..8], e, open_start.elapsed().as_secs_f64() * 1000.0);
                         if let Some(tx) = msg.reply_tx {
                             let _ = tx.send(CraftObjResponse::Ack {
                                 status: craftobj_core::WireStatus::Error,
@@ -209,7 +219,7 @@ impl StreamManager {
                         return;
                     }
                     Err(_) => {
-                        warn!("[stream_mgr.rs] Timeout opening stream to {}", peer);
+                        warn!("[outbound] #{} TIMEOUT open stream to {} (5s)", msg_id, &peer.to_string()[..8]);
                         if let Some(tx) = msg.reply_tx {
                             let _ = tx.send(CraftObjResponse::Ack {
                                 status: craftobj_core::WireStatus::Error,
@@ -220,8 +230,9 @@ impl StreamManager {
                 };
 
                 // Write request
+                let write_start = std::time::Instant::now();
                 if let Err(e) = write_request_frame(&mut stream, 0, &msg.request).await {
-                    warn!("[stream_mgr.rs] Write to {} failed: {}", peer, e);
+                    warn!("[outbound] #{} WRITE FAILED to {}: {} ({:.1}ms)", msg_id, &peer.to_string()[..8], e, write_start.elapsed().as_secs_f64() * 1000.0);
                     if let Some(tx) = msg.reply_tx {
                         let _ = tx.send(CraftObjResponse::Ack {
                             status: craftobj_core::WireStatus::Error,
@@ -229,27 +240,37 @@ impl StreamManager {
                     }
                     return;
                 }
-                info!("[stream_mgr.rs] Sent {} to {}", req_desc, peer);
+                let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
+                info!("[outbound] #{} WRITE OK {} to {} in {:.1}ms", msg_id, req_desc, &peer.to_string()[..8], write_ms);
 
                 // Read response on same stream
+                let read_start = std::time::Instant::now();
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(30),
                     read_frame(&mut stream),
                 ).await {
                     Ok(Ok(StreamFrame::Response { response, .. })) => {
-                        info!("[stream_mgr.rs] Got response from {} for {}", peer, req_desc);
+                        let read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                        let resp_desc = match &response {
+                            CraftObjResponse::PieceBatch { pieces } => format!("PieceBatch({})", pieces.len()),
+                            CraftObjResponse::BatchAck { confirmed_pieces, .. } => format!("BatchAck({})", confirmed_pieces.len()),
+                            CraftObjResponse::Ack { status } => format!("Ack({:?})", status),
+                            other => format!("{:?}", std::mem::discriminant(other)),
+                        };
+                        info!("[outbound] #{} READ OK from {} in {:.1}ms | total={:.1}ms | {}", msg_id, &peer.to_string()[..8], read_ms, total_ms, resp_desc);
                         if let Some(tx) = msg.reply_tx {
                             let _ = tx.send(response);
                         }
                     }
                     Ok(Ok(StreamFrame::Request { .. })) => {
-                        warn!("[stream_mgr.rs] Unexpected request frame from {} (expected response)", peer);
+                        warn!("[outbound] #{} unexpected request frame from {} ({:.1}ms)", msg_id, &peer.to_string()[..8], read_start.elapsed().as_secs_f64() * 1000.0);
                     }
                     Ok(Err(e)) => {
-                        warn!("[stream_mgr.rs] Read response from {} failed: {}", peer, e);
+                        warn!("[outbound] #{} READ FAILED from {}: {} ({:.1}ms)", msg_id, &peer.to_string()[..8], e, read_start.elapsed().as_secs_f64() * 1000.0);
                     }
                     Err(_) => {
-                        warn!("[stream_mgr.rs] Response timeout from {} for {}", peer, req_desc);
+                        warn!("[outbound] #{} READ TIMEOUT from {} (30s)", msg_id, &peer.to_string()[..8]);
                     }
                 }
                 // Stream drops here — closed automatically

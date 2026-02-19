@@ -113,6 +113,17 @@ pub enum CraftObjCommand {
         pieces: Vec<craftobj_transfer::PiecePayload>,
         reply_tx: oneshot::Sender<craftobj_transfer::CraftObjResponse>,
     },
+    /// Fetch pieces from a peer using unified piece_transfer protocol.
+    /// Opens stream, sends PieceSync, then receives batched PieceBatchPush frames.
+    /// Returns (confirmed_count, piece_ids) when transfer completes.
+    FetchPieces {
+        peer_id: PeerId,
+        content_id: ContentId,
+        segment_index: u32,
+        have_pieces: Vec<[u8; 32]>,
+        max_pieces: u16,
+        reply_tx: oneshot::Sender<Result<Vec<[u8; 32]>, String>>,
+    },
     /// Sync PieceMap entries for a newly tracked segment from connected peers.
     SyncPieceMap {
         content_id: ContentId,

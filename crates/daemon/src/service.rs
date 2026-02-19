@@ -815,7 +815,7 @@ async fn drive_swarm(
 
     // Stream manager for persistent piece transfer
     let mut stream_control = swarm.behaviour().stream.new_control();
-    let (mut stream_manager, mut inbound_rx, outbound_tx, distribution_tx) = StreamManager::new(stream_control);
+    let (mut stream_manager, mut inbound_rx, outbound_tx, distribution_tx, fetch_control) = StreamManager::new(stream_control);
 
     // Peer reconnector for exponential backoff reconnection
     let mut peer_reconnector = PeerReconnector::new();
@@ -1048,7 +1048,7 @@ async fn drive_swarm(
                             });
                         }
                         other => {
-                            handle_command(swarm, &protocol, other, pending_requests.clone(), &outbound_tx, &distribution_tx, &event_tx, &region, &signing_key).await;
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &outbound_tx, &distribution_tx, &event_tx, &region, &signing_key, &fetch_control, &store_for_repair).await;
                         }
                     }
                 }
@@ -1119,8 +1119,57 @@ async fn drive_swarm(
                     continue;
                 }
 
-                // Spawn handler as task to avoid blocking the swarm event loop
-                // while waiting for store lock (maintenance cycle may hold it).
+                // Handle PieceSync inline — uses send_pieces for batched transfer
+                if let CraftObjRequest::PieceSync { ref content_id, segment_index, ref have_pieces, max_pieces, .. } = msg.request {
+                    let content_id = content_id.clone();
+                    let have_pieces = have_pieces.clone();
+                    let store_clone = store_for_repair.clone();
+                    let dt_clone = demand_tracker.clone();
+                    let peer = msg.peer;
+                    let mut stream = msg.stream;
+                    tokio::spawn(async move {
+                        info!("[provide] PieceSync from {} for {}/seg{} (have={}, max={})", &peer.to_string()[..8], content_id, segment_index, have_pieces.len(), max_pieces);
+                        
+                        // Record demand
+                        dt_clone.lock().await.record_fetch(content_id.clone());
+                        
+                        // Read pieces from store
+                        let store_guard = store_clone.lock().await;
+                        let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
+                        let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
+                        let mut pieces = Vec::new();
+                        for pid in piece_ids {
+                            if have_set.contains(&pid) { continue; }
+                            if pieces.len() >= max_pieces as usize { break; }
+                            match store_guard.get_piece(&content_id, segment_index, &pid) {
+                                Ok((data, coefficients)) => {
+                                    pieces.push(craftobj_transfer::PiecePayload {
+                                        segment_index,
+                                        piece_id: pid,
+                                        coefficients,
+                                        data,
+                                    });
+                                }
+                                Err(e) => debug!("Failed to read piece {}: {}", hex::encode(&pid[..4]), e),
+                            }
+                        }
+                        drop(store_guard);
+                        
+                        let piece_count = pieces.len();
+                        info!("[provide] Sending {} pieces to {} for {}/seg{}", piece_count, &peer.to_string()[..8], content_id, segment_index);
+                        
+                        // Use send_pieces — same batched protocol as distribution
+                        let label = format!("provide-{}-seg{}", &content_id.to_string()[..8], segment_index);
+                        match crate::piece_transfer::send_pieces(&mut stream, &content_id, pieces, &label).await {
+                            Ok(result) => info!("[provide] Done: {}/{} confirmed to {}", result.total_confirmed, piece_count, &peer.to_string()[..8]),
+                            Err(e) => warn!("[provide] Failed sending to {}: {}", &peer.to_string()[..8], e),
+                        }
+                        // Stream drops — signals end of transfer to receiver
+                    });
+                    continue;
+                }
+
+                // Spawn handler as task for all other request types
                 let store_clone = store_for_repair.clone();
                 let ct_clone = content_tracker.clone();
                 let proto_clone = protocol.clone();
@@ -1247,12 +1296,15 @@ async fn handle_incoming_transfer_request(
 
             let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
             let mut pieces = Vec::new();
+            // Cap response to 15 pieces (~1.5MB) to match distribution batch size.
+            // Large responses (100+ pieces) saturate yamux streams for seconds.
+            let effective_max = (max_pieces as usize).min(15);
 
             for pid in piece_ids {
                 if have_set.contains(&pid) {
                     continue;
                 }
-                if pieces.len() >= max_pieces as usize {
+                if pieces.len() >= effective_max {
                     break;
                 }
                 match store_guard.get_piece(&content_id, segment_index, &pid) {
@@ -1592,6 +1644,8 @@ async fn handle_command(
     event_tx: &EventSender,
     region: &Option<String>,
     signing_key: &Option<ed25519_dalek::SigningKey>,
+    fetch_control: &libp2p_stream::Control,
+    store_for_repair: &Arc<Mutex<craftobj_store::FsStore>>,
 ) {
     match command {
         CraftObjCommand::AnnounceProvider { content_id, manifest, verification_record, reply_tx } => {
@@ -1678,8 +1732,8 @@ async fn handle_command(
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (60s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(60), ack_rx).await {
+                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (5s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
                     Ok(Ok(response)) => { 
                         let desc = match &response {
                             craftobj_transfer::CraftObjResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
@@ -1693,8 +1747,59 @@ async fn handle_command(
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => { 
-                        warn!("[service.rs] PieceSync to {}: timed out after 60s", peer_id);
+                        warn!("[service.rs] PieceSync to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("piece sync timed out".into())); 
+                    }
+                }
+            });
+        }
+
+        CraftObjCommand::FetchPieces { peer_id, content_id, segment_index, have_pieces, max_pieces, reply_tx } => {
+            let mut ctrl = (*fetch_control).clone();
+            let store_clone: Arc<Mutex<craftobj_store::FsStore>> = store_for_repair.clone();
+            tokio::spawn(async move {
+                let label = format!("fetch-{}-seg{}", &content_id.to_string()[..8], segment_index);
+                // Open stream to provider
+                let mut stream = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    ctrl.open_stream(peer_id, crate::stream_manager::transfer_stream_protocol()),
+                ).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        let _ = reply_tx.send(Err(format!("open stream: {}", e)));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = reply_tx.send(Err("open stream timeout".into()));
+                        return;
+                    }
+                };
+
+                // Send PieceSync request to trigger the provider's send_pieces
+                let request = CraftObjRequest::PieceSync {
+                    content_id: content_id.clone(),
+                    segment_index,
+                    merkle_root: [0u8; 32],
+                    have_pieces,
+                    max_pieces,
+                };
+                if let Err(e) = craftobj_transfer::wire::write_request_frame(&mut stream, 0, &request).await {
+                    let _ = reply_tx.send(Err(format!("write PieceSync: {}", e)));
+                    return;
+                }
+
+                // Receive pieces using unified protocol
+                match crate::piece_transfer::receive_pieces(&mut stream, &store_clone, &label).await {
+                    Ok(result) => {
+                        info!("[{}] received {} pieces", label, result.total_confirmed);
+                        // List what we got from store to return piece IDs
+                        let store_guard = store_clone.lock().await;
+                        let piece_ids = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
+                        drop(store_guard);
+                        let _ = reply_tx.send(Ok(piece_ids));
+                    }
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(format!("receive_pieces: {}", e)));
                     }
                 }
             });

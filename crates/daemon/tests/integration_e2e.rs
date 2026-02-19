@@ -104,7 +104,7 @@ impl TestNode {
         daemon_config.challenger_interval_secs = Some(5);
         daemon_config.aggregation_epoch_secs = Some(120);
         daemon_config.pex_interval_secs = 2; // Fast PEX for tests
-        daemon_config.health_scan_interval_secs = 10; // Fast HealthScan for tests
+        daemon_config.health_scan_interval_secs = 300; // Default — don't degrade during tests
         daemon_config.health_check_interval_secs = 30; // Health checks for tests
         daemon_config.demand_threshold = 3; // Low threshold for test demand detection
         daemon_config.max_peer_connections = 10; // Limit connections for test resource usage
@@ -1921,21 +1921,29 @@ async fn test_large_file_transfer() -> Result<(), String> {
         let publish_time = publish_start.elapsed();
         info!("Published 100MB in {:.1}s, CID: {}", publish_time.as_secs_f64(), cid);
         
+        // Wait for ALL segments to have >= 103 pieces on Node B
         let dist_start = Instant::now();
-        let b_has = wait_for_content(&node_b, &cid, 60).await.is_ok();
-        let dist_time = dist_start.elapsed();
-        info!("Distribution to B: has={}, took {:.1}s", b_has, dist_time.as_secs_f64());
-        
-        if let Ok(health_b) = node_b.content_health(&cid).await {
-            let b_pieces: usize = health_b["segments"].as_array()
-                .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
-                .unwrap_or(0);
-            info!("Node B: {} local pieces", b_pieces);
+        let mut b_pieces = 0usize;
+        let mut min_seg_pieces = 0usize;
+        for _ in 0..120 {  // up to 60s
+            sleep(Duration::from_millis(500)).await;
+            if let Ok(health_b) = node_b.content_health(&cid).await {
+                let seg_counts: Vec<usize> = health_b["segments"].as_array()
+                    .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).collect())
+                    .unwrap_or_default();
+                b_pieces = seg_counts.iter().sum();
+                min_seg_pieces = seg_counts.iter().copied().min().unwrap_or(0);
+                if min_seg_pieces >= 103 {
+                    break;
+                }
+            }
         }
+        let dist_time = dist_start.elapsed();
+        info!("Distribution to B: {} pieces (min_seg={}), {:.1}s", b_pieces, min_seg_pieces, dist_time.as_secs_f64());
         
         let node_c = TestNode::spawn(2, vec![boot_a.clone()]).await?;
         wait_for_connection(&node_a, &node_c, 30).await?;
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(2)).await;
         
         let fetch_path = node_c.data_dir.path().join("fetched_large");
         let fetch_start = Instant::now();

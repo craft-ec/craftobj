@@ -1058,239 +1058,42 @@ impl CraftObjHandler {
             let needed = k - current_rank;
             info!("[handler.rs] Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
 
-            // Spawn parallel piece requests using JoinSet
-            let concurrency = needed.min(ranked_providers.len()).min(MAX_CONCURRENT);
-            let mut join_set: JoinSet<(
-                libp2p::PeerId,
-                std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, String>,
-                std::time::Duration,
-            )> = JoinSet::new();
-
-            let mut provider_iter = ranked_providers.iter().copied().cycle();
-            let mut requests_launched = 0usize;
-            let mut total_fetched = 0usize;
-            // Track per-provider consecutive failures to avoid hammering bad peers
-            let mut provider_failures: HashMap<libp2p::PeerId, u32> = HashMap::new();
-
-            // Track which pieces we have (for exclude-list in PieceSync)
-            let have_piece_ids: std::sync::Arc<tokio::sync::Mutex<Vec<[u8; 32]>>> = 
-                std::sync::Arc::new(tokio::sync::Mutex::new(local_piece_ids.clone()));
-
             let seg_start = std::time::Instant::now();
 
-            // Launch initial batch
-            for _ in 0..concurrency {
-                let provider = provider_iter.next().unwrap();
-                let cmd_tx = command_tx.clone();
-                let have_ids = have_piece_ids.clone();
-                info!("[fetch] seg{} initial PieceSync to {} (need {} pieces)", seg_idx, &provider.to_string()[..8], needed);
-                join_set.spawn(async move {
-                    let start = std::time::Instant::now();
-                    let have = have_ids.lock().await.clone();
-                    let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftObjResponse, String>>();
-                    let command = CraftObjCommand::PieceSync {
-                        peer_id: provider,
-                        content_id: cid,
-                        segment_index: seg_idx,
-                        merkle_root: [0u8; 32],
-                        have_pieces: have,
-                        max_pieces: needed as u16,
-                        reply_tx,
-                    };
-                    if cmd_tx.send(command).is_err() {
-                        return (provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
-                    }
-                    match reply_rx.await {
-                        Ok(Ok(craftobj_transfer::CraftObjResponse::PieceBatch { pieces })) => {
-                            if pieces.is_empty() {
-                                (provider, Err("no pieces returned".into()), start.elapsed())
-                            } else {
-                                let batch: Vec<(Vec<u8>, Vec<u8>)> = pieces.into_iter()
-                                    .map(|p| (p.coefficients, p.data))
-                                    .collect();
-                                (provider, Ok(batch), start.elapsed())
-                            }
-                        }
-                        Ok(Ok(_)) => (provider, Err("unexpected response type".into()), start.elapsed()),
-                        Ok(Err(e)) => (provider, Err(e), start.elapsed()),
-                        Err(e) => (provider, Err(e.to_string()), start.elapsed()),
-                    }
-                });
-                requests_launched += 1;
+            // Use unified piece_transfer — one FetchPieces per provider per segment.
+            // Provider streams batched PieceBatchPush, we receive and store via receive_pieces.
+            let provider = ranked_providers[0];
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let command = CraftObjCommand::FetchPieces {
+                peer_id: provider,
+                content_id: cid,
+                segment_index: seg_idx,
+                have_pieces: local_piece_ids.clone(),
+                max_pieces: needed as u16,
+                reply_tx,
+            };
+            if command_tx.send(command).is_err() {
+                return Err(format!("Segment {}: command channel closed", seg_idx));
             }
 
-            // Process results as they complete, spawn replacements
-            while let Some(result) = join_set.join_next().await {
-                let (provider, piece_result, latency) = match result {
-                    Ok(r) => r,
-                    Err(_) => continue, // task panicked
-                };
-
-                match piece_result {
-                    Ok(batch) => {
-                        info!("[handler.rs] Got {} pieces from {} for seg{}", batch.len(), provider, seg_idx);
-                        let mut any_stored = false;
-                        for (coefficients, piece_data) in batch {
-                            // Verify piece using homomorphic hash before accepting
-                            if let Some(ref record) = *vr {
-                                if let Some(seg_hashes) = record.segment_hashes.get(seg_idx as usize) {
-                                    let piece = craftec_erasure::CodedPiece {
-                                        data: piece_data.clone(),
-                                        coefficients: coefficients.clone(),
-                                    };
-                                    if !craftec_erasure::verify_piece(&piece, seg_hashes) {
-                                        warn!("[handler.rs] Piece from {} failed homomorphic hash verification for seg{}, skipping", provider, seg_idx);
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            // Check linear independence before storing
-                            let mut test_matrix = coeff_matrix.clone();
-                            test_matrix.push(coefficients.clone());
-                            let new_rank = craftec_erasure::check_independence(&test_matrix);
-
-                            if new_rank > current_rank {
-                                // Independent piece — store it
-                                let piece_id = craftobj_store::piece_id_from_coefficients(&coefficients);
-
-                                let stored = {
-                                    let client_guard = client.lock().await;
-                                    client_guard.store().store_piece(&cid, seg_idx, &piece_id, &piece_data, &coefficients)
-                                };
-
-                                match stored {
-                                    Ok(()) => {
-                                        if let Some(ref mt) = merkle_tree {
-                                            mt.lock().await.insert(&cid, seg_idx, &piece_id);
-                                        }
-                                        // Emit PieceStored event
-                                        if let Some(ref pm) = piece_map {
-                                            let mut map = pm.lock().await;
-                                            let seq = map.next_seq();
-                                            let mut ps_event = craftobj_core::PieceStored {
-                                                node: map.local_node().to_vec(),
-                                                cid,
-                                                segment: seg_idx,
-                                                piece_id,
-                                                coefficients: coefficients.clone(),
-                                                seq,
-                                                timestamp: std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_secs(),
-                                                signature: vec![],
-                                            };
-                                            if let Some(ref key) = signing_key {
-                                                ps_event.sign(key);
-                                            }
-                                            let event = craftobj_core::PieceEvent::Stored(ps_event);
-                                            map.apply_event(&event);
-                                        }
-                                        // Publish DHT provider record for this CID+segment
-                                        {
-                                            let pkey = craftobj_routing::providers_dht_key(&cid);
-                                            let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
-                                        }
-                                        coeff_matrix.push(coefficients);
-                                        current_rank = new_rank;
-                                        total_fetched += 1;
-                                        any_stored = true;
-                                        // Track stored piece so future requests exclude it
-                                        have_piece_ids.lock().await.push(piece_id);
-                                        info!("[fetch] seg{} stored piece from {}: rank {}/{} ({:.1}ms elapsed)", seg_idx, &provider.to_string()[..8], current_rank, k, seg_start.elapsed().as_secs_f64() * 1000.0);
-
-                                        if current_rank >= k {
-                                            info!("[handler.rs] Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("[handler.rs] Failed to store piece for seg{}: {}", seg_idx, e);
-                                    }
-                                }
-                            }
-                        }
-                        if any_stored {
-                            if let Some(ref scorer) = peer_scorer {
-                                scorer.lock().await.record_success(&provider, latency);
-                            }
-                        }
-                        if current_rank >= k {
-                            break; // segment done
-                        }
-                    }
-                    Err(ref e) => {
-                        info!("[handler.rs] Failed to get piece from {} for seg{}: {}", provider, seg_idx, e);
-                        let failures = provider_failures.entry(provider).or_insert(0);
-                        *failures += 1;
-                        if let Some(ref scorer) = peer_scorer {
-                            scorer.lock().await.record_failure(&provider);
-                        }
+            match tokio::time::timeout(std::time::Duration::from_secs(120), reply_rx).await {
+                Ok(Ok(Ok(piece_ids))) => {
+                    let fetched = piece_ids.len();
+                    if fetched >= k {
+                        info!("[fetch] seg{} COMPLETE: {} pieces from {} in {:.1}s", seg_idx, fetched, &provider.to_string()[..8], seg_start.elapsed().as_secs_f64());
+                    } else {
+                        warn!("[fetch] seg{} INCOMPLETE: {}/{} from {} in {:.1}s", seg_idx, fetched, k, &provider.to_string()[..8], seg_start.elapsed().as_secs_f64());
+                        return Err(format!("Segment {} incomplete: {}/{}", seg_idx, fetched, k));
                     }
                 }
-
-                // Spawn a replacement request if we still need more pieces
-                if current_rank < k {
-                    let still_needed = (k - current_rank) as u16;
-                    // Pick next provider, skip those with too many failures
-                    let mut attempts = 0;
-                    while attempts < ranked_providers.len() {
-                        let next_provider = provider_iter.next().unwrap();
-                        let fail_count = provider_failures.get(&next_provider).copied().unwrap_or(0);
-                        if fail_count < 3 {
-                            let cmd_tx = command_tx.clone();
-                            let have_ids = have_piece_ids.clone();
-                            info!("[fetch] seg{} retry PieceSync to {} (still need {} pieces)", seg_idx, &next_provider.to_string()[..8], still_needed);
-                            join_set.spawn(async move {
-                                let start = std::time::Instant::now();
-                                let have = have_ids.lock().await.clone();
-                                let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftObjResponse, String>>();
-                                let command = CraftObjCommand::PieceSync {
-                                    peer_id: next_provider,
-                                    content_id: cid,
-                                    segment_index: seg_idx,
-                                    merkle_root: [0u8; 32],
-                                    have_pieces: have,
-                                    max_pieces: still_needed,
-                                    reply_tx,
-                                };
-                                if cmd_tx.send(command).is_err() {
-                                    return (next_provider, Err::<Vec<(Vec<u8>, Vec<u8>)>, String>("command channel closed".into()), start.elapsed());
-                                }
-                                match reply_rx.await {
-                                    Ok(Ok(craftobj_transfer::CraftObjResponse::PieceBatch { pieces })) => {
-                                        if pieces.is_empty() {
-                                            (next_provider, Err("no pieces returned".into()), start.elapsed())
-                                        } else {
-                                            let batch: Vec<(Vec<u8>, Vec<u8>)> = pieces.into_iter()
-                                                .map(|p| (p.coefficients, p.data))
-                                                .collect();
-                                            (next_provider, Ok(batch), start.elapsed())
-                                        }
-                                    }
-                                    Ok(Ok(_)) => (next_provider, Err("unexpected response type".into()), start.elapsed()),
-                                    Ok(Err(e)) => (next_provider, Err(e), start.elapsed()),
-                                    Err(e) => (next_provider, Err(e.to_string()), start.elapsed()),
-                                }
-                            });
-                            requests_launched += 1;
-                            break;
-                        }
-                        attempts += 1;
-                    }
+                Ok(Ok(Err(e))) => {
+                    warn!("[fetch] seg{} FAILED: {} ({:.1}s)", seg_idx, e, seg_start.elapsed().as_secs_f64());
+                    return Err(format!("Segment {}: {}", seg_idx, e));
                 }
+                Ok(Err(_)) => return Err(format!("Segment {}: reply channel closed", seg_idx)),
+                Err(_) => return Err(format!("Segment {}: fetch timeout (120s)", seg_idx)),
             }
 
-            if current_rank < k {
-                warn!(
-                    "[fetch] seg{} INCOMPLETE: {}/{} after {} requests, {:.1}s",
-                    seg_idx, current_rank, k, requests_launched, seg_start.elapsed().as_secs_f64()
-                );
-                return Err(format!("Segment {} incomplete: {}/{}", seg_idx, current_rank, k));
-            }
-            info!("[fetch] seg{} COMPLETE: rank {}/{}, {} requests, {:.1}s", seg_idx, current_rank, k, requests_launched, seg_start.elapsed().as_secs_f64());
-            let _ = total_fetched;
             Ok(())
             }); // end segment_join_set.spawn
         }
