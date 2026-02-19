@@ -162,7 +162,7 @@ pub async fn run_daemon_with_config(
 
     // Build swarm with CraftObj wrapper behaviour (CraftBehaviour + libp2p_stream)
     let (mut swarm, local_peer_id) = build_craftobj_swarm(keypair.clone(), network_config).await
-        .map_err(|e| format!("Failed to build swarm: {}", e))?;
+        .map_err(|e| format!("Failed to build swarm: {:?}", e))?;
     info!("[service.rs] CraftObj node started: {}", local_peer_id);
 
     // Set Kademlia to server mode so DHT queries work (especially on localhost / LAN)

@@ -71,8 +71,20 @@ impl TestNode {
         // Generate unique socket path
         let socket_path = format!("/tmp/craftobj-test-{}-{}.sock", index, rand::random::<u32>());
         
-        // Use globally unique ports via atomic counter to avoid conflicts in parallel tests
-        let listen_port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        // Use globally unique ports via atomic counter to avoid conflicts in parallel tests.
+        // Try up to 10 ports to skip any in TIME_WAIT from previous test runs.
+        let listen_port = loop {
+            let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(_listener) => break port, // Drop listener immediately, port is free
+                Err(_) => {
+                    if port > 30200 {
+                        return Err("Could not find free port in range 30000-30200".to_string());
+                    }
+                    continue;
+                }
+            }
+        };
         let ws_port = 0; // OS assigns random port
         
         info!("Spawning test node {} with peer_id {} at {}", 
