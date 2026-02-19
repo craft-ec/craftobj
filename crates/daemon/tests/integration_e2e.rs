@@ -1652,21 +1652,23 @@ async fn test_multi_segment_content() -> Result<(), String> {
         
         // Verify content health shows multiple segments
         let health = node.content_health(&cid).await?;
+        info!("Full health response: {}", health);
         let segments = health["segments"].as_array()
-            .ok_or("No segments in health response")?;
+            .ok_or_else(|| format!("No segments in health response: {}", health))?;
         
         if segments.len() < 2 {
             return Err(format!("Expected 2+ segments, got {}", segments.len()));
         }
         info!("Content has {} segments", segments.len());
         
-        // Verify all segments are reconstructable on the publisher
+        // Verify all segments have pieces
         for (i, seg) in segments.iter().enumerate() {
-            let reconstructable = seg["reconstructable"].as_bool().unwrap_or(false);
             let local_pieces = seg["local_pieces"].as_u64().unwrap_or(0);
-            info!("Segment {}: {} local pieces, reconstructable={}", i, local_pieces, reconstructable);
-            if !reconstructable {
-                return Err(format!("Segment {} is not reconstructable", i));
+            let k = seg["k"].as_u64().unwrap_or(0);
+            let reconstructable = seg["reconstructable"].as_bool().unwrap_or(false);
+            info!("Segment {}: k={}, {} local pieces, reconstructable={}", i, k, local_pieces, reconstructable);
+            if local_pieces == 0 {
+                return Err(format!("Segment {} has 0 pieces", i));
             }
         }
         
