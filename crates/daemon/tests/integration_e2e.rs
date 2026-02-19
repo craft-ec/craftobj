@@ -437,16 +437,20 @@ async fn test_single_node_publish_list() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
+        info!("=== test_single_node_publish_list === Step 1/4: Spawning node...");
         // Spawn a single node
         let node = TestNode::spawn(0, vec![]).await?;
         
         // Wait a moment for node to initialize
         sleep(Duration::from_secs(2)).await;
         
+        info!("=== test_single_node_publish_list === Step 2/4: Publishing content ({:.1}s)...", start.elapsed().as_secs_f64());
         // Publish a small file
         let test_content = b"Hello, CraftOBJ E2E test!";
         let cid = node.publish(test_content).await?;
         
+        info!("=== test_single_node_publish_list === Step 3/4: Verifying list ({:.1}s)...", start.elapsed().as_secs_f64());
         // Verify it appears in the list
         let list_response = node.list().await?;
         let contents = list_response.as_array()
@@ -459,6 +463,7 @@ async fn test_single_node_publish_list() -> Result<(), String> {
             return Err("Published content not found in list".to_string());
         }
         
+        info!("=== test_single_node_publish_list === Step 4/4: Verifying status ({:.1}s)...", start.elapsed().as_secs_f64());
         // Verify status shows stored bytes > 0
         let status = node.status().await?;
         let stored_bytes = status["stored_bytes"].as_u64().unwrap_or(0);
@@ -466,8 +471,8 @@ async fn test_single_node_publish_list() -> Result<(), String> {
             return Err(format!("Status should show stored bytes > 0, got: {}", stored_bytes));
         }
         
-        info!("✓ Single node publish/list test passed - CID: {}, stored: {} bytes", 
-              cid, stored_bytes);
+        info!("=== test_single_node_publish_list === ✓ PASSED in {:.1}s — CID: {}, stored: {} bytes", 
+              start.elapsed().as_secs_f64(), cid, stored_bytes);
         
         node.shutdown().await?;
         Ok(())
@@ -481,6 +486,8 @@ async fn test_two_nodes_connect() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(90);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
+        info!("=== test_two_nodes_connect === Step 1/3: Spawning Node A...");
         // Spawn Node A
         let node_a = TestNode::spawn(0, vec![]).await?;
         
@@ -489,12 +496,14 @@ async fn test_two_nodes_connect() -> Result<(), String> {
         let boot_addr = node_a.get_boot_peer_addr().await?;
         info!("Node A boot peer address: {}", boot_addr);
         
+        info!("=== test_two_nodes_connect === Step 2/3: Spawning Node B ({:.1}s)...", start.elapsed().as_secs_f64());
         // Spawn Node B with Node A as boot peer
         let node_b = TestNode::spawn(1, vec![boot_addr]).await?;
         
         // Wait for connection to establish
         wait_for_connection(&node_a, &node_b, 30).await?;
         
+        info!("=== test_two_nodes_connect === Step 3/3: Verifying connections ({:.1}s)...", start.elapsed().as_secs_f64());
         // Verify both nodes see each other
         let peers_a = node_a.connected_peers().await?;
         let peers_b = node_b.connected_peers().await?;
@@ -506,8 +515,8 @@ async fn test_two_nodes_connect() -> Result<(), String> {
             return Err("Node B should have peers".to_string());
         }
         
-        info!("✓ Two nodes connection test passed - {} peers on A, {} peers on B", 
-              peers_a.len(), peers_b.len());
+        info!("=== test_two_nodes_connect === ✓ PASSED in {:.1}s — {} peers on A, {} peers on B", 
+              start.elapsed().as_secs_f64(), peers_a.len(), peers_b.len());
         
         // Shutdown nodes
         node_a.shutdown().await?;
@@ -524,6 +533,7 @@ async fn test_publish_and_basic_functionality() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Spawn Node A
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
@@ -562,7 +572,7 @@ async fn test_publish_and_basic_functionality() -> Result<(), String> {
             .unwrap_or(false);
         info!("Node B has content after distribution: {}", b_has_content);
         
-        info!("✓ Publish and basic functionality test passed - content published and visible");
+        info!("=== test_publish_and_basic_functionality === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -577,6 +587,7 @@ async fn test_node_spawn_shutdown() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(30);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(99, vec![]).await?;
         
         // Verify node is responsive
@@ -588,7 +599,7 @@ async fn test_node_spawn_shutdown() -> Result<(), String> {
         // Clean shutdown
         node.shutdown().await?;
         
-        info!("✓ Node spawn/shutdown test passed");
+        info!("=== test_node_spawn_shutdown === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
 }
@@ -600,21 +611,25 @@ async fn test_publish_fetch_cross_node() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // 3-node test: A publishes → B stores (via push) → C fetches from network
-        
+        info!("=== test_publish_fetch_cross_node === Step 1/6: Spawning Node A...");
         // Spawn Node A (publisher)
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         
+        info!("=== test_publish_fetch_cross_node === Step 2/6: Spawning Node B ({:.1}s)...", start.elapsed().as_secs_f64());
         // Spawn Node B (storage) connected to A
         let boot_addr_a = node_a.get_boot_peer_addr().await?;
         let node_b = TestNode::spawn(1, vec![boot_addr_a.clone()]).await?;
         wait_for_connection(&node_a, &node_b, 30).await?;
         
+        info!("=== test_publish_fetch_cross_node === Step 3/6: Publishing content ({:.1}s)...", start.elapsed().as_secs_f64());
         // Node A publishes content — triggers distribution to B
         let original_content = b"Cross-node fetch test content for CraftOBJ P2P verification";
         let cid = node_a.publish(original_content).await?;
         
+        info!("=== test_publish_fetch_cross_node === Step 4/6: Waiting for distribution ({:.1}s)...", start.elapsed().as_secs_f64());
         // Wait for distribution: A pushes pieces to B, B announces as provider
         sleep(Duration::from_secs(10)).await;
         
@@ -625,7 +640,8 @@ async fn test_publish_fetch_cross_node() -> Result<(), String> {
             .unwrap_or(false);
         info!("Node B has content after distribution: {}", b_has_content);
         
-        // Spawn Node C (fetcher) — connected to A (for manifest) and B (for pieces)
+        info!("=== test_publish_fetch_cross_node === Step 5/6: Spawning Node C ({:.1}s)...", start.elapsed().as_secs_f64());
+        // Spawn Node C (fetcher) — connected to A (for record) and B (for pieces)
         let boot_addr_b = node_b.get_boot_peer_addr().await?;
         let node_c = TestNode::spawn(2, vec![boot_addr_a.clone(), boot_addr_b]).await?;
         wait_for_connection(&node_a, &node_c, 30).await?;
@@ -633,6 +649,7 @@ async fn test_publish_fetch_cross_node() -> Result<(), String> {
         // Wait for Kademlia provider records to propagate
         sleep(Duration::from_secs(5)).await;
         
+        info!("=== test_publish_fetch_cross_node === Step 6/6: Fetching from Node C ({:.1}s)...", start.elapsed().as_secs_f64());
         // Node C fetches the content from the network (should resolve providers via DHT)
         let fetch_path = node_c.data_dir.path().join("fetched_content");
         let fetch_result = node_c.fetch(&cid, fetch_path.to_str().unwrap()).await?;
@@ -649,7 +666,7 @@ async fn test_publish_fetch_cross_node() -> Result<(), String> {
             ));
         }
         
-        info!("✓ Cross-node fetch test passed - Node C fetched content from network");
+        info!("=== test_publish_fetch_cross_node === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -665,6 +682,7 @@ async fn test_content_health() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -699,7 +717,7 @@ async fn test_content_health() -> Result<(), String> {
             return Err("Published content not found in detailed list".to_string());
         }
         
-        info!("✓ Content health test passed");
+        info!("=== test_content_health === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         node.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
@@ -712,6 +730,7 @@ async fn test_node_stats() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -737,7 +756,7 @@ async fn test_node_stats() -> Result<(), String> {
             return Err("Node stats should not be empty".to_string());
         }
         
-        info!("✓ Node stats test passed");
+        info!("=== test_node_stats === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         node.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
@@ -750,6 +769,7 @@ async fn test_config_get_set() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(30);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -784,7 +804,7 @@ async fn test_config_get_set() -> Result<(), String> {
             return Err("Config should still be a JSON object after set attempt".to_string());
         }
         
-        info!("✓ Config get/set test passed");
+        info!("=== test_config_get_set === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         node.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
@@ -797,6 +817,7 @@ async fn test_three_nodes_pex_discovery() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Spawn Node A
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
@@ -829,7 +850,7 @@ async fn test_three_nodes_pex_discovery() -> Result<(), String> {
             if let Ok(peers_a) = node_a.connected_peers().await {
                 let c_id = node_c.peer_id.to_string();
                 if peers_a.iter().any(|id| id == &c_id) {
-                    info!("✓ PEX discovery successful - Node A discovered Node C in {:.1}s", start.elapsed().as_secs_f64());
+                    info!("=== test_three_nodes_pex_discovery === ✓ PEX discovery in {:.1}s", start.elapsed().as_secs_f64());
                     discovered = true;
                     break;
                 }
@@ -855,6 +876,7 @@ async fn test_extend_content() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -889,7 +911,7 @@ async fn test_extend_content() -> Result<(), String> {
                     .ok_or("Published content not found in updated list")?;
                 
                 info!("Updated content info: {}", updated_content);
-                info!("✓ Content extension test passed");
+                info!("=== test_extend_content === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
             },
             Err(e) => {
                 info!("Content extension failed: {}", e);
@@ -910,6 +932,7 @@ async fn test_pin_unpin() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -955,7 +978,7 @@ async fn test_pin_unpin() -> Result<(), String> {
         
         info!("Content after unpin: {}", unpinned_content);
         
-        info!("✓ Pin/unpin test passed");
+        info!("=== test_pin_unpin === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         node.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
@@ -968,6 +991,7 @@ async fn test_data_remove() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -1022,7 +1046,7 @@ async fn test_data_remove() -> Result<(), String> {
             info!("✓ Content completely removed from list");
         }
         
-        info!("✓ Data remove test passed");
+        info!("=== test_data_remove === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         node.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
@@ -1035,6 +1059,7 @@ async fn test_shutdown_rpc() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(30);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -1063,7 +1088,7 @@ async fn test_shutdown_rpc() -> Result<(), String> {
             }
         }
         
-        info!("✓ Shutdown RPC test passed");
+        info!("=== test_shutdown_rpc === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         // Don't call node.shutdown() since we've already shut down via RPC
         // Just clean up resources manually
@@ -1083,6 +1108,7 @@ async fn test_advanced_p2p_features() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // 3-node scenario: A publishes, B stores via push, C fetches + PEX discovers A
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
@@ -1116,7 +1142,7 @@ async fn test_advanced_p2p_features() -> Result<(), String> {
             return Err("Content mismatch in advanced P2P test".to_string());
         }
         
-        info!("✓ Advanced P2P features test passed");
+        info!("=== test_advanced_p2p_features === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         node_a.shutdown().await?;
         node_b.shutdown().await?;
         node_c.shutdown().await?;
@@ -1156,8 +1182,9 @@ async fn test_multi_node_fetch() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // 4-node test: A publishes → distributes to B,C → D joins later and fetches
-        // D connects to A (for manifest) + B (for pieces).
+        info!("=== test_multi_node_fetch === Step 1/5: Spawning nodes A, B, C...");
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
@@ -1168,6 +1195,7 @@ async fn test_multi_node_fetch() -> Result<(), String> {
         wait_for_connection(&node_a, &node_b, 30).await?;
         wait_for_connection(&node_a, &node_c, 30).await?;
         
+        info!("=== test_multi_node_fetch === Step 2/5: Publishing content ({:.1}s)...", start.elapsed().as_secs_f64());
         // Publish content on A — distribution pushes to B and C
         let original_content = b"Multi-node fetch test content - verifies cross-node reconstruction";
         let cid = node_a.publish(original_content).await?;
@@ -1185,7 +1213,8 @@ async fn test_multi_node_fetch() -> Result<(), String> {
             return Err("Neither B nor C received content after distribution".to_string());
         }
         
-        // Spawn Node D after distribution — connects to A (manifest) and B (pieces)
+        info!("=== test_multi_node_fetch === Step 3/5: Spawning Node D ({:.1}s)...", start.elapsed().as_secs_f64());
+        // Spawn Node D after distribution — connects to A (record) and B (pieces)
         let boot_b = node_b.get_boot_peer_addr().await?;
         let node_d = TestNode::spawn(3, vec![boot_a.clone(), boot_b]).await?;
         wait_for_connection(&node_a, &node_d, 30).await?;
@@ -1194,6 +1223,7 @@ async fn test_multi_node_fetch() -> Result<(), String> {
         // Wait for PieceMap sync (happens on connection via CapabilityRequest)
         sleep(Duration::from_secs(5)).await;
         
+        info!("=== test_multi_node_fetch === Step 4/5: Node D fetching ({:.1}s)...", start.elapsed().as_secs_f64());
         // D fetches content from network
         let fetch_path = node_d.data_dir.path().join("fetched_multi");
         let fetch_result = node_d.fetch(&cid, fetch_path.to_str().unwrap()).await?;
@@ -1206,7 +1236,7 @@ async fn test_multi_node_fetch() -> Result<(), String> {
             return Err(format!("Content mismatch: got {} bytes, expected {}", fetched.len(), original_content.len()));
         }
         
-        info!("✓ Multi-node fetch test passed");
+        info!("=== test_multi_node_fetch === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1225,6 +1255,7 @@ async fn test_new_node_join_equalization() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Spawn 3-node cluster
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
@@ -1267,7 +1298,7 @@ async fn test_new_node_join_equalization() -> Result<(), String> {
             info!("D fetch attempt: {:?}", fetch_result);
         }
         
-        info!("✓ New node join equalization test passed");
+        info!("=== test_new_node_join_equalization === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1286,6 +1317,7 @@ async fn test_node_churn_repair() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(300);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Spawn 3-node cluster
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
@@ -1328,7 +1360,7 @@ async fn test_node_churn_repair() -> Result<(), String> {
         let fetch_result = node_b.fetch(&cid, fetch_path.to_str().unwrap()).await;
         info!("Fetch after churn: {:?}", fetch_result);
         
-        info!("✓ Node churn repair test passed");
+        info!("=== test_node_churn_repair === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1345,6 +1377,7 @@ async fn test_demand_triggers_scaling() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
@@ -1375,7 +1408,7 @@ async fn test_demand_triggers_scaling() -> Result<(), String> {
         let final_health = node_b.content_health(&cid).await?;
         info!("Health after demand (B): {}", final_health);
         
-        info!("✓ Demand triggers scaling test passed");
+        info!("=== test_demand_triggers_scaling === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1392,6 +1425,7 @@ async fn test_homomorphic_hash_verification() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
@@ -1423,7 +1457,7 @@ async fn test_homomorphic_hash_verification() -> Result<(), String> {
             return Err("Content mismatch — hash verification may have been skipped".to_string());
         }
         
-        info!("✓ Homomorphic hash verification test passed (fetch succeeded = verification passed)");
+        info!("=== test_homomorphic_hash_verification === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1439,6 +1473,7 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
@@ -1460,7 +1495,7 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
         let receipts_b = node_b.rpc("receipts.count", None).await?;
         info!("Receipts on B: {}", receipts_b);
         
-        info!("✓ PDP challenge-response test passed (check logs for challenge details)");
+        info!("=== test_pdp_challenge_response === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1480,6 +1515,7 @@ async fn test_degradation() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Single publisher + single storage peer
         // All pieces go to node_b via round-robin (only 1 peer)
         let node_a = TestNode::spawn(0, vec![]).await?;
@@ -1552,7 +1588,7 @@ async fn test_degradation() -> Result<(), String> {
             ));
         }
         
-        info!("✓ Degradation test passed: pieces dropped from {} to {}", pieces_before, min_seen);
+        info!("=== test_degradation === ✓ PASSED in {:.1}s — pieces dropped from {} to {}", start.elapsed().as_secs_f64(), pieces_before, min_seen);
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1569,6 +1605,7 @@ async fn test_capability_exchange_on_connect() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
@@ -1626,7 +1663,7 @@ async fn test_capability_exchange_on_connect() -> Result<(), String> {
             }
         }
         
-        info!("✓ Capability exchange test passed");
+        info!("=== test_capability_exchange_on_connect === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1643,6 +1680,7 @@ async fn test_multi_segment_content() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Single node — test that multi-segment content publishes, stores, and
         // fetches correctly. Cross-node distribution is tested elsewhere.
         let node = TestNode::spawn(0, vec![]).await?;
@@ -1691,7 +1729,7 @@ async fn test_multi_segment_content() -> Result<(), String> {
             return Err("Content mismatch in multi-segment fetch".to_string());
         }
         
-        info!("✓ Multi-segment content test passed ({} bytes, {} segments verified)", fetched.len(), segments.len());
+        info!("=== test_multi_segment_content === ✓ PASSED in {:.1}s — {} bytes, {} segments", start.elapsed().as_secs_f64(), fetched.len(), segments.len());
         
         node.shutdown().await?;
         Ok(())
@@ -1707,6 +1745,7 @@ async fn test_pin_protection_during_eviction() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(90);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(2)).await;
         
@@ -1747,7 +1786,7 @@ async fn test_pin_protection_during_eviction() -> Result<(), String> {
         let health_a = node.content_health(&cid_a).await;
         info!("Health of pinned content: {:?}", health_a);
         
-        info!("✓ Pin protection during eviction test passed");
+        info!("=== test_pin_protection_during_eviction === ✓ PASSED in {:.1}s", start.elapsed().as_secs_f64());
         
         // Unpin before shutdown
         let _ = node.unpin(&cid_a).await;
@@ -1765,6 +1804,7 @@ async fn test_concurrent_publishes() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         // Spawn 3-node cluster
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
@@ -1822,7 +1862,7 @@ async fn test_concurrent_publishes() -> Result<(), String> {
         // Wait for distribution
         sleep(Duration::from_secs(10)).await;
         
-        info!("✓ Concurrent publishes test passed - all 3 CIDs unique and stored");
+        info!("=== test_concurrent_publishes === ✓ PASSED in {:.1}s — all 3 CIDs unique", start.elapsed().as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1847,6 +1887,7 @@ async fn test_large_file_transfer() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(300);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let size = 100 * 1024 * 1024;
         let start_gen = Instant::now();
         let original_content: Vec<u8> = (0..size).map(|i| ((i * 7 + 13) % 256) as u8).collect();
@@ -1905,8 +1946,8 @@ async fn test_large_file_transfer() -> Result<(), String> {
             return Err("SHA-256 mismatch".to_string());
         }
         
-        info!("✓ Large file transfer: 100MB verified, publish={:.1}s, dist={:.1}s, fetch={:.1}s",
-              publish_time.as_secs_f64(), dist_time.as_secs_f64(), fetch_time.as_secs_f64());
+        info!("=== test_large_file_transfer === ✓ PASSED in {:.1}s — 100MB verified, publish={:.1}s, dist={:.1}s, fetch={:.1}s",
+              start.elapsed().as_secs_f64(), publish_time.as_secs_f64(), dist_time.as_secs_f64(), fetch_time.as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1927,6 +1968,7 @@ async fn test_concurrent_stress() -> Result<(), String> {
     
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
@@ -1994,8 +2036,8 @@ async fn test_concurrent_stress() -> Result<(), String> {
             return Err(format!("Need ≥2 verified, got {}", verified));
         }
         
-        info!("✓ Concurrent stress: {}/3 verified, publish={:.1}s, fetch={:.1}s",
-              verified, publish_time.as_secs_f64(), fetch_time.as_secs_f64());
+        info!("=== test_concurrent_stress === ✓ PASSED in {:.1}s — {}/3 verified, publish={:.1}s, fetch={:.1}s",
+              start.elapsed().as_secs_f64(), verified, publish_time.as_secs_f64(), fetch_time.as_secs_f64());
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
