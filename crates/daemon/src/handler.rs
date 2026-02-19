@@ -544,12 +544,37 @@ impl CraftObjHandler {
         // This works even with few nodes where DHT routing tables are sparse
         let mut p2p_fetched = false;
         if let Some(ref command_tx) = self.command_tx {
-            // Step 1: Try to get manifest locally (storage nodes have it from manifest push)
+            // Step 1: Try to get manifest locally; fall back to verification record
             let local_manifest = {
                 let client = self.client.lock().await;
                 let manifest_path = client.store().data_dir().join("manifests").join(format!("{}.json", cid.to_hex()));
                 info!("[handler.rs] Checking manifest at {:?} (exists={})", manifest_path, manifest_path.exists());
-                client.store().get_manifest(&cid).ok()
+                match client.store().get_manifest(&cid) {
+                    Ok(m) => Some(m),
+                    Err(_) => {
+                        // No manifest — try verification record and derive manifest from it
+                        if let Ok(vr) = client.store().get_verification_record(&cid) {
+                            info!("[handler.rs] No manifest but found verification record for {}, deriving manifest from file_size={}", cid, vr.file_size);
+                            let config = craftec_erasure::ErasureConfig::default();
+                            let seg_count = vr.segment_count();
+                            let manifest = craftobj_core::ContentManifest {
+                                content_id: cid,
+                                content_hash: cid.0,
+                                segment_size: config.segment_size,
+                                piece_size: config.piece_size,
+                                segment_count: seg_count,
+                                total_size: vr.file_size,
+                                creator: String::new(),
+                                signature: vec![],
+                            };
+                            // Store synthetic manifest so reconstruct() can find it
+                            let _ = client.store().store_manifest(&manifest);
+                            Some(manifest)
+                        } else {
+                            None
+                        }
+                    }
+                }
             };
 
             if let Some(manifest) = local_manifest {
