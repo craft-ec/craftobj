@@ -587,13 +587,13 @@ mod tests {
     fn make_manifest(cid: ContentId) -> ContentManifest {
         ContentManifest {
             content_id: cid,
-            content_hash: cid.0,
-            segment_size: 10_485_760,
-            piece_size: 262_144,
-            segment_count: 1,
             total_size: 1000,
             creator: String::new(),
             signature: vec![],
+            verification: craftec_erasure::ContentVerificationRecord {
+                file_size: 1000,
+                segment_hashes: vec![],
+            },
         }
     }
 

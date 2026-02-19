@@ -49,59 +49,72 @@ impl std::fmt::Display for ContentId {
     }
 }
 
-/// Fixed segment size for RLNC erasure coding (10 MB).
-pub const SEGMENT_SIZE: usize = 10_485_760;
-
-/// Fixed piece size for RLNC erasure coding (100 KB).
-pub const PIECE_SIZE: usize = 102_400;
-
-/// Lightweight content record replacing the old manifest.
+/// Immutable manifest describing how to reconstruct content from RLNC-coded pieces.
+///
+/// Content is split into segments (default 10MB), each segment into pieces (default 100KB).
+/// k = segment_size / piece_size (number of source pieces per segment).
+/// Reconstruction requires k linearly independent coded pieces per segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContentRecord {
+pub struct ContentManifest {
+    /// Content ID (hash of original data, or ciphertext if encrypted).
     pub content_id: ContentId,
+    /// Final verification hash (SHA-256 of the content bytes).
+    pub content_hash: [u8; 32],
+    /// Size of each segment in bytes (default 10MB).
+    pub segment_size: usize,
+    /// Size of each piece in bytes (default 100KB).
+    pub piece_size: usize,
+    /// Number of segments the content was split into.
+    pub segment_count: usize,
+    /// Total size in bytes of the original content.
     pub total_size: u64,
+    /// Creator's DID string (e.g., `did:craftec:<hex_pubkey>`).
+    /// Empty string for unsigned manifests (backwards compat).
     #[serde(default)]
     pub creator: String,
+    /// Creator's ed25519 signature over the manifest (excluding this field).
     #[serde(default)]
     pub signature: Vec<u8>,
-    pub verification: craftec_erasure::ContentVerificationRecord,
 }
 
-/// Backwards-compat alias.
-pub type ContentManifest = ContentRecord;
-
-impl ContentRecord {
-    pub fn segment_count(&self) -> usize {
-        if self.total_size == 0 { return 0; }
-        ((self.total_size as usize) + SEGMENT_SIZE - 1) / SEGMENT_SIZE
+impl ContentManifest {
+    /// Number of source pieces per full segment (k = segment_size / piece_size).
+    pub fn k(&self) -> usize {
+        if self.piece_size == 0 {
+            return 0;
+        }
+        self.segment_size / self.piece_size
     }
-    pub fn k(&self) -> usize { SEGMENT_SIZE / PIECE_SIZE }
+
+    /// Number of source pieces for a specific segment (last segment may be smaller).
     pub fn k_for_segment(&self, segment_index: usize) -> usize {
-        let seg_count = self.segment_count();
-        if seg_count == 0 { return 0; }
-        if segment_index + 1 < seg_count {
-            SEGMENT_SIZE / PIECE_SIZE
+        if self.piece_size == 0 {
+            return 0;
+        }
+        if segment_index + 1 < self.segment_count {
+            // Full segment
+            self.segment_size / self.piece_size
         } else {
-            let remaining = self.total_size as usize - segment_index * SEGMENT_SIZE;
-            remaining.div_ceil(PIECE_SIZE).max(1)
+            // Last segment — may be partial
+            let remaining = self.total_size as usize - segment_index * self.segment_size;
+            remaining.div_ceil(self.piece_size).max(1)
         }
     }
-    pub fn last_segment_k(&self) -> usize {
-        let remainder = (self.total_size as usize) % SEGMENT_SIZE;
-        if remainder == 0 { self.k() } else { (remainder + PIECE_SIZE - 1) / PIECE_SIZE }
-    }
-    pub fn segment_size(&self) -> usize { SEGMENT_SIZE }
-    pub fn piece_size(&self) -> usize { PIECE_SIZE }
+
+    /// Data to sign: serialized manifest fields excluding the signature.
     pub fn signable_data(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&self.content_id.0);
+        data.extend_from_slice(&self.content_hash);
+        data.extend_from_slice(&self.segment_size.to_le_bytes());
+        data.extend_from_slice(&self.piece_size.to_le_bytes());
+        data.extend_from_slice(&self.segment_count.to_le_bytes());
         data.extend_from_slice(&self.total_size.to_le_bytes());
         data.extend_from_slice(self.creator.as_bytes());
-        let vr_bytes = bincode::serialize(&self.verification).unwrap_or_default();
-        let vr_hash = sha2::Sha256::digest(&vr_bytes);
-        data.extend_from_slice(&vr_hash);
         data
     }
+
+    /// Sign this manifest with the creator's keypair. Sets both `creator` and `signature`.
     pub fn sign(&mut self, keypair: &ed25519_dalek::SigningKey) {
         use ed25519_dalek::Signer;
         let pubkey = keypair.verifying_key();
@@ -110,13 +123,19 @@ impl ContentRecord {
         let sig = keypair.sign(&data);
         self.signature = sig.to_bytes().to_vec();
     }
+
+    /// Verify the creator's signature. Returns false if unsigned or invalid.
     pub fn verify_creator(&self) -> bool {
-        if self.creator.is_empty() || self.signature.len() != 64 { return false; }
+        if self.creator.is_empty() || self.signature.len() != 64 {
+            return false;
+        }
         let pubkey_bytes = match extract_pubkey_from_did(&self.creator) {
-            Some(b) => b, None => return false,
+            Some(b) => b,
+            None => return false,
         };
         let pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
-            Ok(k) => k, Err(_) => return false,
+            Ok(k) => k,
+            Err(_) => return false,
         };
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(&self.signature);
@@ -124,6 +143,8 @@ impl ContentRecord {
         let data = self.signable_data();
         pubkey.verify_strict(&data, &sig).is_ok()
     }
+
+    /// Extract creator's public key bytes from the DID, if present and valid.
     pub fn creator_pubkey(&self) -> Option<[u8; 32]> {
         extract_pubkey_from_did(&self.creator)
     }
@@ -868,35 +889,38 @@ mod tests {
     #[test]
     fn test_content_manifest_serde() {
         let cid = ContentId::from_bytes(b"test");
-        let manifest = ContentRecord {
+        let manifest = ContentManifest {
             content_id: cid,
+            content_hash: cid.0,
+            segment_size: 10_485_760,
+            piece_size: 262_144,
+            segment_count: 1,
             total_size: 1024,
             creator: String::new(),
             signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1024,
-                segment_hashes: vec![],
-            },
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: ContentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, manifest.content_id);
+        assert_eq!(parsed.content_hash, cid.0);
+        assert_eq!(parsed.segment_size, 10_485_760);
+        assert_eq!(parsed.piece_size, 262_144);
         assert_eq!(parsed.total_size, 1024);
     }
 
     #[test]
     fn test_content_manifest_k() {
-        let manifest = ContentRecord {
+        let manifest = ContentManifest {
             content_id: ContentId([0u8; 32]),
+            content_hash: [0u8; 32],
+            segment_size: 10_485_760,
+            piece_size: 262_144,
+            segment_count: 1,
             total_size: 10_485_760,
             creator: String::new(),
             signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 10_485_760,
-                segment_hashes: vec![],
-            },
         };
-        assert_eq!(manifest.k(), SEGMENT_SIZE / PIECE_SIZE);
+        assert_eq!(manifest.k(), 40);
     }
 
     #[test]
@@ -906,15 +930,15 @@ mod tests {
 
         let keypair = SigningKey::generate(&mut OsRng);
         let cid = ContentId::from_bytes(b"signed manifest test");
-        let mut manifest = ContentRecord {
+        let mut manifest = ContentManifest {
             content_id: cid,
+            content_hash: cid.0,
+            segment_size: 10_485_760,
+            piece_size: 262_144,
+            segment_count: 1,
             total_size: 2048,
             creator: String::new(),
             signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 2048,
-                segment_hashes: vec![],
-            },
         };
 
         manifest.sign(&keypair);
@@ -935,15 +959,15 @@ mod tests {
         let keypair1 = SigningKey::generate(&mut OsRng);
         let keypair2 = SigningKey::generate(&mut OsRng);
         let cid = ContentId::from_bytes(b"wrong key test");
-        let mut manifest = ContentRecord {
+        let mut manifest = ContentManifest {
             content_id: cid,
+            content_hash: cid.0,
+            segment_size: 10_485_760,
+            piece_size: 262_144,
+            segment_count: 1,
             total_size: 1024,
             creator: String::new(),
             signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1024,
-                segment_hashes: vec![],
-            },
         };
 
         manifest.sign(&keypair1);
@@ -954,15 +978,15 @@ mod tests {
     #[test]
     fn test_content_manifest_unsigned_verify_false() {
         let cid = ContentId::from_bytes(b"unsigned");
-        let manifest = ContentRecord {
+        let manifest = ContentManifest {
             content_id: cid,
+            content_hash: cid.0,
+            segment_size: 10_485_760,
+            piece_size: 262_144,
+            segment_count: 1,
             total_size: 1024,
             creator: String::new(),
             signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1024,
-                segment_hashes: vec![],
-            },
         };
         assert!(!manifest.verify_creator());
     }

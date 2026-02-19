@@ -517,15 +517,15 @@ mod tests {
         // Create a store with manifest + ≥2 pieces so we count as a provider
         let tmp = tempfile::tempdir().unwrap();
         let store = craftobj_store::FsStore::new(tmp.path()).unwrap();
-        let manifest = craftobj_core::ContentManifest {
+        let manifest = craftobj_core::ContentRecord {
             content_id: cid,
-            content_hash: cid.0,
-            segment_size: 10_485_760,
-            piece_size: 262_144,
-            segment_count: 1,
             total_size: 200,
             creator: String::new(),
             signature: vec![],
+            verification: craftec_erasure::ContentVerificationRecord {
+                file_size: 200,
+                segment_hashes: vec![],
+            },
         };
         store.store_manifest(&manifest).unwrap();
         let piece_data = vec![0u8; 100];

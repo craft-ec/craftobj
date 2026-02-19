@@ -440,13 +440,13 @@ mod tests {
         let cid = ContentId::from_bytes(b"test");
         let manifest = ContentManifest {
             content_id: cid,
-            content_hash: cid.0,
-            segment_size: 10_485_760,
-            piece_size: 262_144,
-            segment_count: 1,
             total_size: 1024,
             creator: String::new(),
             signature: vec![],
+            verification: craftec_erasure::ContentVerificationRecord {
+                file_size: 1024,
+                segment_hashes: vec![],
+            },
         };
         let value = serde_json::to_vec(&manifest).unwrap();
         let parsed = parse_manifest_record(&value).unwrap();
