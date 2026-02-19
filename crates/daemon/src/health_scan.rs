@@ -479,10 +479,21 @@ impl HealthScan {
             let mut seg_snapshots = Vec::new();
             let mut min_ratio = f64::MAX;
 
+            // Look up the manifest to get the actual k per segment.
+            // Fall back to SEGMENT_SIZE / PIECE_SIZE (103) if manifest not found.
+            let manifest = {
+                let s = self.store.lock().await;
+                s.get_record(cid).ok()
+            };
+            let default_k = craftobj_core::SEGMENT_SIZE.div_ceil(craftobj_core::PIECE_SIZE);
+
             for &seg in segments {
                 let rank = map.compute_rank(cid, seg, true);
                 let _total_pieces = map.segment_pieces(cid, seg);
-                let k = 40_usize; // default k for 10MiB segments with 256KiB pieces
+                let k = manifest
+                    .as_ref()
+                    .map(|m| m.k_for_segment(seg as usize))
+                    .unwrap_or(default_k);
                 let providers = map
                     .pieces_for_segment(cid, seg)
                     .iter()
