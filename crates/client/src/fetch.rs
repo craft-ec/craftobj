@@ -755,16 +755,16 @@ mod tests {
         }
     }
 
-    fn make_manifest(total_size: u64, _segment_count: usize) -> ContentManifest {
+    fn make_manifest(total_size: u64, segment_count: usize) -> ContentManifest {
         ContentManifest {
             content_id: ContentId::from_bytes(&[0u8; 32]),
+            content_hash: [0u8; 32],
+            segment_size: 1_000, // 1KB segments for testing
+            piece_size: 100,     // 100B pieces -> k=10
+            segment_count,
             total_size,
             creator: String::new(),
             signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: total_size,
-                segment_hashes: vec![],
-            },
         }
     }
 
