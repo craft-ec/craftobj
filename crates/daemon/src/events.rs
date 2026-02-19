@@ -29,10 +29,6 @@ pub enum DaemonEvent {
     ProviderAnnounced { content_id: String },
     ContentReannounced { content_id: String },
 
-    // -- Receipts --
-    StorageReceiptReceived { content_id: String, storage_node: String },
-    RemovalNoticeReceived { content_id: String, creator: String, valid: bool },
-
     // -- Actions (user-initiated) --
     ContentPublished { content_id: String, size: u64, segments: usize, pieces_per_segment: usize },
     AccessGranted { content_id: String, recipient: String },
@@ -63,15 +59,12 @@ pub enum DaemonEvent {
     // -- Distribution --
     ContentDistributed { content_id: String, pieces_pushed: usize, total_pieces: usize, target_peers: usize },
     DistributionProgress { content_id: String, pieces_pushed: usize, total_pieces: usize, peers_active: usize },
-    DistributionSkipped { reason: String, retry_secs: u64 },
-
     // -- Maintenance --
     MaintenanceCycleStarted { content_count: usize, needs_announce: usize, needs_distribute: usize },
     MaintenanceCycleCompleted { announced: usize, distributed: usize, next_run_secs: u64 },
 
     // -- PDP --
     ChallengerRoundCompleted { rounds: u32 },
-    PieceRequested { content_id: String, peer_id: String, segment: u32 },
 
     // -- Eviction / Retirement --
     ContentEvicted { content_id: String, reason: String },
@@ -88,9 +81,6 @@ pub enum DaemonEvent {
     // -- Peer lifecycle --
     PeerGoingOffline { peer_id: String },
     PeerHeartbeatTimeout { peer_id: String },
-
-    // -- Transfer errors --
-    TransferError { content_id: String, peer_id: String, error_type: String, message: String },
 
     // -- Storage pressure --
     StoragePressure { available_bytes: u64, threshold_bytes: u64 },
