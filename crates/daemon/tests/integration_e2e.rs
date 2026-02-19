@@ -1446,23 +1446,35 @@ async fn test_capability_exchange_on_connect() -> Result<(), String> {
         // Wait for capability exchange (happens automatically on ConnectionEstablished, 500ms delay)
         sleep(Duration::from_secs(3)).await;
         
-        // Check A's peer list — should show B with capabilities
-        let peers_a = node_a.peers().await?;
-        info!("Node A peers: {:?}", peers_a);
+        // Check A's peer scorer — should show B with capabilities
+        // peers RPC returns {peer_id: {capabilities, score, ...}} object
+        let peers_a = node_a.rpc("peers", None).await?;
+        info!("Node A peers: {}", peers_a);
         
-        // Check B's peer list — should show A with capabilities
-        let peers_b = node_b.peers().await?;
-        info!("Node B peers: {:?}", peers_b);
+        let peers_b = node_b.rpc("peers", None).await?;
+        info!("Node B peers: {}", peers_b);
         
-        // Verify at least one peer has capabilities reported
-        let a_sees_b = peers_a.iter().any(|p| {
-            p["peer_id"].as_str().map_or(false, |id| id == node_b.peer_id.to_string())
-        });
-        let b_sees_a = peers_b.iter().any(|p| {
-            p["peer_id"].as_str().map_or(false, |id| id == node_a.peer_id.to_string())
-        });
+        // Verify peer_scorer has the other node with capabilities
+        let b_id = node_b.peer_id.to_string();
+        let a_id = node_a.peer_id.to_string();
+        let a_sees_b = peers_a.get(&b_id).is_some();
+        let b_sees_a = peers_b.get(&a_id).is_some();
         
-        info!("A sees B in peers: {}, B sees A in peers: {}", a_sees_b, b_sees_a);
+        info!("A sees B in peer_scorer: {}, B sees A in peer_scorer: {}", a_sees_b, b_sees_a);
+        
+        // Verify capabilities were exchanged
+        if a_sees_b {
+            let b_caps = &peers_a[&b_id]["capabilities"];
+            info!("A sees B capabilities: {}", b_caps);
+            let has_storage = b_caps.as_array().map_or(false, |arr| arr.iter().any(|c| {
+                c.as_str().map_or(false, |s| s.eq_ignore_ascii_case("storage"))
+            }));
+            if !has_storage {
+                return Err("A should see B's storage capability".to_string());
+            }
+        } else {
+            return Err("A's peer_scorer should contain B after capability exchange".to_string());
+        }
         
         // Also check node.capabilities RPC which returns own capabilities
         let caps_a = node_a.rpc("node.capabilities", None).await?;
@@ -1474,8 +1486,8 @@ async fn test_capability_exchange_on_connect() -> Result<(), String> {
         // Both nodes should report client+storage capabilities (set in TestNode::spawn)
         let a_caps = caps_a["capabilities"].as_array();
         if let Some(caps) = a_caps {
-            let has_storage = caps.iter().any(|c| c.as_str() == Some("storage"));
-            let has_client = caps.iter().any(|c| c.as_str() == Some("client"));
+            let has_storage = caps.iter().any(|c| c.as_str().map_or(false, |s| s.eq_ignore_ascii_case("storage")));
+            let has_client = caps.iter().any(|c| c.as_str().map_or(false, |s| s.eq_ignore_ascii_case("client")));
             if !has_storage || !has_client {
                 return Err(format!("Node A missing expected capabilities: {:?}", caps));
             }
