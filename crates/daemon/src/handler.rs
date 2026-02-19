@@ -953,6 +953,17 @@ impl CraftObjHandler {
             client.store().get_record(&cid).map_err(|e| e.to_string())?
         };
 
+        // Snapshot pieces before extend so we can emit PieceStored events for new ones
+        let pieces_before: std::collections::HashMap<u32, std::collections::HashSet<[u8; 32]>> = {
+            let client = self.client.lock().await;
+            let mut before = std::collections::HashMap::new();
+            for seg in 0..manifest.segment_count() as u32 {
+                let ids = client.store().list_pieces(&cid, seg).unwrap_or_default();
+                before.insert(seg, ids.into_iter().collect());
+            }
+            before
+        };
+
         // Generate new pieces via recombination for each segment
         let result = {
             let client = self.client.lock().await;
@@ -961,6 +972,39 @@ impl CraftObjHandler {
 
         if result.pieces_generated == 0 {
             return Err(format!("failed to generate new pieces: {:?}", result.errors));
+        }
+
+        // Emit PieceStored events to PieceMap for newly generated pieces
+        if let Some(ref pm) = self.piece_map {
+            let client = self.client.lock().await;
+            let local_node = self.local_peer_id.map(|p| p.to_bytes().to_vec()).unwrap_or_default();
+            let mut map = pm.lock().await;
+            for seg in 0..manifest.segment_count() as u32 {
+                let ids_after = client.store().list_pieces(&cid, seg).unwrap_or_default();
+                let before_set = pieces_before.get(&seg).cloned().unwrap_or_default();
+                for pid in ids_after {
+                    if !before_set.contains(&pid) {
+                        if let Ok((_data, coefficients)) = client.store().get_piece(&cid, seg, &pid) {
+                            let seq = map.next_seq();
+                            let stored = craftobj_core::PieceStored {
+                                node: local_node.clone(),
+                                cid,
+                                segment: seg,
+                                piece_id: pid,
+                                coefficients,
+                                seq,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                signature: vec![],
+                            };
+                            map.apply_event(&craftobj_core::PieceEvent::Stored(stored));
+                        }
+                    }
+                }
+                map.track_segment(cid, seg);
+            }
         }
 
         // Announce as provider
