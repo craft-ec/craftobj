@@ -1106,10 +1106,14 @@ async fn drive_swarm(
                     let mut stream = msg.stream;
                     let seq_id = msg.seq_id;
                     let peer = msg.peer;
+                    let stream_return_tx = msg.stream_return_tx;
                     tokio::spawn(async move {
                         match craftobj_transfer::wire::write_response_frame(&mut stream, seq_id, &response).await {
                             Ok(()) => debug!("[service.rs] Sent CapabilityResponse to {} seq={}", peer, seq_id),
                             Err(e) => debug!("[service.rs] Failed CapabilityResponse to {} seq={}: {}", peer, seq_id, e),
+                        }
+                        if let Some(tx) = stream_return_tx {
+                            let _ = tx.send(stream);
                         }
                     });
                     continue;
@@ -1127,16 +1131,25 @@ async fn drive_swarm(
                 let peer = msg.peer;
                 let seq_id = msg.seq_id;
                 let mut stream = msg.stream;
+                let stream_return_tx = msg.stream_return_tx;
                 tokio::spawn(async move {
+                    let handler_start = std::time::Instant::now();
+                    let req_type = format!("{:?}", std::mem::discriminant(&msg.request));
+                    info!("[handler] START peer={} seq={} type={}", &peer.to_string()[..8], seq_id, req_type);
                     let response = handle_incoming_transfer_request(
                         &peer, msg.request, &store_clone, &ct_clone, &proto_clone, &dt_clone,
                         &pm_clone, sk_clone.as_ref(), &cmd_tx_clone,
                     ).await;
-                    info!("[service.rs] Spawned handler done for {} seq={}: {:?}", peer, seq_id, std::mem::discriminant(&response));
-                    // Write response back on the SAME stream the request came from
+                    let handle_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
+                    info!("[handler] DONE peer={} seq={} handle_ms={:.1} resp={:?}", &peer.to_string()[..8], seq_id, handle_ms, std::mem::discriminant(&response));
+                    let write_start = std::time::Instant::now();
                     match craftobj_transfer::wire::write_response_frame(&mut stream, seq_id, &response).await {
-                        Ok(()) => info!("[service.rs] Wrote response to {} seq={}", peer, seq_id),
-                        Err(e) => warn!("[service.rs] Failed to write response to {} seq={}: {}", peer, seq_id, e),
+                        Ok(()) => info!("[handler] WRITE OK peer={} seq={} write_ms={:.1}", &peer.to_string()[..8], seq_id, write_start.elapsed().as_secs_f64() * 1000.0),
+                        Err(e) => warn!("[handler] WRITE FAILED peer={} seq={} write_ms={:.1}: {}", &peer.to_string()[..8], seq_id, write_start.elapsed().as_secs_f64() * 1000.0, e),
+                    }
+                    // Return stream for reuse if persistent stream
+                    if let Some(tx) = stream_return_tx {
+                        let _ = tx.send(stream);
                     }
                 });
             }
@@ -1552,6 +1565,13 @@ async fn handle_incoming_transfer_request(
             }
             
             info!("[service.rs] Batch push result: {}/{} confirmed", confirmed.len(), confirmed.len() + failed.len());
+            
+            // Announce as DHT provider if we stored any pieces
+            if !confirmed.is_empty() {
+                let pkey = craftobj_routing::providers_dht_key(&content_id);
+                let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
+            }
+            
             CraftObjResponse::BatchAck { confirmed_pieces: confirmed, failed_pieces: failed }
         }
         CraftObjRequest::CapabilityRequest => {
@@ -1658,8 +1678,8 @@ async fn handle_command(
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (5s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+                info!("[service.rs] PieceSync sent to outbound queue for {}, waiting for ack (60s timeout)", peer_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(60), ack_rx).await {
                     Ok(Ok(response)) => { 
                         let desc = match &response {
                             craftobj_transfer::CraftObjResponse::PieceBatch { pieces } => format!("{} pieces", pieces.len()),
@@ -1673,7 +1693,7 @@ async fn handle_command(
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => { 
-                        warn!("[service.rs] PieceSync to {}: timed out after 5s", peer_id);
+                        warn!("[service.rs] PieceSync to {}: timed out after 60s", peer_id);
                         let _ = reply_tx.send(Err("piece sync timed out".into())); 
                     }
                 }

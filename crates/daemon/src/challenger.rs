@@ -42,6 +42,7 @@ pub const MAX_PROVIDERS_PER_CID: usize = 5;
 struct ProvidedCid {
     last_challenged: Option<Instant>,
     tier_info: Option<TierInfo>,
+    registered_at: Instant,
 }
 
 /// Manages the challenger duty cycle for all CIDs this node provides.
@@ -124,6 +125,7 @@ impl ChallengerManager {
         self.provided_cids.entry(cid).or_insert(ProvidedCid {
             last_challenged: None,
             tier_info,
+            registered_at: Instant::now(),
         });
         self.online_tracker.observe(cid, self.local_peer_id);
     }
@@ -375,12 +377,19 @@ impl ChallengerManager {
             ranks.insert(cid, (k, rank_map.clone()));
         }
 
-        // Heal if needed — HealthScan handles network-wide repair via PieceMap,
-        // but challenger still heals locally for its own pieces.
-        let healing = if health.needs_healing && health.pieces_needed > 0 {
-            info!("Healing {} — generating {} new pieces locally", cid, health.pieces_needed);
+        // Heal if needed — generate at most 1 piece per segment.
+        // RLNC: each node creates 1 new piece and pushes it. The network self-heals
+        // organically — no single node should bulk-generate hundreds of pieces.
+        // Skip healing for content registered < 120s ago — still being distributed.
+        let recently_registered = self.provided_cids.get(&cid)
+            .map(|s| s.registered_at.elapsed().as_secs() < 120)
+            .unwrap_or(false);
+        let healing = if health.needs_healing && health.pieces_needed > 0 && !recently_registered {
+            // Cap at 1 piece per segment (not pieces_needed which can be 100+)
+            let max_heal = manifest.segment_count().min(health.pieces_needed);
+            info!("Healing {} — generating up to {} pieces (1/segment, need {})", cid, max_heal, health.pieces_needed);
 
-            let result = health::heal_content(store, &manifest, health.pieces_needed);
+            let result = health::heal_content(store, &manifest, max_heal);
             // Rebuild Merkle tree after healing added new pieces
             if result.pieces_generated > 0 {
                 if let Some(ref mt) = self.merkle_tree {

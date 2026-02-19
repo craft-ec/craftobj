@@ -414,10 +414,8 @@ pub async fn run_initial_push(
                     }
                 }
 
-                // Add small delay between batches to same peer to avoid overwhelming
-                if batch_idx + 1 < total_batches {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+                // No delay between batches — backpressure from ack-wait is sufficient.
+                // The sender waits for each batch ack before sending the next one.
             }
 
             info!("[reannounce.rs] Peer {} completed: {} successes, {} failures", 

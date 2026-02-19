@@ -1073,23 +1073,27 @@ impl CraftObjHandler {
             let mut provider_failures: HashMap<libp2p::PeerId, u32> = HashMap::new();
 
             // Track which pieces we have (for exclude-list in PieceSync)
-            let have_piece_ids: Vec<[u8; 32]> = local_piece_ids.clone();
+            let have_piece_ids: std::sync::Arc<tokio::sync::Mutex<Vec<[u8; 32]>>> = 
+                std::sync::Arc::new(tokio::sync::Mutex::new(local_piece_ids.clone()));
+
+            let seg_start = std::time::Instant::now();
 
             // Launch initial batch
             for _ in 0..concurrency {
                 let provider = provider_iter.next().unwrap();
                 let cmd_tx = command_tx.clone();
-                let have_piece_ids = have_piece_ids.clone();
-                info!("[handler.rs] Sending PieceSync to {} for seg{} (have {} pieces, need {})", provider, seg_idx, have_piece_ids.len(), needed);
+                let have_ids = have_piece_ids.clone();
+                info!("[fetch] seg{} initial PieceSync to {} (need {} pieces)", seg_idx, &provider.to_string()[..8], needed);
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
+                    let have = have_ids.lock().await.clone();
                     let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftObjResponse, String>>();
                     let command = CraftObjCommand::PieceSync {
                         peer_id: provider,
                         content_id: cid,
                         segment_index: seg_idx,
                         merkle_root: [0u8; 32],
-                        have_pieces: have_piece_ids.clone(),
+                        have_pieces: have,
                         max_pieces: needed as u16,
                         reply_tx,
                     };
@@ -1192,7 +1196,9 @@ impl CraftObjHandler {
                                         current_rank = new_rank;
                                         total_fetched += 1;
                                         any_stored = true;
-                                        info!("[handler.rs] Stored piece from {} for seg{}: rank now {}/{}", provider, seg_idx, current_rank, k);
+                                        // Track stored piece so future requests exclude it
+                                        have_piece_ids.lock().await.push(piece_id);
+                                        info!("[fetch] seg{} stored piece from {}: rank {}/{} ({:.1}ms elapsed)", seg_idx, &provider.to_string()[..8], current_rank, k, seg_start.elapsed().as_secs_f64() * 1000.0);
 
                                         if current_rank >= k {
                                             info!("[handler.rs] Segment {} complete: rank {}/{}", seg_idx, current_rank, k);
@@ -1226,6 +1232,7 @@ impl CraftObjHandler {
 
                 // Spawn a replacement request if we still need more pieces
                 if current_rank < k {
+                    let still_needed = (k - current_rank) as u16;
                     // Pick next provider, skip those with too many failures
                     let mut attempts = 0;
                     while attempts < ranked_providers.len() {
@@ -1233,16 +1240,19 @@ impl CraftObjHandler {
                         let fail_count = provider_failures.get(&next_provider).copied().unwrap_or(0);
                         if fail_count < 3 {
                             let cmd_tx = command_tx.clone();
+                            let have_ids = have_piece_ids.clone();
+                            info!("[fetch] seg{} retry PieceSync to {} (still need {} pieces)", seg_idx, &next_provider.to_string()[..8], still_needed);
                             join_set.spawn(async move {
                                 let start = std::time::Instant::now();
+                                let have = have_ids.lock().await.clone();
                                 let (reply_tx, reply_rx) = oneshot::channel::<Result<craftobj_transfer::CraftObjResponse, String>>();
                                 let command = CraftObjCommand::PieceSync {
                                     peer_id: next_provider,
                                     content_id: cid,
                                     segment_index: seg_idx,
                                     merkle_root: [0u8; 32],
-                                    have_pieces: vec![],
-                                    max_pieces: 1,
+                                    have_pieces: have,
+                                    max_pieces: still_needed,
                                     reply_tx,
                                 };
                                 if cmd_tx.send(command).is_err() {
@@ -1274,11 +1284,12 @@ impl CraftObjHandler {
 
             if current_rank < k {
                 warn!(
-                    "[handler.rs] Segment {} incomplete: got {}/{} independent pieces after {} requests",
-                    seg_idx, current_rank, k, requests_launched
+                    "[fetch] seg{} INCOMPLETE: {}/{} after {} requests, {:.1}s",
+                    seg_idx, current_rank, k, requests_launched, seg_start.elapsed().as_secs_f64()
                 );
                 return Err(format!("Segment {} incomplete: {}/{}", seg_idx, current_rank, k));
             }
+            info!("[fetch] seg{} COMPLETE: rank {}/{}, {} requests, {:.1}s", seg_idx, current_rank, k, requests_launched, seg_start.elapsed().as_secs_f64());
             let _ = total_fetched;
             Ok(())
             }); // end segment_join_set.spawn
