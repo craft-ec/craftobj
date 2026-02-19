@@ -108,7 +108,8 @@ impl HealthScan {
 
     /// Set custom tier target (default 1.5).
     pub fn set_tier_target(&mut self, target: f64) {
-        self.tier_target = target;
+        // Minimum 1.5x — below 1.0 is unrecoverable, 1.0-1.5 has no safety margin
+        self.tier_target = target.max(1.5);
     }
 
     /// Set custom scan interval.
@@ -851,6 +852,8 @@ mod tests {
         let mut scan = HealthScan::new(pm, store, dt, local, tx);
         scan.set_tier_target(2.0);
         assert_eq!(scan.tier_target, 2.0);
+        scan.set_tier_target(1.0); // below minimum, should clamp to 1.5
+        assert_eq!(scan.tier_target, 1.5);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -879,14 +882,14 @@ mod tests {
         let (pm, store, dt, local, dir) = setup_test();
         let tx = make_tx();
         let mut scan = HealthScan::new(pm.clone(), store.clone(), dt, local, tx);
-        scan.set_tier_target(1.2); // k=3, target_pieces = ceil(3*1.2) = 4
+        // tier_target = 1.5 (minimum). k=3, target_pieces = ceil(3*1.5) = 5.
 
         let cid = ContentId([1u8; 32]);
         let local_bytes = local.to_bytes().to_vec();
         let remote_node = vec![99u8; 38]; // simulated remote peer
 
         // k=3. Local has 3 pieces, remote has 3 pieces = 6 total network pieces.
-        // target_pieces = ceil(3 * 1.2) = 4. 6 > 4 → over-replicated → degrade.
+        // target_pieces = 5. 6 > 5 → over-replicated → degrade.
         {
             let s = store.lock().await;
             let mut map = pm.lock().await;
@@ -951,7 +954,7 @@ mod tests {
         let (pm, store, dt, local, dir) = setup_test();
         let tx = make_tx();
         let mut scan = HealthScan::new(pm.clone(), store.clone(), dt.clone(), local, tx);
-        scan.set_tier_target(1.2); // k=3, target_pieces=4, network=6 > 4 → would degrade without demand
+        // tier_target = 1.5 (minimum). k=3, target_pieces=5, network=6 > 5 → would degrade without demand
 
         let cid = ContentId([1u8; 32]);
         let local_bytes = local.to_bytes().to_vec();
