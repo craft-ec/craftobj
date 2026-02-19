@@ -1141,7 +1141,7 @@ impl CraftObjHandler {
                                         }
                                         // Publish DHT provider record for this CID+segment
                                         {
-                                            let pkey = craftobj_routing::provider_key(&cid, seg_idx);
+                                            let pkey = craftobj_routing::providers_dht_key(&cid);
                                             let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
                                         }
                                         coeff_matrix.push(coefficients);

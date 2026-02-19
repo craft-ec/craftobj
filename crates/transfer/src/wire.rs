@@ -27,6 +27,8 @@ const TYPE_MERKLE_ROOT_RESPONSE: u8 = 0x84;
 const TYPE_MERKLE_DIFF_RESPONSE: u8 = 0x85;
 const TYPE_PDP_PROOF: u8 = 0x86;
 const TYPE_PEX_EXCHANGE_RESPONSE: u8 = 0x87;
+const TYPE_CAPABILITY_REQUEST: u8 = 0x09;
+const TYPE_CAPABILITY_RESPONSE: u8 = 0x88;
 
 /// Maximum frame payload (50 MB).
 const MAX_FRAME_PAYLOAD: usize = 50 * 1024 * 1024;
@@ -90,11 +92,11 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
     }
 
     match ty[0] {
-        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE => {
+        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE | TYPE_CAPABILITY_REQUEST => {
             let request = deserialize_request(ty[0], &payload)?;
             Ok(StreamFrame::Request { seq_id, request })
         }
-        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF | TYPE_PEX_EXCHANGE_RESPONSE => {
+        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF | TYPE_PEX_EXCHANGE_RESPONSE | TYPE_CAPABILITY_RESPONSE => {
             let response = deserialize_response(ty[0], &payload)?;
             Ok(StreamFrame::Response { seq_id, response })
         }
@@ -215,6 +217,9 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
         CraftObjRequest::PexExchange { payload } => {
             Ok((TYPE_PEX_EXCHANGE, payload.clone()))
         }
+        CraftObjRequest::CapabilityRequest => {
+            Ok((TYPE_CAPABILITY_REQUEST, vec![]))
+        }
     }
 }
 
@@ -289,6 +294,9 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
         TYPE_PEX_EXCHANGE => {
             Ok(CraftObjRequest::PexExchange { payload: payload.to_vec() })
         }
+        TYPE_CAPABILITY_REQUEST => {
+            Ok(CraftObjRequest::CapabilityRequest)
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown request type: 0x{:02x}", msg_type),
@@ -346,6 +354,15 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
         CraftObjResponse::PexExchangeResponse { payload } => {
             Ok((TYPE_PEX_EXCHANGE_RESPONSE, payload.clone()))
         }
+        CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region } => {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "capabilities": capabilities,
+                "storage_committed_bytes": storage_committed_bytes,
+                "storage_used_bytes": storage_used_bytes,
+                "region": region,
+            })).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_CAPABILITY_RESPONSE, payload))
+        }
     }
 }
 
@@ -395,6 +412,18 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResp
         }
         TYPE_PEX_EXCHANGE_RESPONSE => {
             Ok(CraftObjResponse::PexExchangeResponse { payload: payload.to_vec() })
+        }
+        TYPE_CAPABILITY_RESPONSE => {
+            let v: serde_json::Value = serde_json::from_slice(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjResponse::CapabilityResponse {
+                capabilities: v["capabilities"].as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default(),
+                storage_committed_bytes: v["storage_committed_bytes"].as_u64().unwrap_or(0),
+                storage_used_bytes: v["storage_used_bytes"].as_u64().unwrap_or(0),
+                region: v["region"].as_str().map(String::from),
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

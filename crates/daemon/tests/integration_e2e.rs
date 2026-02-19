@@ -231,7 +231,7 @@ impl TestNode {
     async fn fetch(&self, cid: &str, output_path: &str) -> Result<Value, String> {
         let params = json!({
             "cid": cid,
-            "output_path": output_path
+            "output": output_path
         });
         self.rpc("fetch", Some(params)).await
     }
@@ -582,55 +582,65 @@ async fn test_node_spawn_shutdown() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore = "Cross-node fetch requires provider resolution via DHT"]
 async fn test_publish_fetch_cross_node() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_publish_fetch_cross_node ===");
     
     let timeout_duration = Duration::from_secs(120);
     timeout(timeout_duration, async {
-        // Spawn Node A
+        // 3-node test: A publishes → B stores (via push) → C fetches from network
+        
+        // Spawn Node A (publisher)
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(3)).await;
         
-        // Get boot peer address and spawn Node B
-        let boot_addr = node_a.get_boot_peer_addr().await?;
-        let node_b = TestNode::spawn(1, vec![boot_addr]).await?;
-        
-        // Wait for connection
+        // Spawn Node B (storage) connected to A
+        let boot_addr_a = node_a.get_boot_peer_addr().await?;
+        let node_b = TestNode::spawn(1, vec![boot_addr_a.clone()]).await?;
         wait_for_connection(&node_a, &node_b, 30).await?;
         
-        // Node A publishes content
+        // Node A publishes content — triggers distribution to B
         let original_content = b"Cross-node fetch test content for CraftOBJ P2P verification";
         let cid = node_a.publish(original_content).await?;
         
-        // Wait for DHT announcement to propagate
-        sleep(Duration::from_secs(10)).await;
+        // Wait for distribution: A pushes pieces to B, B announces as provider
+        sleep(Duration::from_secs(15)).await;
         
-        // Node B tries to fetch the content
-        let fetch_path = node_b.data_dir.path().join("fetched_content");
-        let fetch_result = node_b.fetch(&cid, fetch_path.to_str().unwrap()).await;
+        // Verify B received the content via push distribution
+        let list_b = node_b.list().await?;
+        let b_has_content = list_b.as_array()
+            .map(|arr| arr.iter().any(|c| c["content_id"].as_str().map_or(false, |id| id == cid)))
+            .unwrap_or(false);
+        info!("Node B has content after distribution: {}", b_has_content);
         
-        match fetch_result {
-            Ok(_) => {
-                // Verify fetched content matches original
-                let fetched_content = std::fs::read(&fetch_path)
-                    .map_err(|e| format!("Failed to read fetched file: {}", e))?;
-                    
-                if fetched_content == original_content {
-                    info!("✓ Cross-node fetch test passed - content matches");
-                } else {
-                    return Err("Fetched content does not match original".to_string());
-                }
-            },
-            Err(e) => {
-                info!("Cross-node fetch failed (expected until provider resolution is implemented): {}", e);
-                // This is expected to fail until provider resolution via DHT is working
-            }
+        // Spawn Node C (fetcher) — connected to B so it can find B's provider records
+        let boot_addr_b = node_b.get_boot_peer_addr().await?;
+        let node_c = TestNode::spawn(2, vec![boot_addr_b]).await?;
+        wait_for_connection(&node_b, &node_c, 30).await?;
+        // Wait for Kademlia provider records to propagate
+        sleep(Duration::from_secs(5)).await;
+        
+        // Node C fetches the content from the network (should resolve providers via DHT)
+        let fetch_path = node_c.data_dir.path().join("fetched_content");
+        let fetch_result = node_c.fetch(&cid, fetch_path.to_str().unwrap()).await?;
+        info!("Fetch result from Node C: {}", fetch_result);
+        
+        // Verify fetched content matches original
+        let fetched_content = std::fs::read(&fetch_path)
+            .map_err(|e| format!("Failed to read fetched file: {}", e))?;
+            
+        if fetched_content != original_content {
+            return Err(format!(
+                "Fetched content does not match original (got {} bytes, expected {} bytes)",
+                fetched_content.len(), original_content.len()
+            ));
         }
+        
+        info!("✓ Cross-node fetch test passed - Node C fetched content from network");
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
+        node_c.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
 }
@@ -768,7 +778,6 @@ async fn test_config_get_set() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore = "PEX discovery requires implementation of peer exchange protocol"]
 async fn test_three_nodes_pex_discovery() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_three_nodes_pex_discovery ===");

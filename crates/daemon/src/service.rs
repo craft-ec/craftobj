@@ -329,6 +329,7 @@ pub async fn run_daemon_with_config(
     handler.set_settlement_client(settlement_client);
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
+    let daemon_config_for_swarm = daemon_config_shared.clone();
     handler.set_daemon_config(daemon_config_shared, data_dir.clone());
     handler.set_eviction_manager(eviction_manager.clone());
     handler.set_event_sender(event_tx.clone());
@@ -493,7 +494,7 @@ pub async fn run_daemon_with_config(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, piece_map.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, piece_map.clone(), daemon_config_for_swarm.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
@@ -632,7 +633,7 @@ async fn eviction_maintenance_loop(
                 }
                 // Remove DHT provider records and untrack all segments for this removed CID
                 for seg in segments_seen {
-                    let pkey = craftobj_routing::provider_key(cid, seg);
+                    let pkey = craftobj_routing::providers_dht_key(cid);
                     let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
@@ -756,7 +757,7 @@ async fn gc_loop(
                         map.apply_event(&event);
                     }
                     // Remove DHT provider record and untrack segment after dropping all pieces
-                    let pkey = craftobj_routing::provider_key(cid, seg);
+                    let pkey = craftobj_routing::providers_dht_key(cid);
                     let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
@@ -804,6 +805,7 @@ async fn drive_swarm(
     receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     max_peer_connections: usize,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
+    daemon_config: Arc<Mutex<crate::config::DaemonConfig>>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
@@ -862,6 +864,41 @@ async fn drive_swarm(
                             address: endpoint.get_remote_address().to_string(),
                             total_peers: total,
                         });
+                        // Request capabilities from newly connected peer
+                        {
+                            let tx = outbound_tx.clone();
+                            let ps = peer_scorer.clone();
+                            tokio::spawn(async move {
+                                // Small delay to let streams initialize
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                let msg = OutboundMessage {
+                                    peer: peer_id,
+                                    request: CraftObjRequest::CapabilityRequest,
+                                    reply_tx: Some(reply_tx),
+                                };
+                                if tx.send(msg).await.is_err() { return; }
+                                match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                                    Ok(Ok(CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region })) => {
+                                        let mut scorer = ps.lock().await;
+                                        let caps: Vec<craftobj_core::CraftObjCapability> = capabilities.iter().filter_map(|c| match c.as_str() {
+                                            "client" => Some(craftobj_core::CraftObjCapability::Client),
+                                            "storage" => Some(craftobj_core::CraftObjCapability::Storage),
+                                            "aggregator" => Some(craftobj_core::CraftObjCapability::Aggregator),
+                                            _ => None,
+                                        }).collect();
+                                        scorer.update_capabilities_with_storage(&peer_id, caps, 0, storage_committed_bytes, storage_used_bytes, region);
+                                        info!("[service.rs] Got capabilities from {}: {:?}", peer_id, capabilities);
+                                    }
+                                    Ok(Ok(other)) => {
+                                        debug!("[service.rs] Unexpected response to CapabilityRequest from {}: {:?}", peer_id, std::mem::discriminant(&other));
+                                    }
+                                    Ok(Err(_)) | Err(_) => {
+                                        debug!("[service.rs] CapabilityRequest to {} timed out or failed", peer_id);
+                                    }
+                                }
+                            });
+                        }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                         let remaining = swarm.connected_peers().count();
@@ -1032,6 +1069,29 @@ async fn drive_swarm(
                         match craftobj_transfer::wire::write_response_frame(&mut stream, seq_id, &response).await {
                             Ok(()) => debug!("[PEX] Sent response to {} seq={}", peer, seq_id),
                             Err(e) => debug!("[PEX] Failed response to {} seq={}: {}", peer, seq_id, e),
+                        }
+                    });
+                    continue;
+                }
+
+                // Handle CapabilityRequest inline
+                if let CraftObjRequest::CapabilityRequest = msg.request {
+                    debug!("[service.rs] CapabilityRequest from {}", msg.peer);
+                    let cfg = daemon_config.lock().await;
+                    let response = CraftObjResponse::CapabilityResponse {
+                        capabilities: cfg.capabilities.clone(),
+                        storage_committed_bytes: cfg.max_storage_bytes,
+                        storage_used_bytes: 0, // TODO: compute from store
+                        region: cfg.region.clone(),
+                    };
+                    drop(cfg);
+                    let mut stream = msg.stream;
+                    let seq_id = msg.seq_id;
+                    let peer = msg.peer;
+                    tokio::spawn(async move {
+                        match craftobj_transfer::wire::write_response_frame(&mut stream, seq_id, &response).await {
+                            Ok(()) => debug!("[service.rs] Sent CapabilityResponse to {} seq={}", peer, seq_id),
+                            Err(e) => debug!("[service.rs] Failed CapabilityResponse to {} seq={}: {}", peer, seq_id, e),
                         }
                     });
                     continue;
@@ -1239,7 +1299,7 @@ async fn handle_incoming_transfer_request(
                         map.apply_event(&event);
                     }
                     // Publish DHT provider record for this CID+segment
-                    let pkey = craftobj_routing::provider_key(&content_id, segment_index);
+                    let pkey = craftobj_routing::providers_dht_key(&content_id);
                     let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
                     CraftObjResponse::Ack { status: WireStatus::Ok }
                 }
@@ -1412,7 +1472,10 @@ async fn handle_incoming_transfer_request(
         }
         CraftObjRequest::PexExchange { .. } => {
             // PEX is handled inline in the main event loop, not here.
-            // This arm exists for exhaustiveness only.
+            CraftObjResponse::Ack { status: craftobj_core::WireStatus::Ok }
+        }
+        CraftObjRequest::CapabilityRequest => {
+            // Handled inline in the main event loop.
             CraftObjResponse::Ack { status: craftobj_core::WireStatus::Ok }
         }
     }

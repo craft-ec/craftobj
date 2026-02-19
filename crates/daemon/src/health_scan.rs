@@ -633,7 +633,7 @@ impl HealthScan {
                     let event = craftobj_core::PieceEvent::Stored(stored);
                     map.apply_event(&event);
                     // Publish DHT provider record for this CID+segment
-                    let pkey = craftobj_routing::provider_key(&cid, segment);
+                    let pkey = craftobj_routing::providers_dht_key(&cid);
                     let _ = self.command_tx.send(CraftObjCommand::StartProviding { key: pkey });
                     info!(
                         "HealthScan repair complete for {}/seg{}: generated 1 new piece",

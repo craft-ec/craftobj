@@ -68,6 +68,8 @@ pub enum CraftObjRequest {
     PexExchange {
         payload: Vec<u8>, // serialized PexMessage
     },
+    /// Request capabilities from a peer (sent on connection established).
+    CapabilityRequest,
     /// PDP challenge request: challenger sends nonce + byte positions for verification.
     PdpChallenge {
         content_id: ContentId,
@@ -121,6 +123,13 @@ pub enum CraftObjResponse {
     /// Response to PexExchange: return our own peer list
     PexExchangeResponse {
         payload: Vec<u8>, // serialized PexMessage
+    },
+    /// Response to CapabilityRequest: node capabilities and storage info.
+    CapabilityResponse {
+        capabilities: Vec<String>,
+        storage_committed_bytes: u64,
+        storage_used_bytes: u64,
+        region: Option<String>,
     },
     /// Response to PdpChallenge: proof of data possession.
     PdpProof {
