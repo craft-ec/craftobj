@@ -18,7 +18,8 @@ use craftec_erasure::{
     ErasureConfig,
 };
 use craftobj_core::{
-    ContentId, ContentManifest, CraftObjError, PublishOptions, RemovalNotice, Result,
+    ContentId, ContentManifest, CraftObjError, PIECE_SIZE, PublishOptions, RemovalNotice, Result,
+    SEGMENT_SIZE,
     access::{self, AccessEntry},
     pre::{self, EncryptedContentKey, ReEncryptedKey, ReKeyEntry},
 };
@@ -120,7 +121,11 @@ impl CraftObjClient {
         let content_id = ContentId::from_bytes(&content_bytes);
         let total_size = content_bytes.len() as u64;
 
-        let config = ErasureConfig::default();
+        let config = ErasureConfig {
+            piece_size: PIECE_SIZE,
+            segment_size: SEGMENT_SIZE,
+            ..Default::default()
+        };
 
         // Segment and RLNC encode
         let encoded_segments = segmenter::segment_and_encode(&content_bytes, &config)
