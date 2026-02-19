@@ -412,6 +412,8 @@ pub async fn run_daemon_with_config(
         } else {
             warn!("[service.rs] Could not lock client for PieceMap initialization");
         }
+        // Mark the local node as online so HealthScan rank computation includes local pieces
+        pm.set_node_online(&local_peer_id.to_bytes(), true);
         Arc::new(Mutex::new(pm))
     };
 

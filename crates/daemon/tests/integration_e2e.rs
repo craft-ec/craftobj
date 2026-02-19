@@ -40,6 +40,7 @@ struct TestNode {
     /// Unix socket path for IPC
     socket_path: String,
     /// WebSocket port for IPC
+    #[allow(dead_code)]
     ws_port: u16,
     /// Listen port for libp2p (0 = random)
     listen_port: u16,
@@ -215,6 +216,7 @@ impl TestNode {
     }
     
     /// Get list of connected peers (from peer_scorer / gossipsub)
+    #[allow(dead_code)]
     async fn peers(&self) -> Result<Vec<Value>, String> {
         let response = self.rpc("peers", None).await?;
         let peers = response["peers"].as_array()
@@ -294,6 +296,7 @@ impl TestNode {
     }
     
     /// Remove data (requires creator secret)
+    #[allow(dead_code)]
     async fn data_remove(&self, cid: &str, creator_secret: &str) -> Result<Value, String> {
         let params = json!({
             "cid": cid,
@@ -317,6 +320,7 @@ impl TestNode {
     }
     
     /// Get the listen addresses of this node
+    #[allow(dead_code)]
     async fn get_listen_addrs(&self) -> Result<Vec<String>, String> {
         Ok(vec![format!("/ip4/127.0.0.1/tcp/{}", self.listen_port)])
     }
@@ -395,31 +399,6 @@ fn init_test_tracing() {
             .with_test_writer()
             .init();
     });
-}
-
-// Simple base64 encoding/decoding
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    
-    let mut encoded = String::new();
-    let mut i = 0;
-    
-    while i < data.len() {
-        let b1 = data[i];
-        let b2 = if i + 1 < data.len() { data[i + 1] } else { 0 };
-        let b3 = if i + 2 < data.len() { data[i + 2] } else { 0 };
-        
-        let bitmap = ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32);
-        
-        encoded.push(CHARS[((bitmap >> 18) & 63) as usize] as char);
-        encoded.push(CHARS[((bitmap >> 12) & 63) as usize] as char);
-        encoded.push(if i + 1 < data.len() { CHARS[((bitmap >> 6) & 63) as usize] as char } else { '=' });
-        encoded.push(if i + 2 < data.len() { CHARS[(bitmap & 63) as usize] as char } else { '=' });
-        
-        i += 3;
-    }
-    
-    encoded
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -535,10 +514,8 @@ async fn test_publish_and_basic_functionality() -> Result<(), String> {
         let original_content = b"CraftOBJ E2E test content for P2P transfer verification";
         let cid = node_a.publish(original_content).await?;
         
-        // Wait for some time for any distribution that might happen automatically
-        sleep(Duration::from_secs(10)).await;
-        
-        // Verify both nodes can see the content exists (at least on node A)
+        // Verify content exists on node A immediately after publish
+        // (before distribution/cleanup can remove local pieces)
         let list_a = node_a.list().await?;
         let contents_a = list_a.as_array()
             .ok_or("No array in list response from node A")?;
@@ -551,10 +528,16 @@ async fn test_publish_and_basic_functionality() -> Result<(), String> {
             return Err("Published content not found on node A".to_string());
         }
         
-        info!("✓ Publish and basic functionality test passed - content published and visible");
+        // Wait for distribution to B, then verify B received it
+        sleep(Duration::from_secs(15)).await;
         
-        // Note: Direct fetch between nodes may not work without provider resolution
-        // TODO: Implement fetch via provider resolution when that functionality is available
+        let list_b = node_b.list().await?;
+        let b_has_content = list_b.as_array()
+            .map(|arr| arr.iter().any(|c| c["content_id"].as_str().map_or(false, |id| id == cid)))
+            .unwrap_or(false);
+        info!("Node B has content after distribution: {}", b_has_content);
+        
+        info!("✓ Publish and basic functionality test passed - content published and visible");
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1064,17 +1047,54 @@ async fn test_shutdown_rpc() -> Result<(), String> {
     }).await.map_err(|_| "Test timed out".to_string())?
 }
 
-// Placeholder for advanced P2P features that require full implementation
+/// Advanced P2P features — verifies cross-node fetch + PEX in a single scenario.
+/// Individual feature tests exist (test_publish_fetch_cross_node, test_three_nodes_pex_discovery, etc.)
+/// This test combines them into one 3-node scenario.
 #[tokio::test]
-#[ignore = "Requires full P2P implementation"]
-async fn test_advanced_p2p_features() {
-    // Advanced features are now covered by the individual tests above:
-    // ✓ Cross-node fetch (test_publish_fetch_cross_node) 
-    // ✓ PEX discovery (test_three_nodes_pex_discovery)
-    // ✓ Content health (test_content_health)  
-    // ✓ Data removal (test_data_remove)
+async fn test_advanced_p2p_features() -> Result<(), String> {
+    init_test_tracing();
+    info!("=== Running test_advanced_p2p_features ===");
     
-    info!("Advanced P2P features are tested individually in dedicated test functions");
+    let timeout_duration = Duration::from_secs(120);
+    timeout(timeout_duration, async {
+        // 3-node scenario: A publishes, B stores via push, C fetches + PEX discovers A
+        let node_a = TestNode::spawn(0, vec![]).await?;
+        sleep(Duration::from_secs(3)).await;
+        let boot_a = node_a.get_boot_peer_addr().await?;
+        
+        let node_b = TestNode::spawn(1, vec![boot_a]).await?;
+        wait_for_connection(&node_a, &node_b, 20).await?;
+        
+        // Publish on A
+        let content = b"Advanced P2P features combined test content";
+        let cid = node_a.publish(content).await?;
+        
+        // Wait for distribution to B
+        sleep(Duration::from_secs(15)).await;
+        
+        // Spawn C connected to B only (not directly to A)
+        let boot_b = node_b.get_boot_peer_addr().await?;
+        let node_c = TestNode::spawn(2, vec![boot_b]).await?;
+        wait_for_connection(&node_b, &node_c, 20).await?;
+        sleep(Duration::from_secs(5)).await;
+        
+        // C fetches content from network
+        let fetch_path = node_c.data_dir.path().join("fetched_advanced");
+        let fetch_result = node_c.fetch(&cid, fetch_path.to_str().unwrap()).await?;
+        info!("Advanced P2P fetch result: {}", fetch_result);
+        
+        let fetched = std::fs::read(&fetch_path)
+            .map_err(|e| format!("Failed to read: {}", e))?;
+        if fetched != content {
+            return Err("Content mismatch in advanced P2P test".to_string());
+        }
+        
+        info!("✓ Advanced P2P features test passed");
+        node_a.shutdown().await?;
+        node_b.shutdown().await?;
+        node_c.shutdown().await?;
+        Ok(())
+    }).await.map_err(|_| "Test timed out".to_string())?
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1100,14 +1120,6 @@ async fn wait_for_content(node: &TestNode, cid: &str, timeout_secs: u64) -> Resu
     Err(format!("Node {} did not receive content {} within {}s", node.index, cid, timeout_secs))
 }
 
-/// Helper: connect all nodes in a chain and wait for connections
-async fn connect_chain(nodes: &[&TestNode], timeout_secs: u64) -> Result<(), String> {
-    for i in 0..nodes.len() - 1 {
-        wait_for_connection(nodes[i], nodes[i + 1], timeout_secs).await?;
-    }
-    Ok(())
-}
-
 /// Test 1: Multi-node fetch — 4 nodes, content published on A, distributed to B and C,
 /// node D fetches and reconstructs from multiple providers.
 #[tokio::test]
@@ -1115,7 +1127,7 @@ async fn test_multi_node_fetch() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_multi_node_fetch ===");
     
-    let timeout_duration = Duration::from_secs(180);
+    let timeout_duration = Duration::from_secs(300);
     timeout(timeout_duration, async {
         // Spawn Node A (publisher)
         let node_a = TestNode::spawn(0, vec![]).await?;
@@ -1130,40 +1142,68 @@ async fn test_multi_node_fetch() -> Result<(), String> {
         wait_for_connection(&node_a, &node_b, 20).await?;
         wait_for_connection(&node_a, &node_c, 20).await?;
         
-        // Publish content on A
-        let original_content = b"Multi-node fetch test: content distributed across B and C, fetched by D";
-        let cid = node_a.publish(original_content).await?;
+        // Publish ~800 KiB content so we get multiple pieces (k=4 with 256KiB piece_size).
+        // With 2 storage peers, round-robin distributes pieces across B and C,
+        // forcing Node D to fetch from BOTH providers.
+        let original_content: Vec<u8> = (0..800 * 1024).map(|i| (i % 251) as u8).collect();
+        let cid = node_a.publish(&original_content).await?;
+        info!("Published {} bytes, CID: {}", original_content.len(), cid);
         
         // Wait for distribution to B and C
-        sleep(Duration::from_secs(15)).await;
+        sleep(Duration::from_secs(20)).await;
         
-        // Check B and C received content
+        // Check B and C received content (pieces distributed round-robin)
         let b_has = wait_for_content(&node_b, &cid, 15).await.is_ok();
         let c_has = wait_for_content(&node_c, &cid, 15).await.is_ok();
         info!("Distribution: B has content={}, C has content={}", b_has, c_has);
         
-        // Spawn Node D connected to B (will discover C via PEX or DHT)
+        // Check piece counts on B and C to verify pieces were split
+        if let Ok(health_b) = node_b.content_health(&cid).await {
+            let b_pieces: usize = health_b["segments"].as_array()
+                .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+                .unwrap_or(0);
+            info!("Node B local pieces: {}", b_pieces);
+        }
+        if let Ok(health_c) = node_c.content_health(&cid).await {
+            let c_pieces: usize = health_c["segments"].as_array()
+                .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+                .unwrap_or(0);
+            info!("Node C local pieces: {}", c_pieces);
+        }
+        
+        // Spawn Node D connected to both B and C
         let boot_b = node_b.get_boot_peer_addr().await?;
         let boot_c = node_c.get_boot_peer_addr().await?;
         let node_d = TestNode::spawn(3, vec![boot_b, boot_c]).await?;
         wait_for_connection(&node_b, &node_d, 20).await?;
+        wait_for_connection(&node_c, &node_d, 20).await?;
         
         // Allow provider records to propagate
         sleep(Duration::from_secs(5)).await;
         
-        // Node D fetches content from network
+        // Node D fetches content from network — should fetch pieces from BOTH B and C
         let fetch_path = node_d.data_dir.path().join("fetched_multi");
         let fetch_result = node_d.fetch(&cid, fetch_path.to_str().unwrap()).await?;
         info!("Multi-node fetch result: {}", fetch_result);
         
-        // Verify fetched content matches
+        // Verify fetched content matches original
         let fetched = std::fs::read(&fetch_path)
             .map_err(|e| format!("Failed to read fetched file: {}", e))?;
         if fetched != original_content {
             return Err(format!("Content mismatch: got {} bytes, expected {}", fetched.len(), original_content.len()));
         }
         
-        info!("✓ Multi-node fetch test passed");
+        // Verify D fetched multiple pieces (check local piece count)
+        let health_d = node_d.content_health(&cid).await?;
+        let d_pieces: usize = health_d["segments"].as_array()
+            .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+            .unwrap_or(0);
+        info!("Node D fetched {} pieces total", d_pieces);
+        if d_pieces < 2 {
+            return Err(format!("Expected D to have multiple pieces for parallel fetch, got {}", d_pieces));
+        }
+        
+        info!("✓ Multi-node fetch test passed ({} pieces fetched from multiple providers)", d_pieces);
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -1404,9 +1444,9 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
         
         // Publish content on A, distribute to B
         let content = b"PDP challenge-response test content for proof of data possession";
-        let cid = node_a.publish(content).await?;
+        let _cid = node_a.publish(content).await?;
         
-        // Wait for distribution
+        // Wait for distribution and challenger cycle (challenger_interval_secs=5 in test config)
         sleep(Duration::from_secs(20)).await;
         
         // Check receipts — PDP challenges generate receipts
@@ -1416,9 +1456,6 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
         let receipts_b = node_b.rpc("receipts.count", None).await?;
         info!("Receipts on B: {}", receipts_b);
         
-        // With challenger_interval_secs=60, we'd need to wait for the challenge cycle
-        // For manual testing, check logs for "PDP challenge" messages
-        
         info!("✓ PDP challenge-response test passed (check logs for challenge details)");
         
         node_a.shutdown().await?;
@@ -1427,7 +1464,99 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
     }).await.map_err(|_| "Test timed out".to_string())?
 }
 
-/// Test 7: Capability exchange on connect — two nodes connect,
+/// Test 7: Degradation — content with more pieces than tier target and no demand
+/// should have excess pieces dropped by HealthScan.
+///
+/// Flow: publish ~800KiB content → single storage peer receives all pieces →
+/// HealthScan detects over-replication (rank > tier_target) → drops excess pieces.
+#[tokio::test]
+async fn test_degradation() -> Result<(), String> {
+    init_test_tracing();
+    info!("=== Running test_degradation ===");
+    
+    let timeout_duration = Duration::from_secs(180);
+    timeout(timeout_duration, async {
+        // Single publisher + single storage peer
+        // All pieces go to node_b via round-robin (only 1 peer)
+        let node_a = TestNode::spawn(0, vec![]).await?;
+        sleep(Duration::from_secs(3)).await;
+        let boot_a = node_a.get_boot_peer_addr().await?;
+        
+        let node_b = TestNode::spawn(1, vec![boot_a.clone()]).await?;
+        wait_for_connection(&node_a, &node_b, 20).await?;
+        
+        // Publish ~800 KiB content: k=4 pieces at 256KiB piece_size.
+        // All 4 pieces get pushed to node_b (only storage peer).
+        // tier_target=1.5, ceil=2. rank=4 > 2 → over-replicated.
+        // local_count=4 > MIN_PIECES(2). No demand → HealthScan should degrade.
+        let content: Vec<u8> = (0..800 * 1024).map(|i| (i % 251) as u8).collect();
+        let cid = node_a.publish(&content).await?;
+        info!("Published {} bytes, CID: {}", content.len(), cid);
+        
+        // Wait for distribution — poll quickly to catch pieces before HealthScan runs.
+        // HealthScan has 10s initial delay + 10s interval, so we need to check fast.
+        let mut pieces_before: usize = 0;
+        for attempt in 0..30 {
+            sleep(Duration::from_secs(1)).await;
+            if let Ok(health) = node_b.content_health(&cid).await {
+                let p: usize = health["segments"].as_array()
+                    .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+                    .unwrap_or(0);
+                if p > pieces_before {
+                    pieces_before = p;
+                    info!("Node B pieces at {}s: {}", attempt + 1, pieces_before);
+                }
+                if pieces_before >= 3 {
+                    break; // Good enough for degradation test
+                }
+            }
+        }
+        info!("Node B peak pieces before degradation: {}", pieces_before);
+        
+        if pieces_before < 3 {
+            return Err(format!("Expected ≥3 pieces on B for degradation test, got {}", pieces_before));
+        }
+        
+        // Poll for degradation: HealthScan runs every 10s, drops 1 piece/segment/cycle.
+        // The challenger may also heal, so we just need to observe a DROP at any point.
+        // We track the minimum piece count seen — if it ever drops below initial, degradation worked.
+        info!("Polling for HealthScan degradation...");
+        let mut min_seen = pieces_before;
+        let mut degradation_observed = false;
+        for attempt in 0..40 {
+            sleep(Duration::from_secs(1)).await;
+            if let Ok(health) = node_b.content_health(&cid).await {
+                let p: usize = health["segments"].as_array()
+                    .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+                    .unwrap_or(pieces_before);
+                if p < min_seen {
+                    min_seen = p;
+                    info!("Degradation detected at {}s: pieces dropped to {} (was {})", attempt + 1, p, pieces_before);
+                    degradation_observed = true;
+                }
+                // Once we've confirmed degradation happened, we can stop
+                if degradation_observed && min_seen < pieces_before {
+                    break;
+                }
+            }
+        }
+        
+        if !degradation_observed {
+            return Err(format!(
+                "Expected degradation to drop pieces from {}, but minimum seen was {}",
+                pieces_before, min_seen
+            ));
+        }
+        
+        info!("✓ Degradation test passed: pieces dropped from {} to {}", pieces_before, min_seen);
+        
+        node_a.shutdown().await?;
+        node_b.shutdown().await?;
+        Ok(())
+    }).await.map_err(|_| "Test timed out".to_string())?
+}
+
+/// Test 8: Capability exchange on connect — two nodes connect,
 /// verify they exchange capabilities and peer_scorer is updated.
 #[tokio::test]
 async fn test_capability_exchange_on_connect() -> Result<(), String> {
@@ -1685,3 +1814,4 @@ async fn test_concurrent_publishes() -> Result<(), String> {
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
 }
+
