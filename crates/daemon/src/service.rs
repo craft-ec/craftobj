@@ -815,7 +815,7 @@ async fn drive_swarm(
 
     // Stream manager for persistent piece transfer
     let mut stream_control = swarm.behaviour().stream.new_control();
-    let (mut stream_manager, mut inbound_rx, outbound_tx) = StreamManager::new(stream_control);
+    let (mut stream_manager, mut inbound_rx, outbound_tx, distribution_tx) = StreamManager::new(stream_control);
 
     // Peer reconnector for exponential backoff reconnection
     let mut peer_reconnector = PeerReconnector::new();
@@ -1048,7 +1048,7 @@ async fn drive_swarm(
                             });
                         }
                         other => {
-                            handle_command(swarm, &protocol, other, pending_requests.clone(), &outbound_tx, &event_tx, &region, &signing_key).await;
+                            handle_command(swarm, &protocol, other, pending_requests.clone(), &outbound_tx, &distribution_tx, &event_tx, &region, &signing_key).await;
                         }
                     }
                 }
@@ -1492,6 +1492,68 @@ async fn handle_incoming_transfer_request(
             // PEX is handled inline in the main event loop, not here.
             CraftObjResponse::Ack { status: craftobj_core::WireStatus::Ok }
         }
+        CraftObjRequest::PieceBatchPush { content_id, pieces } => {
+            info!("[service.rs] Handling PieceBatchPush from {} for {} ({} pieces)", peer, content_id, pieces.len());
+            let store_guard = store.lock().await;
+            
+            // Check if we have the manifest
+            if store_guard.get_record(&content_id).is_err() {
+                warn!("[service.rs] Received batch piece push for {} but no manifest — rejecting", content_id);
+                return CraftObjResponse::BatchAck { 
+                    confirmed_pieces: vec![], 
+                    failed_pieces: pieces.iter().map(|p| p.piece_id).collect() 
+                };
+            }
+            
+            let mut confirmed = Vec::new();
+            let mut failed = Vec::new();
+            
+            for piece in pieces {
+                match store_guard.store_piece(&content_id, piece.segment_index, &piece.piece_id, &piece.data, &piece.coefficients) {
+                    Ok(()) => {
+                        confirmed.push(piece.piece_id);
+                        // Notify protocol for tracker update
+                        if let Err(e) = protocol.event_tx.send(CraftObjEvent::PiecePushReceived { content_id }) {
+                            debug!("Failed to send piece push event: {}", e);
+                        }
+                        // Update PieceMap
+                        {
+                            let mut map = piece_map.lock().await;
+                            let newly_tracked = map.track_segment(content_id, piece.segment_index);
+                            if newly_tracked {
+                                let _ = command_tx.send(CraftObjCommand::SyncPieceMap {
+                                    content_id,
+                                    segment_index: piece.segment_index,
+                                });
+                            }
+                            let seq = map.next_seq();
+                            let stored = craftobj_core::PieceStored {
+                                node: map.local_node().to_vec(),
+                                cid: content_id,
+                                segment: piece.segment_index,
+                                piece_id: piece.piece_id,
+                                coefficients: piece.coefficients.clone(),
+                                seq,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                signature: vec![],
+                            };
+                            let event = craftobj_core::PieceEvent::Stored(stored);
+                            map.apply_event(&event);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[service.rs] Failed to store batch piece {}: {}", hex::encode(&piece.piece_id[..8]), e);
+                        failed.push(piece.piece_id);
+                    }
+                }
+            }
+            
+            info!("[service.rs] Batch push result: {}/{} confirmed", confirmed.len(), confirmed.len() + failed.len());
+            CraftObjResponse::BatchAck { confirmed_pieces: confirmed, failed_pieces: failed }
+        }
         CraftObjRequest::CapabilityRequest => {
             // Handled inline in the main event loop.
             CraftObjResponse::Ack { status: craftobj_core::WireStatus::Ok }
@@ -1506,6 +1568,7 @@ async fn handle_command(
     command: CraftObjCommand,
     pending_requests: PendingRequests,
     outbound_tx: &mpsc::Sender<OutboundMessage>,
+    distribution_tx: &mpsc::Sender<crate::stream_manager::DistributionMessage>,
     event_tx: &EventSender,
     region: &Option<String>,
     signing_key: &Option<ed25519_dalek::SigningKey>,
@@ -1729,6 +1792,23 @@ async fn handle_command(
                         warn!("[service.rs] PushPiece to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("piece push timed out".into()));
                     }
+                }
+            });
+        }
+
+        CraftObjCommand::PushPieceBatch { peer_id, content_id, pieces, reply_tx } => {
+            debug!("Handling push piece batch command for {} to {} ({} pieces)", content_id, peer_id, pieces.len());
+            let msg = crate::stream_manager::DistributionMessage {
+                peer: peer_id,
+                content_id,
+                pieces,
+                reply_tx,
+            };
+            let tx = distribution_tx.clone();
+            tokio::spawn(async move {
+                info!("[service.rs] PushPieceBatch: sending to distribution queue for {}", peer_id);
+                if tx.send(msg).await.is_err() {
+                    warn!("[service.rs] PushPieceBatch to {}: distribution channel closed", peer_id);
                 }
             });
         }

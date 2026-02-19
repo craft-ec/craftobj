@@ -106,6 +106,13 @@ pub enum CraftObjCommand {
         piece_data: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Push multiple pieces to a remote storage peer via persistent stream (pipelined).
+    PushPieceBatch {
+        peer_id: PeerId,
+        content_id: ContentId,
+        pieces: Vec<craftobj_transfer::PiecePayload>,
+        reply_tx: oneshot::Sender<craftobj_transfer::CraftObjResponse>,
+    },
     /// Sync PieceMap entries for a newly tracked segment from connected peers.
     SyncPieceMap {
         content_id: ContentId,

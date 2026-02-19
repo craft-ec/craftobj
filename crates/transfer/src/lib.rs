@@ -78,6 +78,11 @@ pub enum CraftObjRequest {
         nonce: [u8; 32],
         byte_positions: Vec<u32>,
     },
+    /// Push multiple pieces in a batch for distribution.
+    PieceBatchPush {
+        content_id: ContentId,
+        pieces: Vec<PiecePayload>,
+    },
 }
 
 /// A piece within a PieceBatch response.
@@ -137,6 +142,11 @@ pub enum CraftObjResponse {
         coefficients: Vec<u8>,
         challenged_bytes: Vec<u8>, // bytes at the challenged positions
         proof_hash: [u8; 32],     // hash of (data_bytes + positions + coefficients + nonce)
+    },
+    /// Batch acknowledgment for multiple piece pushes.
+    BatchAck {
+        confirmed_pieces: Vec<[u8; 32]>, // piece_ids that were successfully stored
+        failed_pieces: Vec<[u8; 32]>,    // piece_ids that failed to store
     },
 }
 

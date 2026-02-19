@@ -22,6 +22,7 @@ const TYPE_MERKLE_ROOT: u8 = 0x05;
 const TYPE_MERKLE_DIFF: u8 = 0x06;
 const TYPE_PDP_CHALLENGE: u8 = 0x07;
 const TYPE_PEX_EXCHANGE: u8 = 0x08;
+const TYPE_PIECE_BATCH_PUSH: u8 = 0x09;
 const TYPE_PIECE_BATCH: u8 = 0x81;
 const TYPE_ACK: u8 = 0x82;
 const TYPE_PIECE_MAP_ENTRIES: u8 = 0x83;
@@ -29,7 +30,8 @@ const TYPE_MERKLE_ROOT_RESPONSE: u8 = 0x84;
 const TYPE_MERKLE_DIFF_RESPONSE: u8 = 0x85;
 const TYPE_PDP_PROOF: u8 = 0x86;
 const TYPE_PEX_EXCHANGE_RESPONSE: u8 = 0x87;
-const TYPE_CAPABILITY_REQUEST: u8 = 0x09;
+const TYPE_BATCH_ACK: u8 = 0x89;
+const TYPE_CAPABILITY_REQUEST: u8 = 0x0A;
 const TYPE_CAPABILITY_RESPONSE: u8 = 0x88;
 
 /// A parsed frame from a persistent stream.
@@ -66,11 +68,11 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
     let raw = read_raw_frame(io).await?;
 
     match raw.msg_type {
-        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE | TYPE_CAPABILITY_REQUEST => {
+        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE | TYPE_PIECE_BATCH_PUSH | TYPE_CAPABILITY_REQUEST => {
             let request = deserialize_request(raw.msg_type, &raw.payload)?;
             Ok(StreamFrame::Request { seq_id: raw.seq_id, request })
         }
-        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF | TYPE_PEX_EXCHANGE_RESPONSE | TYPE_CAPABILITY_RESPONSE => {
+        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF | TYPE_PEX_EXCHANGE_RESPONSE | TYPE_BATCH_ACK | TYPE_CAPABILITY_RESPONSE => {
             let response = deserialize_response(raw.msg_type, &raw.payload)?;
             Ok(StreamFrame::Response { seq_id: raw.seq_id, response })
         }
@@ -163,6 +165,15 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
         CraftObjRequest::PexExchange { payload } => {
             Ok((TYPE_PEX_EXCHANGE, payload.clone()))
         }
+        CraftObjRequest::PieceBatchPush { content_id, pieces } => {
+            let inner = PieceBatchPushWire {
+                content_id: *content_id,
+                pieces: pieces.clone(),
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_PIECE_BATCH_PUSH, payload))
+        }
         CraftObjRequest::CapabilityRequest => {
             Ok((TYPE_CAPABILITY_REQUEST, vec![]))
         }
@@ -240,6 +251,14 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
         TYPE_PEX_EXCHANGE => {
             Ok(CraftObjRequest::PexExchange { payload: payload.to_vec() })
         }
+        TYPE_PIECE_BATCH_PUSH => {
+            let inner: PieceBatchPushWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjRequest::PieceBatchPush {
+                content_id: inner.content_id,
+                pieces: inner.pieces,
+            })
+        }
         TYPE_CAPABILITY_REQUEST => {
             Ok(CraftObjRequest::CapabilityRequest)
         }
@@ -300,6 +319,15 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
         CraftObjResponse::PexExchangeResponse { payload } => {
             Ok((TYPE_PEX_EXCHANGE_RESPONSE, payload.clone()))
         }
+        CraftObjResponse::BatchAck { confirmed_pieces, failed_pieces } => {
+            let inner = BatchAckWire {
+                confirmed_pieces: confirmed_pieces.clone(),
+                failed_pieces: failed_pieces.clone(),
+            };
+            let payload = bincode::serialize(&inner)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok((TYPE_BATCH_ACK, payload))
+        }
         CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region } => {
             let payload = serde_json::to_vec(&serde_json::json!({
                 "capabilities": capabilities,
@@ -358,6 +386,14 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResp
         }
         TYPE_PEX_EXCHANGE_RESPONSE => {
             Ok(CraftObjResponse::PexExchangeResponse { payload: payload.to_vec() })
+        }
+        TYPE_BATCH_ACK => {
+            let inner: BatchAckWire = bincode::deserialize(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(CraftObjResponse::BatchAck {
+                confirmed_pieces: inner.confirmed_pieces,
+                failed_pieces: inner.failed_pieces,
+            })
         }
         TYPE_CAPABILITY_RESPONSE => {
             let v: serde_json::Value = serde_json::from_slice(payload)
@@ -452,6 +488,18 @@ struct PdpProofWire {
     coefficients: Vec<u8>,
     challenged_bytes: Vec<u8>,
     proof_hash: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct PieceBatchPushWire {
+    content_id: ContentId,
+    pieces: Vec<PiecePayload>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BatchAckWire {
+    confirmed_pieces: Vec<[u8; 32]>,
+    failed_pieces: Vec<[u8; 32]>,
 }
 
 #[cfg(test)]

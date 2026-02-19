@@ -276,27 +276,20 @@ pub async fn run_initial_push(
         }
     }
 
-    // Push ALL pieces round-robin across peers. Publisher uploads everything (1.2x content size).
-    // Skip failed peers for remaining pieces. Emit progress events periodically.
+    // Push pieces in batches using pipelined distribution.
+    // Distribute ALL pieces across peers for maximum redundancy.
     let total_pieces = all_pieces.len();
-    let mut peer_failures: std::collections::HashMap<libp2p::PeerId, usize> = std::collections::HashMap::new();
-    const MAX_PEER_FAILURES: usize = 5; // Allow up to 5 failures before marking dead
-    let mut total_pushed: usize = 0;
-    let progress_interval = std::cmp::max(total_pieces / 20, 10); // ~5% or every 10
+    const BATCH_SIZE: usize = 50; // Pieces per batch
+    let batches_per_peer = (total_pieces + manifest_ok_peers.len() - 1) / manifest_ok_peers.len();
+    let pieces_per_peer = std::cmp::max(batches_per_peer, BATCH_SIZE);
 
+    // Split pieces into batches per peer
+    let mut peer_batches: std::collections::HashMap<libp2p::PeerId, Vec<craftobj_transfer::PiecePayload>> = std::collections::HashMap::new();
+    
     let cid = *content_id;
     for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
-        // Find next available peer (round-robin, skipping failed)
-        let available_peers: Vec<libp2p::PeerId> = manifest_ok_peers.iter()
-            .filter(|p| peer_failures.get(p).copied().unwrap_or(0) < MAX_PEER_FAILURES)
-            .copied()
-            .collect();
-        if available_peers.is_empty() {
-            warn!("[reannounce.rs] Initial push for {}: all peers failed, stopping at piece {}/{}", content_id, i, total_pieces);
-            break;
-        }
-        let peer = available_peers[i % available_peers.len()];
-
+        let peer = manifest_ok_peers[i % manifest_ok_peers.len()];
+        
         let (piece_data, coefficients) = {
             let c = client.lock().await;
             match c.store().get_piece(&cid, *seg_idx, piece_id) {
@@ -304,55 +297,85 @@ pub async fn run_initial_push(
                 Err(_) => continue,
             }
         };
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let cmd = CraftObjCommand::PushPiece {
-            peer_id: peer,
-            content_id: cid,
+        
+        let piece_payload = craftobj_transfer::PiecePayload {
             segment_index: *seg_idx,
             piece_id: *piece_id,
             coefficients,
-            piece_data,
-            reply_tx,
+            data: piece_data,
         };
-        if command_tx.send(cmd).is_err() {
-            continue;
-        }
-
-        // Timeout per piece push: 10 seconds
-        match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
-            Ok(Ok(Ok(()))) => {
-                total_pushed += 1;
-                info!("[reannounce.rs] Pushed piece {}/{} for {} to {}", total_pushed, total_pieces, content_id, peer);
-            }
-            Ok(Ok(Err(e))) => {
-                let count = peer_failures.entry(peer).or_insert(0);
-                *count += 1;
-                warn!("[reannounce.rs] Push piece {}/{} to {} failed: {} (failure {}/{})", i+1, total_pieces, peer, e, count, MAX_PEER_FAILURES);
-            }
-            Ok(Err(_)) => {
-                let count = peer_failures.entry(peer).or_insert(0);
-                *count += 1;
-                warn!("[reannounce.rs] Push piece {}/{} to {} — reply channel dropped (failure {}/{})", i+1, total_pieces, peer, count, MAX_PEER_FAILURES);
-            }
-            Err(_) => {
-                let count = peer_failures.entry(peer).or_insert(0);
-                *count += 1;
-                warn!("[reannounce.rs] Push piece {}/{} to {} timed out (10s) (failure {}/{})", i+1, total_pieces, peer, count, MAX_PEER_FAILURES);
-            }
-        }
-
-        // Emit progress event periodically
-        if total_pushed > 0 && (total_pushed % progress_interval == 0 || i == total_pieces - 1) {
-            let active_peers = ranked_peers.len() - peer_failures.values().filter(|&&c| c >= MAX_PEER_FAILURES).count();
-            let _ = event_tx.send(DaemonEvent::DistributionProgress {
-                content_id: content_id.to_hex(),
-                pieces_pushed: total_pushed,
-                total_pieces,
-                peers_active: active_peers,
-            });
-        }
+        
+        peer_batches.entry(peer).or_insert_with(Vec::new).push(piece_payload);
     }
+    
+    info!("[reannounce.rs] Initial push for {}: distributing {} pieces in batches to {} peers", content_id, total_pieces, manifest_ok_peers.len());
+    
+    // Send batches concurrently using the pipelined distribution system
+    let mut batch_futures = Vec::new();
+    let mut total_pushed = 0usize;
+    
+    for (peer, pieces) in peer_batches {
+        let peer_piece_count = pieces.len();
+        
+        // Split into smaller batches to avoid overwhelming the receiver
+        for batch in pieces.chunks(BATCH_SIZE) {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = CraftObjCommand::PushPieceBatch {
+                peer_id: peer,
+                content_id: cid,
+                pieces: batch.to_vec(),
+                reply_tx,
+            };
+            
+            if command_tx.send(cmd).is_ok() {
+                let peer_copy = peer;
+                let batch_size = batch.len();
+                batch_futures.push(async move {
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+                        Ok(Ok(craftobj_transfer::CraftObjResponse::BatchAck { confirmed_pieces, failed_pieces })) => {
+                            let confirmed_count = confirmed_pieces.len();
+                            let failed_count = failed_pieces.len();
+                            info!("[reannounce.rs] Batch to {}: {}/{} confirmed, {} failed", 
+                                peer_copy, confirmed_count, batch_size, failed_count);
+                            (peer_copy, confirmed_count, failed_count)
+                        }
+                        Ok(Ok(_)) => {
+                            warn!("[reannounce.rs] Batch to {}: unexpected response type", peer_copy);
+                            (peer_copy, 0, batch_size)
+                        }
+                        Ok(Err(_)) => {
+                            warn!("[reannounce.rs] Batch to {}: reply channel closed", peer_copy);
+                            (peer_copy, 0, batch_size)
+                        }
+                        Err(_) => {
+                            warn!("[reannounce.rs] Batch to {}: timed out after 30s", peer_copy);
+                            (peer_copy, 0, batch_size)
+                        }
+                    }
+                });
+            } else {
+                warn!("[reannounce.rs] Failed to send batch command to {}", peer);
+            }
+        }
+        
+        total_pushed += peer_piece_count;
+        info!("[reannounce.rs] Queued {} pieces for {}", peer_piece_count, peer);
+    }
+    
+    // Wait for all batches to complete
+    let batch_results = futures::future::join_all(batch_futures).await;
+    let mut confirmed_total = 0usize;
+    let mut failed_total = 0usize;
+    let mut peer_success_count: std::collections::HashMap<libp2p::PeerId, usize> = std::collections::HashMap::new();
+    
+    for (peer, confirmed, failed) in batch_results {
+        confirmed_total += confirmed;
+        failed_total += failed;
+        *peer_success_count.entry(peer).or_insert(0) += confirmed;
+    }
+    
+    let successful_peers = peer_success_count.len();
+    total_pushed = confirmed_total;
 
     info!("[reannounce.rs] Initial push for {}: pushed {}/{} pieces to {} peers", content_id, total_pushed, total_pieces, ranked_peers.len());
 
