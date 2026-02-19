@@ -1584,10 +1584,14 @@ async fn test_degradation() -> Result<(), String> {
         }
         
         // Phase 1: Artificially over-replicate B via extend().
-        // Generate enough extra pieces to push well above target(6).
+        // extend() generates 1 piece per call, so call multiple times.
         info!("Phase 1: Over-replicating B via extend()...");
-        let extend_result = node_b.extend(&cid, Some(10)).await;
-        info!("Extend result: {:?}", extend_result);
+        for i in 0..10 {
+            match node_b.extend(&cid, None).await {
+                Ok(r) => info!("Extend #{}: {}", i + 1, r),
+                Err(e) => info!("Extend #{} failed: {}", i + 1, e),
+            }
+        }
         sleep(Duration::from_secs(2)).await;
         
         let pieces_after_extend: usize = node_b.content_health(&cid).await.ok()
@@ -1647,9 +1651,10 @@ async fn test_degradation() -> Result<(), String> {
 
 /// Test 7b: Degradation skipped when demand exists.
 ///
-/// Same setup as test_degradation, but Node B actively fetches pieces during
-/// HealthScan cycles, creating demand via record_fetch(). HealthScan should
-/// skip degradation because demand exists.
+/// 3 nodes: A publishes, B stores + over-replicates via extend(), C fetches
+/// repeatedly to generate DemandSignals. B's DemandSignalTracker records
+/// incoming signals → HealthScan skips degradation despite over-replication.
+/// Wait 3 HealthScan cycles (30s at interval=10) to prove consistency.
 #[tokio::test]
 async fn test_degradation_skipped_with_demand() -> Result<(), String> {
     init_test_tracing();
@@ -1660,43 +1665,53 @@ async fn test_degradation_skipped_with_demand() -> Result<(), String> {
         let start = std::time::Instant::now();
         let node_a = TestNode::spawn_with_config(0, vec![], |cfg| {
             cfg.health_scan_interval_secs = 10;
+            cfg.demand_threshold = 3;
         }).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
 
         let node_b = TestNode::spawn_with_config(1, vec![boot_a.clone()], |cfg| {
             cfg.health_scan_interval_secs = 10;
+            cfg.demand_threshold = 3;
+        }).await?;
+        let node_c = TestNode::spawn_with_config(2, vec![boot_a.clone()], |cfg| {
+            cfg.health_scan_interval_secs = 10;
+            cfg.demand_threshold = 3;
         }).await?;
 
         wait_for_connection(&node_a, &node_b, 30).await?;
+        wait_for_connection(&node_a, &node_c, 30).await?;
+        wait_for_connection(&node_b, &node_c, 30).await?;
 
-        // Publish ~800KiB content
+        // Publish ~800KiB content (k=4, target=ceil(4×1.5)=6)
         let content: Vec<u8> = (0..800 * 1024).map(|i| (i % 251) as u8).collect();
         let cid = node_a.publish(&content).await?;
         info!("Published {} bytes, CID: {}", content.len(), cid);
 
         // Wait for distribution to B
         let mut pieces_b: usize = 0;
-        for attempt in 0..30 {
+        for _attempt in 0..30 {
             sleep(Duration::from_secs(1)).await;
             if let Ok(health) = node_b.content_health(&cid).await {
                 let p: usize = health["segments"].as_array()
                     .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
                     .unwrap_or(0);
-                if p > pieces_b {
-                    pieces_b = p;
-                }
+                if p > pieces_b { pieces_b = p; }
                 if pieces_b >= 2 { break; }
             }
         }
-
         if pieces_b < 2 {
             return Err(format!("Expected ≥2 pieces on B, got {}", pieces_b));
         }
 
-        // Over-replicate B via extend()
+        // Over-replicate B via extend() (1 piece per call)
         info!("Over-replicating B via extend()...");
-        let _ = node_b.extend(&cid, Some(10)).await;
+        for i in 0..10 {
+            match node_b.extend(&cid, None).await {
+                Ok(r) => info!("Extend #{}: {}", i + 1, r),
+                Err(e) => info!("Extend #{} failed: {}", i + 1, e),
+            }
+        }
         sleep(Duration::from_secs(2)).await;
 
         let pieces_after_extend: usize = node_b.content_health(&cid).await.ok()
@@ -1708,41 +1723,54 @@ async fn test_degradation_skipped_with_demand() -> Result<(), String> {
         if pieces_after_extend <= 6 {
             return Err(format!("Extend did not push above target(6): got {} pieces", pieces_after_extend));
         }
-
         let peak_pieces = pieces_after_extend;
 
-        // Create demand by actively fetching from A (triggers record_fetch on A).
-        // Do this repeatedly during HealthScan cycles.
-        info!("Creating demand via repeated fetches during HealthScan cycles...");
-        for cycle in 0..3 {
-            // Fetch from node_a to create demand (PieceSync triggers record_fetch)
-            for i in 0..3 {
-                let path = format!("{}/demand_fetch_{}_{}", node_b.data_dir.path().display(), cycle, i);
-                let _ = node_b.fetch(&cid, &path).await;
-                sleep(Duration::from_millis(200)).await;
+        // Generate demand: C fetches repeatedly → DemandSignals broadcast → B receives them
+        info!("Generating demand via Node C fetches...");
+        let init_path = node_c.data_dir.path().join("demand_init");
+        let _ = node_c.fetch(&cid, init_path.to_str().unwrap()).await;
+        sleep(Duration::from_secs(1)).await;
+
+        // Keep fetching during 3 HealthScan cycles to maintain demand
+        for cycle in 0..30 {
+            if cycle % 2 == 0 {
+                let path = node_c.data_dir.path().join(format!("demand_{}", cycle));
+                let _ = node_c.fetch(&cid, path.to_str().unwrap()).await;
             }
-            // Wait for a HealthScan cycle
-            sleep(Duration::from_secs(12)).await;
+            sleep(Duration::from_secs(1)).await;
+
+            // Log state every 10s
+            if cycle % 10 == 9 {
+                if let Ok(health) = node_b.content_health(&cid).await {
+                    let p: usize = health["segments"].as_array()
+                        .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
+                        .unwrap_or(0);
+                    info!("B at {}s: pieces={}, has_demand={}", cycle + 1, p, health["has_demand"]);
+                }
+            }
         }
 
-        // Check that pieces did NOT decrease
-        let pieces_after_demand: usize = node_b.content_health(&cid).await.ok()
+        // Assert pieces did NOT decrease
+        let pieces_final: usize = node_b.content_health(&cid).await.ok()
             .and_then(|h| h["segments"].as_array().map(|segs|
                 segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum()))
             .unwrap_or(0);
 
-        info!("B pieces after demand cycles: {} (peak was {})", pieces_after_demand, peak_pieces);
+        info!("B pieces after demand cycles: {} (peak was {})", pieces_final, peak_pieces);
 
-        // Demand should prevent degradation — pieces should NOT decrease
-        assert!(pieces_after_demand >= peak_pieces,
-            "Demand should prevent degradation: peak={}, after={}",
-            peak_pieces, pieces_after_demand);
+        if pieces_final < peak_pieces {
+            return Err(format!(
+                "Demand should prevent degradation: peak={}, final={} — pieces decreased!",
+                peak_pieces, pieces_final
+            ));
+        }
 
-        info!("=== test_degradation_skipped_with_demand === ✓ PASSED in {:.1}s — pieces held at {} (peak {})",
-              start.elapsed().as_secs_f64(), pieces_after_demand, peak_pieces);
+        info!("=== test_degradation_skipped_with_demand === ✓ PASSED in {:.1}s — pieces stable at {} (peak {})",
+              start.elapsed().as_secs_f64(), pieces_final, peak_pieces);
 
         node_a.shutdown().await?;
         node_b.shutdown().await?;
+        node_c.shutdown().await?;
         Ok(())
     }).await.map_err(|_| "Test timed out".to_string())?
 }

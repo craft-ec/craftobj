@@ -255,13 +255,13 @@ pub fn heal_content(
             continue;
         }
 
-        // Generate 1 new piece per segment via recombination.
-        // RLNC: each node generates 1 piece and pushes it. Bulk generation wastes CPU
-        // and blocks other work. The network heals organically across nodes.
+        // Generate new pieces via RLNC recombination.
+        // For extend() we may generate multiple pieces per segment.
         if generated >= pieces_needed {
             break;
         }
-        for _ in 0..1 {
+        let to_generate = pieces_needed - generated;
+        for _ in 0..to_generate {
             match craftec_erasure::create_piece_from_existing(&existing_pieces) {
                 Ok(new_piece) => {
                     let new_pid = craftobj_store::piece_id_from_coefficients(&new_piece.coefficients);

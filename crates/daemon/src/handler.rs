@@ -942,6 +942,10 @@ impl CraftObjHandler {
 
     /// Extend a CID by generating new coded pieces via RLNC recombination.
     async fn handle_extend(&self, params: Option<Value>) -> Result<Value, String> {
+        let additional_pieces = params.as_ref()
+            .and_then(|p| p.get("additional_pieces"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
         let cid = extract_cid(params)?;
 
         let manifest = {
@@ -952,7 +956,7 @@ impl CraftObjHandler {
         // Generate new pieces via recombination for each segment
         let result = {
             let client = self.client.lock().await;
-            crate::health::heal_content(client.store(), &manifest, 1)
+            crate::health::heal_content(client.store(), &manifest, additional_pieces)
         };
 
         if result.pieces_generated == 0 {
