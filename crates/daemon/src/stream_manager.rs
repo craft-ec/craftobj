@@ -9,7 +9,7 @@
 //! Inbound: accept stream from peer, read request, write response, close.
 //! No persistent streams. No stream management. No contention.
 
-use craftobj_transfer::wire::{read_frame, write_request_frame, write_response_frame, StreamFrame};
+use craftobj_transfer::wire::{read_frame, write_request_frame, StreamFrame};
 use craftobj_transfer::{CraftObjRequest, CraftObjResponse};
 use libp2p::PeerId;
 use tokio::sync::{mpsc, oneshot};
@@ -87,7 +87,7 @@ impl StreamManager {
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(8192);
         let (distribution_tx, distribution_rx) = mpsc::channel::<DistributionMessage>(1024);
 
-        let mut control_clone = control.clone();
+        let control_clone = control.clone();
 
         // Spawn outbound writer — opens fresh stream per request
         tokio::spawn(Self::outbound_loop(control.clone(), outbound_rx));
@@ -104,7 +104,7 @@ impl StreamManager {
         };
 
         // Start distribution manager
-        let mut mgr_clone = mgr.clone_for_distribution();
+        let mgr_clone = mgr.clone_for_distribution();
         tokio::spawn(Self::distribution_manager(mgr_clone, distribution_rx));
 
         (mgr, inbound_rx, outbound_tx, distribution_tx, control_for_fetch)
@@ -420,7 +420,7 @@ impl StreamManager {
                             current_stream = Some(stream);
                             seq_id += 1;
                         }
-                        Ok(Ok(frame)) => {
+                        Ok(Ok(_frame)) => {
                             warn!("[dist_stream] batch#{} unexpected frame type (not Response) after {:.1}ms", batch_count, read_start.elapsed().as_secs_f64() * 1000.0);
                             let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
                                 status: craftobj_core::WireStatus::Error 

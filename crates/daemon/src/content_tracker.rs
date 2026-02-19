@@ -18,16 +18,13 @@ pub const DEFAULT_REANNOUNCE_THRESHOLD_SECS: u64 = 1200;
 /// Role this node plays for a piece of content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ContentRole {
+    #[default]
     Publisher,
     StorageProvider,
 }
 
-impl Default for ContentRole {
-    fn default() -> Self {
-        Self::Publisher
-    }
-}
 
 /// Lifecycle stage of content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,7 +349,7 @@ impl ContentTracker {
                 format!("Fully distributed — {} providers ✓", state.provider_count)
             }
             ContentStage::Degraded => {
-                format!("DEGRADED — insufficient pieces, needs repair")
+                "DEGRADED — insufficient pieces, needs repair".to_string()
             }
         };
         Some((state.clone(), summary))

@@ -585,7 +585,7 @@ impl CraftObjHandler {
                         for (node, _pid, _coeff) in map.pieces_for_segment(&cid, seg) {
                             if node == &local_node { continue; }
                             if seen.insert(node.clone()) {
-                                if let Ok(peer_id) = libp2p::PeerId::from_bytes(&node) {
+                                if let Ok(peer_id) = libp2p::PeerId::from_bytes(node) {
                                     info!("[handler.rs] Provider {} found in PieceMap for {}", peer_id, cid);
                                     providers.push(peer_id);
                                 }
@@ -853,15 +853,13 @@ impl CraftObjHandler {
         let receipts: Vec<&craftobj_core::StorageReceipt> =
             if let Some(cid_hex) = params.get("cid").and_then(|v| v.as_str()) {
                 let cid = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
-                store.query_by_cid(&cid).into_iter().filter_map(|e| match e {
-                    crate::receipt_store::ReceiptEntry::Storage(r) => Some(r),
-                    _ => None,
+                store.query_by_cid(&cid).into_iter().map(|e| {
+                    let crate::receipt_store::ReceiptEntry::Storage(r) = e; r
                 }).collect()
             } else if let Some(node_hex) = params.get("node").and_then(|v| v.as_str()) {
                 let node = parse_pubkey(node_hex)?;
-                store.query_by_node(&node).into_iter().filter_map(|e| match e {
-                    crate::receipt_store::ReceiptEntry::Storage(r) => Some(r),
-                    _ => None,
+                store.query_by_node(&node).into_iter().map(|e| {
+                    let crate::receipt_store::ReceiptEntry::Storage(r) = e; r
                 }).collect()
             } else {
                 store.all_storage_receipts().iter().collect()
@@ -1017,14 +1015,14 @@ impl CraftObjHandler {
         for seg_idx in 0..manifest.segment_count() as u32 {
             let k = manifest.k_for_segment(seg_idx as usize);
             let client = self.client.clone();
-            let peer_scorer = self.peer_scorer.clone();
-            let merkle_tree = self.merkle_tree.clone();
-            let piece_map = self.piece_map.clone();
-            let signing_key = self.node_signing_key.clone();
+            let _peer_scorer = self.peer_scorer.clone();
+            let _merkle_tree = self.merkle_tree.clone();
+            let _piece_map = self.piece_map.clone();
+            let _signing_key = self.node_signing_key.clone();
             let command_tx = command_tx.clone();
             let cid = *content_id;
             let ranked_providers = ranked_providers.clone();
-            let vr = verification_record.clone();
+            let _vr = verification_record.clone();
 
             segment_join_set.spawn(async move {
             // Load existing pieces' piece IDs and coefficient vectors for independence checking
@@ -1829,38 +1827,6 @@ impl CraftObjHandler {
     // Health & Statistics RPC methods
     // -----------------------------------------------------------------------
 
-    /// Shared helper: compute health info for a single CID.
-    /// Returns (min_rank, health_ratio, disk_usage).
-    /// Health ratio = min per-segment ratio (pieces/k_for_segment), so the last
-    /// segment (which has fewer source pieces) doesn't drag down the score.
-    async fn compute_cid_health(&self, cid: &craftobj_core::ContentId) -> Result<(usize, f64, u64), String> {
-        let client = self.client.lock().await;
-        let store = client.store();
-
-        let manifest = store.get_record(cid).ok();
-        let segments = store.list_segments(cid).unwrap_or_default();
-        let mut min_rank: Option<usize> = None;
-        let mut min_ratio: Option<f64> = None;
-        for &seg in &segments {
-            let pieces = store.list_pieces(cid, seg).unwrap_or_default();
-            let rank = pieces.len();
-            min_rank = Some(min_rank.map_or(rank, |r: usize| r.min(rank)));
-            // Per-segment k for correct last-segment health
-            let seg_k = manifest.as_ref()
-                .map(|m| m.k_for_segment(seg as usize))
-                .unwrap_or(0);
-            if seg_k > 0 {
-                let ratio = rank as f64 / seg_k as f64;
-                min_ratio = Some(min_ratio.map_or(ratio, |r: f64| r.min(ratio)));
-            }
-        }
-        let min_rank = min_rank.unwrap_or(0);
-        let health_ratio = min_ratio.unwrap_or(0.0);
-        let disk_usage = store.cid_disk_usage(cid);
-
-        Ok((min_rank, health_ratio, disk_usage))
-    }
-
     /// `content.health` — Per-CID health info.
     async fn handle_content_health(&self, params: Option<Value>) -> Result<Value, String> {
         let cid = extract_cid(params)?;
@@ -1984,12 +1950,12 @@ impl CraftObjHandler {
         });
 
         let snapshots: Vec<craftobj_core::HealthSnapshot> = std::io::BufRead::lines(reader)
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter_map(|line| serde_json::from_str(&line).ok())
             .filter(|s: &craftobj_core::HealthSnapshot| s.timestamp >= cutoff)
             .collect();
 
-        serde_json::to_value(&serde_json::json!({ "snapshots": snapshots }))
+        serde_json::to_value(serde_json::json!({ "snapshots": snapshots }))
             .map_err(|e| e.to_string())
     }
 
@@ -2280,7 +2246,7 @@ impl CraftObjHandler {
         let mut segments_json = Vec::new();
         for &seg in &segments_list {
             let pieces = store.list_pieces(&cid, seg).unwrap_or_default();
-            let piece_ids: Vec<String> = pieces.iter().map(|p| hex::encode(p)).collect();
+            let piece_ids: Vec<String> = pieces.iter().map(hex::encode).collect();
             let local_count = pieces.len();
             // Use per-segment k (last segment may have fewer source pieces)
             let k = manifest.as_ref()

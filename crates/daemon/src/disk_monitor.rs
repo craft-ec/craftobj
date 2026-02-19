@@ -37,9 +37,9 @@ pub fn get_disk_space(path: &Path) -> Option<DiskSpace> {
             return None;
         }
         let stat = unsafe { stat.assume_init() };
-        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-        let available = stat.f_bavail as u64 * stat.f_frsize as u64;
-        let used = total.saturating_sub(stat.f_bfree as u64 * stat.f_frsize as u64);
+        let total = stat.f_blocks as u64 * stat.f_frsize;
+        let available = stat.f_bavail as u64 * stat.f_frsize;
+        let used = total.saturating_sub(stat.f_bfree as u64 * stat.f_frsize);
         let percent = if total > 0 { used as f64 / total as f64 } else { 0.0 };
         Some(DiskSpace {
             used_bytes: used,

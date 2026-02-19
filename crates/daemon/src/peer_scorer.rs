@@ -304,6 +304,7 @@ impl PeerScorer {
     }
 
     /// Update capabilities, storage info, and merkle root from peer discovery.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_capabilities_full(
         &mut self,
         peer: &PeerId,
@@ -575,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_empty_scorer() {
-        let mut scorer = PeerScorer::new();
+        let scorer = PeerScorer::new();
         assert!(scorer.is_empty());
         assert_eq!(scorer.len(), 0);
     }

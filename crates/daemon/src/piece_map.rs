@@ -16,6 +16,7 @@ use libp2p::PeerId;
 ///
 /// Only tracks segments where the local node holds at least one piece.
 /// Events for untracked segments are discarded.
+#[allow(clippy::type_complexity)]
 pub struct PieceMap {
     /// (node_bytes, cid, segment, piece_id) → coefficients
     pieces: HashMap<(Vec<u8>, ContentId, u32, [u8; 32]), Vec<u8>>,

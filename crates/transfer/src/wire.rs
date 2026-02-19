@@ -98,7 +98,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 max_pieces: *max_pieces,
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PIECE_SYNC, payload))
         }
         CraftObjRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
@@ -110,7 +110,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 data: data.clone(),
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PIECE_PUSH, payload))
         }
         CraftObjRequest::ManifestPush { content_id, record_json } => {
@@ -119,7 +119,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 record_json: record_json.clone(),
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_MANIFEST_PUSH, payload))
         }
         CraftObjRequest::PieceMapQuery { content_id, segment_index } => {
@@ -128,7 +128,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 segment_index: *segment_index,
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PIECE_MAP_QUERY, payload))
         }
         CraftObjRequest::MerkleRoot { content_id, segment_index } => {
@@ -137,7 +137,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 segment_index: *segment_index,
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_MERKLE_ROOT, payload))
         }
         CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
@@ -147,7 +147,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 since_root: *since_root,
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_MERKLE_DIFF, payload))
         }
         CraftObjRequest::PdpChallenge { content_id, segment_index, piece_id, nonce, byte_positions } => {
@@ -159,7 +159,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 byte_positions: byte_positions.clone(),
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PDP_CHALLENGE, payload))
         }
         CraftObjRequest::PexExchange { payload } => {
@@ -171,7 +171,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 pieces: pieces.clone(),
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PIECE_BATCH_PUSH, payload))
         }
         CraftObjRequest::CapabilityRequest => {
@@ -273,17 +273,17 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
     match response {
         CraftObjResponse::PieceBatch { pieces } => {
             let payload = bincode::serialize(pieces)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PIECE_BATCH, payload))
         }
         CraftObjResponse::Ack { status } => {
             let payload = bincode::serialize(status)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_ACK, payload))
         }
         CraftObjResponse::PieceMapEntries { entries } => {
             let payload = bincode::serialize(entries)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PIECE_MAP_ENTRIES, payload))
         }
         CraftObjResponse::MerkleRootResponse { root, leaf_count } => {
@@ -292,7 +292,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 leaf_count: *leaf_count,
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_MERKLE_ROOT_RESPONSE, payload))
         }
         CraftObjResponse::MerkleDiffResponse { current_root, added, removed } => {
@@ -302,7 +302,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 removed: removed.clone(),
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_MERKLE_DIFF_RESPONSE, payload))
         }
         CraftObjResponse::PdpProof { piece_id, coefficients, challenged_bytes, proof_hash } => {
@@ -313,7 +313,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 proof_hash: *proof_hash,
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_PDP_PROOF, payload))
         }
         CraftObjResponse::PexExchangeResponse { payload } => {
@@ -325,7 +325,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 failed_pieces: failed_pieces.clone(),
             };
             let payload = bincode::serialize(&inner)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok((TYPE_BATCH_ACK, payload))
         }
         CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region } => {
@@ -334,7 +334,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 "storage_committed_bytes": storage_committed_bytes,
                 "storage_used_bytes": storage_used_bytes,
                 "region": region,
-            })).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            })).map_err(io::Error::other)?;
             Ok((TYPE_CAPABILITY_RESPONSE, payload))
         }
     }

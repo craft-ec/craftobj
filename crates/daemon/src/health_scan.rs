@@ -639,6 +639,14 @@ impl HealthScan {
         _offset: usize,
     ) {
         let store_guard = self.store.lock().await;
+        
+        // Snapshot piece IDs before repair to find the newly generated one
+        let pieces_before: std::collections::HashSet<[u8; 32]> = store_guard
+            .list_pieces(&cid, segment)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        
         let result = crate::health::heal_segment(&store_guard, &cid, segment, 1);
 
         if result.pieces_generated == 0 {
@@ -650,15 +658,29 @@ impl HealthScan {
         }
 
         if let Ok(pieces_after) = store_guard.list_pieces(&cid, segment) {
-            if let Some(&new_pid) = pieces_after.last() {
-                if let Ok((_data, coefficients)) = store_guard.get_piece(&cid, segment, &new_pid) {
+            // Find the newly generated piece by diffing before/after
+            let new_pieces: Vec<[u8; 32]> = pieces_after
+                .into_iter()
+                .filter(|pid| !pieces_before.contains(pid))
+                .collect();
+            
+            if new_pieces.is_empty() {
+                warn!(
+                    "HealthScan repair for {}/seg{}: heal_segment reported {} generated but no new piece found in store",
+                    cid, segment, result.pieces_generated
+                );
+                return;
+            }
+            
+            for new_pid in &new_pieces {
+                if let Ok((_data, coefficients)) = store_guard.get_piece(&cid, segment, new_pid) {
                     let mut map = self.piece_map.lock().await;
                     let seq = map.next_seq();
                     let stored = craftobj_core::PieceStored {
                         node: local_node.to_vec(),
                         cid,
                         segment,
-                        piece_id: new_pid,
+                        piece_id: *new_pid,
                         coefficients,
                         seq,
                         timestamp: std::time::SystemTime::now()
@@ -669,15 +691,16 @@ impl HealthScan {
                     };
                     let event = craftobj_core::PieceEvent::Stored(stored);
                     map.apply_event(&event);
-                    // Publish DHT provider record for this CID+segment
-                    let pkey = craftobj_routing::providers_dht_key(&cid);
-                    let _ = self.command_tx.send(CraftObjCommand::StartProviding { key: pkey });
-                    info!(
-                        "HealthScan repair complete for {}/seg{}: generated 1 new piece",
-                        cid, segment
-                    );
                 }
             }
+            
+            // Publish DHT provider record for this CID+segment
+            let pkey = craftobj_routing::providers_dht_key(&cid);
+            let _ = self.command_tx.send(CraftObjCommand::StartProviding { key: pkey });
+            info!(
+                "HealthScan repair complete for {}/seg{}: generated {} new piece(s)",
+                cid, segment, new_pieces.len()
+            );
         }
     }
 
@@ -790,7 +813,7 @@ impl HealthScan {
         let cutoff = since.unwrap_or(0);
         reader
             .lines()
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter_map(|line| serde_json::from_str::<HealthSnapshot>(&line).ok())
             .filter(|s| s.timestamp >= cutoff)
             .collect()
@@ -820,6 +843,7 @@ pub async fn run_health_scan_loop(health_scan: Arc<Mutex<HealthScan>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::MerkleDiffResult;
     use craftobj_core::{ContentId, PieceEvent, PieceStored};
 
     fn make_tx() -> mpsc::UnboundedSender<CraftObjCommand> {

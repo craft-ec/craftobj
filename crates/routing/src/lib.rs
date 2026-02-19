@@ -78,7 +78,7 @@ pub fn verification_dht_key(content_id: &ContentId) -> Vec<u8> {
 pub fn provider_key(content_id: &ContentId, segment_index: u32) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"craftobj/provider/");
-    hasher.update(&content_id.0);
+    hasher.update(content_id.0);
     hasher.update(segment_index.to_be_bytes());
     hasher.finalize().to_vec()
 }

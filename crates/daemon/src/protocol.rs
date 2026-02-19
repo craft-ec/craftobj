@@ -60,6 +60,7 @@ pub struct CraftObjProtocol {
 
 /// Tracks what we're waiting for from a DHT query.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 enum PendingQuery {
     ProvidersLookup { content_id: ContentId },
     ManifestLookup { content_id: ContentId },
@@ -162,11 +163,8 @@ impl CraftObjProtocol {
     pub async fn handle_kademlia_event(&self, event: &libp2p::kad::Event) {
         use libp2p::kad::Event;
 
-        match event {
-            Event::OutboundQueryProgressed { id, result, .. } => {
-                self.handle_query_result(*id, result).await;
-            }
-            _ => {}
+        if let Event::OutboundQueryProgressed { id, result, .. } = event {
+            self.handle_query_result(*id, result).await;
         }
     }
 

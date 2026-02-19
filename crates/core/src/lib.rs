@@ -73,7 +73,7 @@ pub type ContentManifest = ContentRecord;
 impl ContentRecord {
     pub fn segment_count(&self) -> usize {
         if self.total_size == 0 { return 0; }
-        ((self.total_size as usize) + SEGMENT_SIZE - 1) / SEGMENT_SIZE
+        (self.total_size as usize).div_ceil(SEGMENT_SIZE)
     }
     pub fn k(&self) -> usize { SEGMENT_SIZE.div_ceil(PIECE_SIZE) }
     pub fn k_for_segment(&self, segment_index: usize) -> usize {
@@ -88,7 +88,7 @@ impl ContentRecord {
     }
     pub fn last_segment_k(&self) -> usize {
         let remainder = (self.total_size as usize) % SEGMENT_SIZE;
-        if remainder == 0 { self.k() } else { (remainder + PIECE_SIZE - 1) / PIECE_SIZE }
+        if remainder == 0 { self.k() } else { remainder.div_ceil(PIECE_SIZE) }
     }
     pub fn segment_size(&self) -> usize { SEGMENT_SIZE }
     pub fn piece_size(&self) -> usize { PIECE_SIZE }

@@ -70,7 +70,7 @@ pub fn compute_proof_hash(piece_data: &[u8], byte_positions: &[u32], coefficient
     let mut hasher = Sha256::new();
     for &pos in byte_positions {
         if (pos as usize) < piece_data.len() {
-            hasher.update(&[piece_data[pos as usize]]);
+            hasher.update([piece_data[pos as usize]]);
         }
     }
     hasher.update(coefficients);
@@ -112,6 +112,7 @@ pub enum CrossVerifyResult {
 ///
 /// # Returns
 /// `CrossVerifyResult` indicating whether verification passed, failed, or was inconclusive.
+#[allow(clippy::needless_range_loop)] // Matrix index arithmetic is clearer with explicit indices
 pub fn cross_verify_piece(
     own_pieces: &[(Vec<u8>, Vec<u8>)], // (data, coefficients) pairs
     prover_coefficients: &[u8],
@@ -153,8 +154,8 @@ pub fn cross_verify_piece(
     let mut matrix: Vec<Vec<u8>> = Vec::with_capacity(k);
     for row in 0..k {
         let mut r = Vec::with_capacity(n + 1);
-        for col in 0..n {
-            r.push(own_coeffs[col][row]);
+        for coeff in own_coeffs.iter().take(n) {
+            r.push(coeff[row]);
         }
         r.push(prover_coefficients[row]);
         matrix.push(r);
@@ -187,12 +188,15 @@ pub fn cross_verify_piece(
         for c in 0..cols {
             matrix[row][c] = GF256::mul(matrix[row][c], inv);
         }
+        // Eliminate other rows
         for other in 0..k {
             if other == row { continue; }
             let factor = matrix[other][pivot_col];
             if factor == 0 { continue; }
+            // Use row values to eliminate - need to avoid borrow issues
+            let row_copy: Vec<u8> = matrix[row].clone();
             for c in 0..cols {
-                let val = GF256::mul(factor, matrix[row][c]);
+                let val = GF256::mul(factor, row_copy[c]);
                 matrix[other][c] = GF256::add(matrix[other][c], val);
             }
         }
@@ -456,6 +460,7 @@ pub fn create_storage_receipt(
 }
 
 /// Create and sign a StorageReceipt.
+#[allow(clippy::too_many_arguments)]
 pub fn create_signed_storage_receipt(
     content_id: ContentId,
     storage_node: [u8; 32],

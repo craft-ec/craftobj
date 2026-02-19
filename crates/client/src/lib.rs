@@ -470,7 +470,7 @@ impl CraftObjClient {
                 let mut s = [0u8; 32];
                 use sha2::Digest;
                 let hash = sha2::Sha256::digest(
-                    &[&new_content_id.0[..], &seg_idx.to_le_bytes()[..]].concat(),
+                    [&new_content_id.0[..], &seg_idx.to_le_bytes()[..]].concat(),
                 );
                 s.copy_from_slice(&hash);
                 s

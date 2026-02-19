@@ -324,7 +324,7 @@ pub async fn run_initial_push(
                 return (peer, 0usize, read_failed.len(), read_failed);
             }
 
-            let payload_count = payloads.len();
+            let _payload_count = payloads.len();
             let (reply_tx, reply_rx) = oneshot::channel();
             let cmd = CraftObjCommand::DistributePieces {
                 peer_id: peer,
@@ -363,7 +363,7 @@ pub async fn run_initial_push(
 
     // Wait for all peer distribution tasks
     let mut total_pushed = 0usize;
-    let mut total_failed_count = 0usize;
+    let mut _total_failed_count = 0usize;
     let mut failed_pieces: Vec<[u8; 32]> = Vec::new();
 
     let peer_results = futures::future::join_all(peer_futures).await;
@@ -371,7 +371,7 @@ pub async fn run_initial_push(
         match result {
             Ok((peer, successes, failures, failed_pids)) => {
                 total_pushed += successes;
-                total_failed_count += failures;
+                _total_failed_count += failures;
                 failed_pieces.extend(failed_pids);
                 info!("[reannounce.rs] Peer {}: {} successes, {} failures", peer, successes, failures);
             }

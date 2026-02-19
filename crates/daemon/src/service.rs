@@ -14,7 +14,7 @@ use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::stream_manager::{StreamManager, InboundMessage, OutboundMessage};
+use crate::stream_manager::{StreamManager, OutboundMessage};
 
 use crate::behaviour::{build_craftobj_swarm, CraftObjBehaviourEvent, CraftObjSwarm};
 use crate::commands::CraftObjCommand;
@@ -447,7 +447,7 @@ pub async fn run_daemon_with_config(
     let _ = event_tx.send(DaemonEvent::DiscoveryStatus {
         total_peers: 0,
         storage_peers: 0,
-        action: format!("Starting mDNS discovery and Kademlia bootstrap"),
+        action: "Starting mDNS discovery and Kademlia bootstrap".to_string(),
     });
 
     if ws_port > 0 {
@@ -576,7 +576,7 @@ async fn eviction_maintenance_loop(
                     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
                     let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
                     if ret == 0 {
-                        let available = stat.f_bavail as u64 * stat.f_frsize as u64;
+                        let available = stat.f_bavail as u64 * stat.f_frsize;
                         if available < DISK_SPACE_THRESHOLD {
                             warn!("[service.rs] Low disk space: {} bytes available (threshold: {} bytes)", available, DISK_SPACE_THRESHOLD);
                             let _ = event_tx.send(DaemonEvent::StoragePressure {
@@ -669,6 +669,7 @@ async fn eviction_maintenance_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Periodic garbage collection: delete unpinned content, enforce storage limits.
 async fn gc_loop(
     store: Arc<Mutex<craftobj_store::FsStore>>,
@@ -791,7 +792,7 @@ async fn gc_loop(
         }
     }
 }
-
+#[allow(clippy::too_many_arguments)]
 async fn drive_swarm(
     swarm: &mut CraftObjSwarm,
     protocol: Arc<CraftObjProtocol>,
@@ -802,13 +803,13 @@ async fn drive_swarm(
     event_tx: EventSender,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
     client: Arc<Mutex<craftobj_client::CraftObjClient>>,
-    max_storage_bytes: u64,
+    _max_storage_bytes: u64,
     store_for_repair: Arc<Mutex<craftobj_store::FsStore>>,
     demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>>,
-    merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
+    _merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
-    receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
+    _receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     max_peer_connections: usize,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
     daemon_config: Arc<Mutex<crate::config::DaemonConfig>>,
@@ -817,7 +818,7 @@ async fn drive_swarm(
     use libp2p::futures::StreamExt;
 
     // Stream manager for persistent piece transfer
-    let mut stream_control = swarm.behaviour().stream.new_control();
+    let stream_control = swarm.behaviour().stream.new_control();
     let (mut stream_manager, mut inbound_rx, outbound_tx, distribution_tx, fetch_control) = StreamManager::new(stream_control);
 
     // Peer reconnector for exponential backoff reconnection
@@ -1136,7 +1137,7 @@ async fn drive_swarm(
 
                 // Handle PieceSync inline — uses send_pieces for batched transfer
                 if let CraftObjRequest::PieceSync { ref content_id, segment_index, ref have_pieces, max_pieces, .. } = msg.request {
-                    let content_id = content_id.clone();
+                    let content_id = *content_id;
                     let have_pieces = have_pieces.clone();
                     let store_clone = store_for_repair.clone();
                     let dt_clone = demand_tracker.clone();
@@ -1146,7 +1147,7 @@ async fn drive_swarm(
                         info!("[provide] PieceSync from {} for {}/seg{} (have={}, max={})", &peer.to_string()[..8], content_id, segment_index, have_pieces.len(), max_pieces);
                         
                         // Record demand
-                        dt_clone.lock().await.record_fetch(content_id.clone());
+                        dt_clone.lock().await.record_fetch(content_id);
                         
                         // Read pieces from store
                         let store_guard = store_clone.lock().await;
@@ -1289,6 +1290,7 @@ async fn drive_swarm(
 }
 
 /// Handle an incoming transfer request from a peer via persistent stream.
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming_transfer_request(
     peer: &libp2p::PeerId,
     request: CraftObjRequest,
@@ -1649,16 +1651,17 @@ async fn handle_incoming_transfer_request(
 }
 
 /// Handle a command from the IPC handler.
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     swarm: &mut CraftObjSwarm,
     protocol: &Arc<CraftObjProtocol>,
     command: CraftObjCommand,
     pending_requests: PendingRequests,
     outbound_tx: &mpsc::Sender<OutboundMessage>,
-    distribution_tx: &mpsc::Sender<crate::stream_manager::DistributionMessage>,
+    _distribution_tx: &mpsc::Sender<crate::stream_manager::DistributionMessage>,
     event_tx: &EventSender,
-    region: &Option<String>,
-    signing_key: &Option<ed25519_dalek::SigningKey>,
+    _region: &Option<String>,
+    _signing_key: &Option<ed25519_dalek::SigningKey>,
     fetch_control: &libp2p_stream::Control,
     store_for_repair: &Arc<Mutex<craftobj_store::FsStore>>,
 ) {
@@ -1792,7 +1795,7 @@ async fn handle_command(
 
                 // Send PieceSync request to trigger the provider's send_pieces
                 let request = CraftObjRequest::PieceSync {
-                    content_id: content_id.clone(),
+                    content_id,
                     segment_index,
                     merkle_root: [0u8; 32],
                     have_pieces,

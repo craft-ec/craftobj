@@ -452,22 +452,6 @@ impl ChallengerManager {
         })
     }
 
-    /// Load our own pieces for a given CID and segment from local store.
-    /// Returns (data, coefficients) pairs for cross-verification.
-    fn load_own_pieces(&self, store: &FsStore, cid: &ContentId, segment_index: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let piece_ids = match store.list_pieces(cid, segment_index) {
-            Ok(ids) => ids,
-            Err(_) => return Vec::new(),
-        };
-        let mut pieces = Vec::new();
-        for pid in &piece_ids {
-            if let Ok((data, coeff)) = store.get_piece(cid, segment_index, pid) {
-                pieces.push((data, coeff));
-            }
-        }
-        pieces
-    }
-
     async fn resolve_providers(&self, cid: ContentId) -> Result<Vec<PeerId>, String> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -505,39 +489,6 @@ impl ChallengerManager {
         }
     }
 
-    /// Request a piece from a peer via PieceSync (requesting 1 piece, excluding none).
-    /// This is kept for compatibility but PDP challenges should use send_pdp_challenge instead.
-    async fn request_piece(
-        &self,
-        peer: PeerId,
-        cid: ContentId,
-        segment_index: u32,
-        _piece_id: &[u8; 32],
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(CraftObjCommand::PieceSync {
-                peer_id: peer,
-                content_id: cid,
-                segment_index,
-                merkle_root: [0u8; 32],
-                have_pieces: vec![],
-                max_pieces: 1,
-                reply_tx: tx,
-            })
-            .map_err(|e| format!("Failed to send PieceSync: {}", e))?;
-        let response = rx.await.map_err(|e| format!("Channel closed: {}", e))??;
-        match response {
-            craftobj_transfer::CraftObjResponse::PieceBatch { pieces } => {
-                if let Some(piece) = pieces.into_iter().next() {
-                    Ok((piece.coefficients, piece.data))
-                } else {
-                    Err("no pieces returned".into())
-                }
-            }
-            _ => Err("unexpected response type".into()),
-        }
-    }
 }
 
 #[cfg(test)]

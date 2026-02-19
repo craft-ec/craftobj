@@ -27,6 +27,7 @@ pub struct CraftObjBehaviour {
 
 /// Events emitted by CraftObjBehaviour.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CraftObjBehaviourEvent {
     Craft(CraftBehaviourEvent),
     // libp2p_stream::Behaviour produces no events (streams are accepted via Control)

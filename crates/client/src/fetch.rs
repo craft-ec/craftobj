@@ -679,6 +679,7 @@ mod tests {
             pieces.entry(key).or_default().push((coefficients, data));
         }
 
+        #[allow(dead_code)] // Test utility for future use
         fn set_delay(&self, provider: &ProviderId, delay: Duration) {
             self.delays
                 .lock()
@@ -693,6 +694,7 @@ mod tests {
                 .insert(provider.0.clone());
         }
 
+        #[allow(dead_code)] // Test utility for future use
         fn request_count(&self, provider: &ProviderId) -> u64 {
             *self
                 .request_counts
@@ -952,7 +954,7 @@ mod tests {
             }
         }
 
-        let providers = vec![ProviderId("p0".into()), ProviderId("p1".into())];
+        let _providers = vec![ProviderId("p0".into()), ProviderId("p1".into())];
 
         // Only fetch segment 1 (starts at byte 10_485_760)
         let segs = segments_for_range(&manifest, 10_485_760, 500);

@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 
 use craftobj_core::ContentId;
 use craftobj_store::FsStore;
@@ -47,14 +47,13 @@ where
     let total = pieces.len();
     let mut confirmed = 0usize;
     let mut failed = 0usize;
-    let mut seq_id = 0u64;
-
     for (batch_idx, chunk) in pieces.chunks(BATCH_SIZE).enumerate() {
+        let seq_id = batch_idx as u64;
         let batch_start = std::time::Instant::now();
         let batch_len = chunk.len();
 
         let request = CraftObjRequest::PieceBatchPush {
-            content_id: content_id.clone(),
+            content_id: *content_id,
             pieces: chunk.to_vec(),
         };
 
@@ -82,7 +81,6 @@ where
             Err(_) => return Err(format!("[{}] batch#{}: ack timeout (30s)", label, batch_idx)),
         }
 
-        seq_id += 1;
     }
 
     info!("[{}] complete: {}/{} confirmed, {} failed", label, confirmed, total, failed);
