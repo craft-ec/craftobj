@@ -118,13 +118,13 @@ impl CraftObjProtocol {
     }
 
     /// Get a manifest from the DHT.
-    pub async fn get_manifest(
+    pub async fn get_record(
         &self,
         behaviour: &mut CraftBehaviour,
         content_id: &ContentId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Getting manifest for {}", content_id);
-        let query_id = ContentRouter::get_manifest(behaviour, content_id);
+        let query_id = ContentRouter::get_record(behaviour, content_id);
 
         let mut queries = self.pending_queries.lock().await;
         queries.insert(query_id, PendingQuery::ManifestLookup {

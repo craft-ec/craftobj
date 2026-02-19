@@ -40,14 +40,14 @@ async fn test_push_distribute_and_reconstruct() {
 
     let store_a = FsStore::new(&dir_a).unwrap();
     let store_b = FsStore::new(&dir_b).unwrap();
-    let manifest = store_a.get_manifest(&content_id).unwrap();
+    let manifest = store_a.get_record(&content_id).unwrap();
 
-    // Push manifest to Node B (simulates PushManifest command)
-    store_b.store_manifest(&manifest).unwrap();
+    // Push manifest to Node B (simulates PushRecord command)
+    store_b.store_record(&manifest).unwrap();
 
     // Push only 2 pieces per segment (simulates round-robin with 2-per-peer cap)
     let max_per_segment = 2;
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let k = manifest.k_for_segment(seg_idx as usize);
         let piece_ids = store_a.list_pieces(&content_id, seg_idx).unwrap();
 
@@ -96,17 +96,17 @@ async fn test_three_node_distribute_and_reconstruct() {
     let content_id = result.content_id;
 
     let store_a = FsStore::new(&dir_a).unwrap();
-    let manifest = store_a.get_manifest(&content_id).unwrap();
+    let manifest = store_a.get_record(&content_id).unwrap();
 
     let store_b = FsStore::new(&dir_b).unwrap();
     let store_c = FsStore::new(&dir_c).unwrap();
 
     // Push manifest to both
-    store_b.store_manifest(&manifest).unwrap();
-    store_c.store_manifest(&manifest).unwrap();
+    store_b.store_record(&manifest).unwrap();
+    store_c.store_record(&manifest).unwrap();
 
     // Round-robin pieces: even-indexed to B, odd-indexed to C
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let piece_ids = store_a.list_pieces(&content_id, seg_idx).unwrap();
         for (i, pid) in piece_ids.iter().enumerate() {
             let (data, coeff) = store_a.get_piece(&content_id, seg_idx, pid).unwrap();
@@ -121,9 +121,9 @@ async fn test_three_node_distribute_and_reconstruct() {
     // Simulate a fetcher (Node D) that gathers pieces from both B and C
     let dir_d = temp_dir("3n-d");
     let store_d = FsStore::new(&dir_d).unwrap();
-    store_d.store_manifest(&manifest).unwrap();
+    store_d.store_record(&manifest).unwrap();
 
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let k = manifest.k_for_segment(seg_idx as usize);
         let mut collected = 0;
 

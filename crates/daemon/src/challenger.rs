@@ -205,7 +205,7 @@ impl ChallengerManager {
         info!("Running challenge round for {} (we are challenger)", cid);
 
         let manifest = store
-            .get_manifest(&cid)
+            .get_record(&cid)
             .map_err(|e| format!("Failed to get manifest: {}", e))?;
 
         // Determine which segments to sample: all if ≤5, random subset otherwise

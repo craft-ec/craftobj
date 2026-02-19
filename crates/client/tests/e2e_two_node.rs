@@ -106,10 +106,10 @@ async fn test_two_node_publish_fetch_plaintext() {
     assert!(publish_result.encryption_key.is_none());
 
     let store_a = FsStore::new(&dir_a).unwrap();
-    let manifest = store_a.get_manifest(&content_id).unwrap();
+    let manifest = store_a.get_record(&content_id).unwrap();
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
         for p in &pieces {
             store_b
@@ -118,7 +118,7 @@ async fn test_two_node_publish_fetch_plaintext() {
         }
     }
 
-    store_b.store_manifest(&manifest).unwrap();
+    store_b.store_record(&manifest).unwrap();
 
     let client_b = CraftObjClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("output.bin");
@@ -155,10 +155,10 @@ async fn test_two_node_publish_fetch_encrypted() {
     assert_ne!(content_id, plaintext_cid);
 
     let store_a = FsStore::new(&dir_a).unwrap();
-    let manifest = store_a.get_manifest(&content_id).unwrap();
+    let manifest = store_a.get_record(&content_id).unwrap();
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
         for p in &pieces {
             store_b
@@ -167,7 +167,7 @@ async fn test_two_node_publish_fetch_encrypted() {
         }
     }
 
-    store_b.store_manifest(&manifest).unwrap();
+    store_b.store_record(&manifest).unwrap();
 
     let client_b = CraftObjClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("decrypted.txt");
@@ -199,10 +199,10 @@ async fn test_two_node_any_piece_request() {
     let content_id = publish_result.content_id;
 
     let store_a = FsStore::new(&dir_a).unwrap();
-    let manifest = store_a.get_manifest(&content_id).unwrap();
+    let manifest = store_a.get_record(&content_id).unwrap();
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let k = manifest.k_for_segment(seg_idx as usize);
         let pieces = simulate_piece_sync(&store_a, &content_id, seg_idx, vec![], 1000).await;
         for p in &pieces {
@@ -215,7 +215,7 @@ async fn test_two_node_any_piece_request() {
         assert!(stored.len() >= k, "expected at least {} pieces, got {}", k, stored.len());
     }
 
-    store_b.store_manifest(&manifest).unwrap();
+    store_b.store_record(&manifest).unwrap();
 
     let client_b = CraftObjClient::new(&dir_b).unwrap();
     let output_path = dir_b.join("recovered.bin");

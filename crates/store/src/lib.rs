@@ -166,7 +166,7 @@ impl FsStore {
     }
 
     /// Store a content manifest.
-    pub fn store_manifest(&self, manifest: &ContentManifest) -> Result<()> {
+    pub fn store_record(&self, manifest: &ContentManifest) -> Result<()> {
         let path = self
             .data_dir
             .join("manifests")
@@ -179,7 +179,7 @@ impl FsStore {
     }
 
     /// Retrieve a content manifest.
-    pub fn get_manifest(&self, content_id: &ContentId) -> Result<ContentManifest> {
+    pub fn get_record(&self, content_id: &ContentId) -> Result<ContentManifest> {
         let path = self
             .data_dir
             .join("manifests")
@@ -523,7 +523,7 @@ impl GarbageCollector {
         let mut total: u64 = 0;
         let mut candidates: Vec<(ContentId, u64)> = Vec::new();
         for cid in &all_content {
-            if let Ok(manifest) = store.get_manifest(cid) {
+            if let Ok(manifest) = store.get_record(cid) {
                 total += manifest.total_size;
                 if !pin_manager.is_pinned(cid) {
                     candidates.push((*cid, manifest.total_size));
@@ -676,10 +676,10 @@ mod tests {
         let cid = ContentId::from_bytes(b"test content");
         let manifest = make_manifest(cid);
 
-        store.store_manifest(&manifest).unwrap();
+        store.store_record(&manifest).unwrap();
         assert!(store.has_manifest(&cid));
 
-        let loaded = store.get_manifest(&cid).unwrap();
+        let loaded = store.get_record(&cid).unwrap();
         assert_eq!(loaded.content_id, cid);
         assert_eq!(loaded.total_size, 1000);
 
@@ -695,7 +695,7 @@ mod tests {
         let cid2 = ContentId::from_bytes(b"file2");
 
         for cid in [&cid1, &cid2] {
-            store.store_manifest(&make_manifest(*cid)).unwrap();
+            store.store_record(&make_manifest(*cid)).unwrap();
             let coeff = vec![1u8, 2, 3];
             let id = piece_id_from_coefficients(&coeff);
             store.store_piece(cid, 0, &id, b"data", &coeff).unwrap();
@@ -759,7 +759,7 @@ mod tests {
         for cid in [&cid1, &cid2, &cid3] {
             let mut manifest = make_manifest(*cid);
             manifest.total_size = 100;
-            store.store_manifest(&manifest).unwrap();
+            store.store_record(&manifest).unwrap();
         }
         pm.pin(&cid1).unwrap();
 

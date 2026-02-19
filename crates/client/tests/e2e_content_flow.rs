@@ -61,13 +61,13 @@ fn publish_and_distribute_round_robin() {
     let store_pub = FsStore::new(&dir_pub).unwrap();
     let store_s1 = FsStore::new(&dir_s1).unwrap();
     let store_s2 = FsStore::new(&dir_s2).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
+    let manifest = store_pub.get_record(&cid).unwrap();
 
     let total_encoded = total_piece_count(&store_pub, &cid, seg_count);
     assert!(total_encoded > 0);
 
-    store_s1.store_manifest(&manifest).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
+    store_s1.store_record(&manifest).unwrap();
+    store_s2.store_record(&manifest).unwrap();
 
     // Round-robin push ALL pieces, then delete from publisher
     let stores = [&store_s1, &store_s2];
@@ -112,9 +112,9 @@ fn push_with_mid_transfer_failure() {
     let store_pub = FsStore::new(&dir_pub).unwrap();
     let store_s1 = FsStore::new(&dir_s1).unwrap();
     let store_s2 = FsStore::new(&dir_s2).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
-    store_s1.store_manifest(&manifest).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
+    let manifest = store_pub.get_record(&cid).unwrap();
+    store_s1.store_record(&manifest).unwrap();
+    store_s2.store_record(&manifest).unwrap();
 
     // Push all pieces to s1. Only push first 2 to s2 (simulating failure after 2).
     let total_pieces = total_piece_count(&store_pub, &cid, seg_count);
@@ -164,8 +164,8 @@ fn push_with_single_storage_node() {
 
     let store_pub = FsStore::new(&dir_pub).unwrap();
     let store_s1 = FsStore::new(&dir_s1).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
-    store_s1.store_manifest(&manifest).unwrap();
+    let manifest = store_pub.get_record(&cid).unwrap();
+    store_s1.store_record(&manifest).unwrap();
 
     let total_encoded = total_piece_count(&store_pub, &cid, seg_count);
 
@@ -221,10 +221,10 @@ fn multiple_publishers_different_content() {
     let store_a = FsStore::new(&dir_a).unwrap();
     let store_b = FsStore::new(&dir_b).unwrap();
 
-    let manifest_a = store_a.get_manifest(&result_a.content_id).unwrap();
-    let manifest_b = store_b.get_manifest(&result_b.content_id).unwrap();
-    store.store_manifest(&manifest_a).unwrap();
-    store.store_manifest(&manifest_b).unwrap();
+    let manifest_a = store_a.get_record(&result_a.content_id).unwrap();
+    let manifest_b = store_b.get_record(&result_b.content_id).unwrap();
+    store.store_record(&manifest_a).unwrap();
+    store.store_record(&manifest_b).unwrap();
 
     for seg in 0..result_a.segment_count as u32 {
         for pid in store_a.list_pieces(&result_a.content_id, seg).unwrap() {
@@ -292,8 +292,8 @@ fn storage_node_at_capacity_refuses_via_gc() {
 
     let store_pub = FsStore::new(&dir_pub).unwrap();
     let store_node = FsStore::new(&dir_store).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
-    store_node.store_manifest(&manifest).unwrap();
+    let manifest = store_pub.get_record(&cid).unwrap();
+    store_node.store_record(&manifest).unwrap();
 
     // Push some pieces
     let seg0_pieces = store_pub.list_pieces(&cid, 0).unwrap();
@@ -312,7 +312,7 @@ fn storage_node_at_capacity_refuses_via_gc() {
     assert_eq!(removed, 1, "GC should remove unpinned content over capacity");
 
     // Content should be gone
-    assert!(store_node.get_manifest(&cid).is_err());
+    assert!(store_node.get_record(&cid).is_err());
 
     for d in [&dir_pub, &dir_store] {
         std::fs::remove_dir_all(d).ok();
@@ -337,7 +337,7 @@ fn tiny_file_less_than_one_piece() {
     assert_eq!(result.segment_count, 1);
     assert_eq!(result.total_size, content.len() as u64);
 
-    let manifest = client.store().get_manifest(&result.content_id).unwrap();
+    let manifest = client.store().get_record(&result.content_id).unwrap();
     let k = manifest.k_for_segment(0);
     assert_eq!(k, 1, "tiny file should have k=1");
 
@@ -362,7 +362,7 @@ fn exact_one_segment_file() {
     let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
     assert_eq!(result.segment_count, 1);
 
-    let manifest = client.store().get_manifest(&result.content_id).unwrap();
+    let manifest = client.store().get_record(&result.content_id).unwrap();
     let k = manifest.k_for_segment(0);
     assert_eq!(k, 40, "full segment should have k=40 (10MB/256KiB)");
 
@@ -386,7 +386,7 @@ fn multi_segment_with_partial_last() {
     let result = client.publish(&file_path, &PublishOptions::default()).unwrap();
     assert_eq!(result.segment_count, 2);
 
-    let manifest = client.store().get_manifest(&result.content_id).unwrap();
+    let manifest = client.store().get_record(&result.content_id).unwrap();
     let k0 = manifest.k_for_segment(0);
     let k1 = manifest.k_for_segment(1);
     assert_eq!(k0, 40, "full segment k=40 (10MB/256KiB)");
@@ -429,10 +429,10 @@ fn publish_and_distribute(
     let cid = result.content_id;
     let seg_count = result.segment_count;
     let store_pub = FsStore::new(&dir_pub).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
+    let manifest = store_pub.get_record(&cid).unwrap();
 
     for s in stores {
-        s.store_manifest(&manifest).unwrap();
+        s.store_record(&manifest).unwrap();
     }
 
     for seg in 0..seg_count as u32 {
@@ -460,8 +460,8 @@ fn equalization_one_non_provider() {
     let (cid, seg_count, _content) = publish_and_distribute(2_000_000, &[&store_s1, &store_s2]);
 
     // s3 is non-provider
-    let manifest = store_s1.get_manifest(&cid).unwrap();
-    store_s3.store_manifest(&manifest).unwrap();
+    let manifest = store_s1.get_record(&cid).unwrap();
+    store_s3.store_record(&manifest).unwrap();
     assert_eq!(total_piece_count(&store_s3, &cid, seg_count), 0);
 
     let total_before = total_piece_count(&store_s1, &cid, seg_count)
@@ -510,10 +510,10 @@ fn equalization_three_non_providers() {
     // All pieces on s1
     let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1]);
 
-    let manifest = store_s1.get_manifest(&cid).unwrap();
-    store_n1.store_manifest(&manifest).unwrap();
-    store_n2.store_manifest(&manifest).unwrap();
-    store_n3.store_manifest(&manifest).unwrap();
+    let manifest = store_s1.get_record(&cid).unwrap();
+    store_n1.store_record(&manifest).unwrap();
+    store_n2.store_record(&manifest).unwrap();
+    store_n3.store_record(&manifest).unwrap();
 
     let total_before = total_piece_count(&store_s1, &cid, seg_count);
 
@@ -596,8 +596,8 @@ fn equalization_multiple_rounds_converge() {
 
     // All pieces on s1
     let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1]);
-    let manifest = store_s1.get_manifest(&cid).unwrap();
-    store_s2.store_manifest(&manifest).unwrap();
+    let manifest = store_s1.get_record(&cid).unwrap();
+    store_s2.store_record(&manifest).unwrap();
 
     let total = total_piece_count(&store_s1, &cid, seg_count);
 
@@ -642,8 +642,8 @@ fn piece_uniqueness_after_equalization() {
     let store_s3 = FsStore::new(&dir_s3).unwrap();
 
     let (cid, seg_count, _) = publish_and_distribute(2_000_000, &[&store_s1, &store_s2]);
-    let manifest = store_s1.get_manifest(&cid).unwrap();
-    store_s3.store_manifest(&manifest).unwrap();
+    let manifest = store_s1.get_record(&cid).unwrap();
+    store_s3.store_record(&manifest).unwrap();
 
     // Equalize to s3
     for seg in 0..seg_count as u32 {
@@ -693,8 +693,8 @@ fn fetch_from_distributed_network() {
 
     // Client fetches k pieces per segment
     let store_client = FsStore::new(&dir_client).unwrap();
-    let manifest = store_s1.get_manifest(&cid).unwrap();
-    store_client.store_manifest(&manifest).unwrap();
+    let manifest = store_s1.get_record(&cid).unwrap();
+    store_client.store_record(&manifest).unwrap();
 
     for seg in 0..seg_count as u32 {
         let k = manifest.k_for_segment(seg as usize);
@@ -737,9 +737,9 @@ fn fetch_with_some_providers_offline() {
 
     // s2 is "offline" — client can only reach s1
     // s1 should have enough pieces (at least k due to parity) to reconstruct
-    let manifest = store_s1.get_manifest(&cid).unwrap();
+    let manifest = store_s1.get_record(&cid).unwrap();
     let store_client = FsStore::new(&dir_client).unwrap();
-    store_client.store_manifest(&manifest).unwrap();
+    store_client.store_record(&manifest).unwrap();
 
     let mut can_reconstruct = true;
     for seg in 0..seg_count as u32 {
@@ -783,7 +783,7 @@ fn fetch_tiny_file_k1() {
     std::fs::write(&file, content).unwrap();
 
     let result = client.publish(&file, &PublishOptions::default()).unwrap();
-    let manifest = client.store().get_manifest(&result.content_id).unwrap();
+    let manifest = client.store().get_record(&result.content_id).unwrap();
     assert_eq!(manifest.k_for_segment(0), 1);
 
     let output = dir.join("output.txt");
@@ -827,7 +827,7 @@ fn fetch_with_redundant_pieces_discards_extras() {
     let cid = result.content_id;
 
     // Verify we have more pieces than k (due to parity)
-    let manifest = client.store().get_manifest(&cid).unwrap();
+    let manifest = client.store().get_record(&cid).unwrap();
     for seg in 0..result.segment_count as u32 {
         let k = manifest.k_for_segment(seg as usize);
         let total = client.store().list_pieces(&cid, seg).unwrap().len();
@@ -924,7 +924,7 @@ fn unpin_gc_sweep_removes_content() {
     assert_eq!(removed, 1);
 
     // Content gone
-    assert!(client.store().get_manifest(&cid).is_err());
+    assert!(client.store().get_record(&cid).is_err());
     assert_eq!(client.store().list_pieces(&cid, 0).unwrap().len(), 0);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -949,7 +949,7 @@ fn gc_does_not_remove_pinned_content() {
     assert_eq!(removed, 0, "pinned content must not be GC'd");
 
     // Content still exists
-    assert!(client.store().get_manifest(&cid).is_ok());
+    assert!(client.store().get_record(&cid).is_ok());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -975,7 +975,7 @@ fn delete_content_removes_pieces_and_manifest() {
 
     // Pieces and manifest gone
     assert_eq!(total_piece_count(client.store(), &cid, result.segment_count), 0);
-    assert!(client.store().get_manifest(&cid).is_err());
+    assert!(client.store().get_record(&cid).is_err());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1073,8 +1073,8 @@ fn partial_push_retry_full_scenario() {
 
     let store_pub = FsStore::new(&dir_pub).unwrap();
     let store_storage = FsStore::new(&dir_storage).unwrap();
-    let manifest = store_pub.get_manifest(&cid).unwrap();
-    store_storage.store_manifest(&manifest).unwrap();
+    let manifest = store_pub.get_record(&cid).unwrap();
+    store_storage.store_record(&manifest).unwrap();
 
     let total_pieces = total_piece_count(&store_pub, &cid, seg_count);
 
@@ -1236,9 +1236,9 @@ fn gc_sweep_removes_only_unpinned_when_over_threshold() {
     assert_eq!(removed, 1, "should remove only the 1 unpinned content");
 
     // Pinned ones survive
-    assert!(client.store().get_manifest(&cids[0]).is_ok());
-    assert!(client.store().get_manifest(&cids[1]).is_err());
-    assert!(client.store().get_manifest(&cids[2]).is_ok());
+    assert!(client.store().get_record(&cids[0]).is_ok());
+    assert!(client.store().get_record(&cids[1]).is_err());
+    assert!(client.store().get_record(&cids[2]).is_ok());
 
     std::fs::remove_dir_all(&dir).ok();
 }

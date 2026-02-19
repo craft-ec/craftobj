@@ -78,7 +78,7 @@ enum PendingRequest {
     ResolveProviders {
         reply_tx: oneshot::Sender<Result<Vec<libp2p::PeerId>, String>>,
     },
-    GetManifest {
+    GetRecord {
         reply_tx: oneshot::Sender<Result<ContentManifest, String>>,
     },
     GetAccessList {
@@ -1258,7 +1258,7 @@ async fn handle_incoming_transfer_request(
             info!("[service.rs] PiecePush handler: store lock acquired");
 
             // Check if we have the manifest (must receive ManifestPush first)
-            if store_guard.get_manifest(&content_id).is_err() {
+            if store_guard.get_record(&content_id).is_err() {
                 warn!("[service.rs] Received piece push for {} but no manifest — rejecting", content_id);
                 return CraftObjResponse::Ack { status: WireStatus::Error };
             }
@@ -1313,14 +1313,14 @@ async fn handle_incoming_transfer_request(
                 }
             }
         }
-        CraftObjRequest::ManifestPush { content_id, manifest_json } => {
+        CraftObjRequest::ManifestPush { content_id, record_json } => {
             info!("[service.rs] Handling ManifestPush from {} for {}", peer, content_id);
-            match serde_json::from_slice::<craftobj_core::ContentManifest>(&manifest_json) {
+            match serde_json::from_slice::<craftobj_core::ContentManifest>(&record_json) {
                 Ok(manifest) => {
                     info!("[service.rs] ManifestPush handler: acquiring store lock...");
                     let store_guard = store.lock().await;
                     info!("[service.rs] ManifestPush handler: store lock acquired");
-                    match store_guard.store_manifest(&manifest) {
+                    match store_guard.store_record(&manifest) {
                         Ok(()) => {
                             info!("[service.rs] Stored manifest for {}", content_id);
                             if let Err(e) = protocol.event_tx.send(CraftObjEvent::ManifestPushReceived {
@@ -1506,7 +1506,7 @@ async fn handle_command(
             let result = async {
                 // Don't announce publisher as provider here — publishers delete all
                 // pieces after distribution. Storage nodes announce themselves in the
-                // PushManifest handler when they receive the manifest.
+                // PushRecord handler when they receive the manifest.
                 // We only publish the manifest to DHT so fetchers can find it.
                 protocol.publish_manifest(&mut swarm.behaviour_mut().craft, &manifest, &local_peer_id).await
                     .map_err(|e| format!("Failed to publish manifest: {}", e))?;
@@ -1549,14 +1549,14 @@ async fn handle_command(
             }
         }
         
-        CraftObjCommand::GetManifest { content_id, reply_tx } => {
+        CraftObjCommand::GetRecord { content_id, reply_tx } => {
             debug!("Handling get manifest command for {}", content_id);
             
-            match protocol.get_manifest(&mut swarm.behaviour_mut().craft, &content_id).await {
+            match protocol.get_record(&mut swarm.behaviour_mut().craft, &content_id).await {
                 Ok(()) => {
                     // Store the reply channel to respond when DHT query completes
                     let mut pending = pending_requests.lock().await;
-                    pending.insert(content_id, PendingRequest::GetManifest { reply_tx });
+                    pending.insert(content_id, PendingRequest::GetRecord { reply_tx });
                     debug!("Started DHT manifest retrieval for {}", content_id);
                 }
                 Err(e) => {
@@ -1722,26 +1722,26 @@ async fn handle_command(
             });
         }
 
-        CraftObjCommand::PushManifest { peer_id, content_id, manifest_json, reply_tx } => {
+        CraftObjCommand::PushRecord { peer_id, content_id, record_json, reply_tx } => {
             debug!("Handling push manifest command for {} to {}", content_id, peer_id);
             let request = CraftObjRequest::ManifestPush {
                 content_id,
-                manifest_json,
+                record_json,
             };
             let (ack_tx, ack_rx) = oneshot::channel();
             let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
             let tx = outbound_tx.clone();
             tokio::spawn(async move {
-                info!("[service.rs] PushManifest: sending to outbound queue for {}", peer_id);
+                info!("[service.rs] PushRecord: sending to outbound queue for {}", peer_id);
                 if tx.send(msg).await.is_err() {
-                    warn!("[service.rs] PushManifest to {}: outbound channel closed", peer_id);
+                    warn!("[service.rs] PushRecord to {}: outbound channel closed", peer_id);
                     let _ = reply_tx.send(Err("outbound channel closed".into()));
                     return;
                 }
-                info!("[service.rs] PushManifest: waiting for ack from {} (5s timeout)", peer_id);
+                info!("[service.rs] PushRecord: waiting for ack from {} (5s timeout)", peer_id);
                 match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
                     Ok(Ok(CraftObjResponse::Ack { status })) => {
-                        info!("[service.rs] PushManifest to {}: got ack status={:?}", peer_id, status);
+                        info!("[service.rs] PushRecord to {}: got ack status={:?}", peer_id, status);
                         if status == craftobj_core::WireStatus::Ok {
                             let _ = reply_tx.send(Ok(()));
                         } else {
@@ -1749,15 +1749,15 @@ async fn handle_command(
                         }
                     }
                     Ok(Ok(other)) => { 
-                        warn!("[service.rs] PushManifest to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
+                        warn!("[service.rs] PushRecord to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
                         let _ = reply_tx.send(Err("unexpected response type".into())); 
                     }
                     Ok(Err(_)) => { 
-                        warn!("[service.rs] PushManifest to {}: ack channel closed", peer_id);
+                        warn!("[service.rs] PushRecord to {}: ack channel closed", peer_id);
                         let _ = reply_tx.send(Err("ack channel closed".into())); 
                     }
                     Err(_) => {
-                        warn!("[service.rs] PushManifest to {}: timed out after 5s", peer_id);
+                        warn!("[service.rs] PushRecord to {}: timed out after 5s", peer_id);
                         let _ = reply_tx.send(Err("manifest push timed out".into()));
                     }
                 }
@@ -1991,7 +1991,7 @@ async fn handle_protocol_events(
                 
                 // Find and respond to the waiting request
                 let mut pending = pending_requests.lock().await;
-                if let Some(PendingRequest::GetManifest { reply_tx }) = pending.remove(&content_id) {
+                if let Some(PendingRequest::GetRecord { reply_tx }) = pending.remove(&content_id) {
                     let _ = reply_tx.send(Ok(manifest));
                     debug!("Responded to manifest retrieval request for {}", content_id);
                 }
@@ -2073,7 +2073,7 @@ async fn handle_protocol_events(
                         PendingRequest::ResolveProviders { reply_tx } => {
                             let _ = reply_tx.send(Err(error));
                         }
-                        PendingRequest::GetManifest { reply_tx } => {
+                        PendingRequest::GetRecord { reply_tx } => {
                             let _ = reply_tx.send(Err(error));
                         }
                         PendingRequest::GetAccessList { reply_tx } => {

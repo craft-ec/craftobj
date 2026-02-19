@@ -46,7 +46,7 @@ pub enum CraftObjRequest {
     /// Push a manifest to a storage peer. Must arrive before pieces.
     ManifestPush {
         content_id: ContentId,
-        manifest_json: Vec<u8>,
+        record_json: Vec<u8>,
     },
     /// Query PieceMap entries for a specific segment (lightweight — no piece data).
     PieceMapQuery {
@@ -162,7 +162,7 @@ mod tests {
         };
         let _manifest = CraftObjRequest::ManifestPush {
             content_id: ContentId::from_bytes(b"test"),
-            manifest_json: vec![],
+            record_json: vec![],
         };
         let _merkle_root = CraftObjRequest::MerkleRoot {
             content_id: ContentId::from_bytes(b"test"),

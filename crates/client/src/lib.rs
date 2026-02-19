@@ -188,7 +188,7 @@ impl CraftObjClient {
             signature: vec![],
             verification: verification_record.clone(),
         };
-        self.store.store_manifest(&manifest)?;
+        self.store.store_record(&manifest)?;
 
         // Auto-pin published content
         self.pin_manager.pin(&content_id)?;
@@ -220,9 +220,9 @@ impl CraftObjClient {
     ) -> Result<PublishResult> {
         let mut result = self.publish(path, options)?;
 
-        let mut manifest = self.store.get_manifest(&result.content_id)?;
+        let mut manifest = self.store.get_record(&result.content_id)?;
         manifest.sign(keypair);
-        self.store.store_manifest(&manifest)?;
+        self.store.store_record(&manifest)?;
         result.manifest = manifest;
 
         Ok(result)
@@ -251,7 +251,7 @@ impl CraftObjClient {
         dest: &Path,
         encryption_key: Option<&[u8]>,
     ) -> Result<()> {
-        let manifest = self.store.get_manifest(content_id)?;
+        let manifest = self.store.get_record(content_id)?;
         let config = ErasureConfig {
             piece_size: manifest.piece_size(),
             segment_size: manifest.segment_size(),
@@ -333,7 +333,7 @@ impl CraftObjClient {
         let content_ids = self.store.list_content()?;
         let mut result = Vec::new();
         for cid in content_ids {
-            if let Ok(manifest) = self.store.get_manifest(&cid) {
+            if let Ok(manifest) = self.store.get_record(&cid) {
                 result.push(ContentInfo {
                     content_id: cid,
                     total_size: manifest.total_size,
@@ -351,7 +351,7 @@ impl CraftObjClient {
         let mut stored_bytes = 0u64;
         let mut piece_count = 0usize;
         for cid in &content {
-            if let Ok(manifest) = self.store.get_manifest(cid) {
+            if let Ok(manifest) = self.store.get_record(cid) {
                 stored_bytes += manifest.total_size;
                 for seg in 0..manifest.segment_count() as u32 {
                     piece_count += self.store.list_pieces(cid, seg).unwrap_or_default().len();
@@ -438,7 +438,7 @@ impl CraftObjClient {
         all_authorized: &[ed25519_dalek::VerifyingKey],
     ) -> Result<RevocationResult> {
         // 1. Reconstruct original ciphertext from pieces
-        let manifest = self.store.get_manifest(old_content_id)?;
+        let manifest = self.store.get_record(old_content_id)?;
         let config = ErasureConfig {
             piece_size: manifest.piece_size(),
             segment_size: manifest.segment_size(),
@@ -524,7 +524,7 @@ impl CraftObjClient {
             signature: vec![],
             verification: new_verification_record.clone(),
         };
-        self.store.store_manifest(&new_manifest)?;
+        self.store.store_record(&new_manifest)?;
         self.pin_manager.pin(&new_content_id)?;
 
         // 3. Encrypt content key to creator
@@ -945,7 +945,7 @@ mod tests {
             .publish_signed(&file_path, &PublishOptions::default(), &keypair)
             .unwrap();
 
-        let manifest = client.store().get_manifest(&result.content_id).unwrap();
+        let manifest = client.store().get_record(&result.content_id).unwrap();
         assert!(!manifest.creator.is_empty());
         assert!(manifest.verify_creator());
         assert_eq!(

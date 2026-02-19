@@ -11,7 +11,7 @@ use std::time::Duration;
 use craftec_erasure::ContentVerificationRecord;
 use craftobj_core::{
     ContentManifest, ContentId, CraftObjError, RemovalNotice, Result,
-    MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,
+    RECORD_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,
     REMOVAL_DHT_PREFIX,
     access::AccessList,
     pre::ReKeyEntry,
@@ -40,7 +40,7 @@ pub fn providers_dht_key(content_id: &ContentId) -> Vec<u8> {
 
 /// Build DHT key for a content manifest.
 pub fn manifest_dht_key(content_id: &ContentId) -> Vec<u8> {
-    format!("{}{}", MANIFEST_DHT_PREFIX, content_id.to_hex()).into_bytes()
+    format!("{}{}", RECORD_DHT_PREFIX, content_id.to_hex()).into_bytes()
 }
 
 /// Build DHT key for an access list.
@@ -158,7 +158,7 @@ impl ContentRouter {
     }
 
     /// Fetch a manifest from the DHT.
-    pub fn get_manifest(
+    pub fn get_record(
         behaviour: &mut CraftBehaviour,
         content_id: &ContentId,
     ) -> kad::QueryId {

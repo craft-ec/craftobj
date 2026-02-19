@@ -296,7 +296,7 @@ impl ContentTracker {
             if self.states.contains_key(&cid) {
                 continue;
             }
-            match store.get_manifest(&cid) {
+            match store.get_record(&cid) {
                 Ok(manifest) => {
                     // Count actual pieces in store
                     let mut local_pieces = 0;
@@ -364,7 +364,7 @@ impl ContentTracker {
         let cids: Vec<ContentId> = self.states.keys().copied().collect();
         for cid in cids {
             let actual_pieces = {
-                let manifest = match store.get_manifest(&cid) {
+                let manifest = match store.get_record(&cid) {
                     Ok(m) => m,
                     Err(_) => {
                         warn!("Tracker has {} but no manifest on disk, removing", cid);

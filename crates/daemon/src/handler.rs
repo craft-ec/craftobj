@@ -436,7 +436,7 @@ impl CraftObjHandler {
 
         // Don't announce publisher as provider — publisher is a client that deletes
         // all pieces after distribution. Storage nodes announce themselves when they
-        // receive the manifest via PushManifest handler.
+        // receive the manifest via PushRecord handler.
         if let Some(ref command_tx) = self.command_tx {
             debug!("Publishing manifest for {} to DHT (without provider announcement)", result.content_id);
             
@@ -549,7 +549,7 @@ impl CraftObjHandler {
                 let client = self.client.lock().await;
                 let manifest_path = client.store().data_dir().join("manifests").join(format!("{}.json", cid.to_hex()));
                 info!("[handler.rs] Checking manifest at {:?} (exists={})", manifest_path, manifest_path.exists());
-                match client.store().get_manifest(&cid) {
+                match client.store().get_record(&cid) {
                     Ok(m) => Some(m),
                     Err(_) => {
                         // No manifest — try verification record and derive manifest from it
@@ -563,7 +563,7 @@ impl CraftObjHandler {
                                 verification: vr,
                             };
                             // Store synthetic manifest so reconstruct() can find it
-                            let _ = client.store().store_manifest(&manifest);
+                            let _ = client.store().store_record(&manifest);
                             Some(manifest)
                         } else {
                             None
@@ -669,7 +669,7 @@ impl CraftObjHandler {
                             info!("[handler.rs] Found {} providers for {} via DHT", providers.len(), cid);
 
                             let (manifest_tx, manifest_rx) = oneshot::channel();
-                            let command = CraftObjCommand::GetManifest {
+                            let command = CraftObjCommand::GetRecord {
                                 content_id: cid,
                                 reply_tx: manifest_tx,
                             };
@@ -681,7 +681,7 @@ impl CraftObjHandler {
                                         // Bug 2 fix: store manifest locally so reconstruct() can find it
                                         {
                                             let client = self.client.lock().await;
-                                            match client.store().store_manifest(&manifest) {
+                                            match client.store().store_record(&manifest) {
                                                 Ok(()) => info!("[handler.rs] Stored DHT manifest locally for {}", cid),
                                                 Err(e) => warn!("[handler.rs] Failed to store DHT manifest locally: {}", e),
                                             }
@@ -756,7 +756,7 @@ impl CraftObjHandler {
                 // Get creator from manifest
                 let creator = {
                     let c = self.client.lock().await;
-                    c.store().get_manifest(&item.content_id)
+                    c.store().get_record(&item.content_id)
                         .map(|m| m.creator.clone())
                         .unwrap_or_default()
                 };
@@ -949,7 +949,7 @@ impl CraftObjHandler {
 
         let manifest = {
             let client = self.client.lock().await;
-            client.store().get_manifest(&cid).map_err(|e| e.to_string())?
+            client.store().get_record(&cid).map_err(|e| e.to_string())?
         };
 
         // Generate new pieces via recombination for each segment
@@ -1495,7 +1495,7 @@ impl CraftObjHandler {
             // Announce new CID as provider
             let manifest = {
                 let client = self.client.lock().await;
-                client.store().get_manifest(&revocation.new_content_id)
+                client.store().get_record(&revocation.new_content_id)
                     .map_err(|e| e.to_string())?
             };
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -1597,7 +1597,7 @@ impl CraftObjHandler {
         // Verify creator matches manifest (if we have it locally)
         {
             let client = self.client.lock().await;
-            if let Ok(manifest) = client.store().get_manifest(&content_id) {
+            if let Ok(manifest) = client.store().get_record(&content_id) {
                 if !manifest.creator.is_empty() {
                     let expected_did = craftobj_core::did_from_pubkey(&creator_key.verifying_key());
                     if manifest.creator != expected_did {
@@ -1988,7 +1988,7 @@ impl CraftObjHandler {
         let client = self.client.lock().await;
         let store = client.store();
 
-        let manifest = store.get_manifest(cid).ok();
+        let manifest = store.get_record(cid).ok();
         let segments = store.list_segments(cid).unwrap_or_default();
         let mut min_rank: Option<usize> = None;
         let mut min_ratio: Option<f64> = None;
@@ -2018,7 +2018,7 @@ impl CraftObjHandler {
         let client = self.client.lock().await;
         let store = client.store();
 
-        let manifest = store.get_manifest(&cid).map_err(|e| e.to_string())?;
+        let manifest = store.get_record(&cid).map_err(|e| e.to_string())?;
         let pinned = client.is_pinned(&cid);
 
         // Collect local per-segment piece counts
@@ -2151,7 +2151,7 @@ impl CraftObjHandler {
         // Collect local per-segment piece counts and manifests per CID
         let mut cid_data: Vec<(craftobj_core::ContentId, Vec<usize>, Option<craftobj_core::ContentManifest>, u64)> = Vec::new();
         for item in &items {
-            let manifest = client.store().get_manifest(&item.content_id).ok();
+            let manifest = client.store().get_record(&item.content_id).ok();
             let seg_count = manifest.as_ref().map(|m| m.segment_count()).unwrap_or(0);
             let mut local_seg_pieces = vec![0usize; seg_count];
             let segments = client.store().list_segments(&item.content_id).unwrap_or_default();
@@ -2306,7 +2306,7 @@ impl CraftObjHandler {
                     let mut min_ratio: Option<f64> = None;
                     for &seg in &segments {
                         let pieces = client.store().list_pieces(&state.content_id, seg).unwrap_or_default();
-                        let manifest = client.store().get_manifest(&state.content_id).ok();
+                        let manifest = client.store().get_record(&state.content_id).ok();
                         let seg_k = manifest.as_ref().map(|m| m.k_for_segment(seg as usize)).unwrap_or(0);
                         if seg_k > 0 {
                             let ratio = pieces.len() as f64 / seg_k as f64;
@@ -2425,7 +2425,7 @@ impl CraftObjHandler {
         let store = client.store();
 
         // Get manifest for per-segment k calculation
-        let manifest = store.get_manifest(&cid).ok();
+        let manifest = store.get_record(&cid).ok();
 
         let segments_list = store.list_segments(&cid).unwrap_or_default();
         let mut segments_json = Vec::new();

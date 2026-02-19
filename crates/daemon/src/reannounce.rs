@@ -100,7 +100,7 @@ async fn reannounce_content(
 ) {
     let manifest = {
         let c = client.lock().await;
-        match c.store().get_manifest(content_id) {
+        match c.store().get_record(content_id) {
             Ok(m) => m,
             Err(e) => {
                 warn!("[reannounce.rs] Cannot re-announce {}: manifest not found: {}", content_id, e);
@@ -211,7 +211,7 @@ pub async fn run_initial_push(
 
     let manifest = {
         let c = client.lock().await;
-        match c.store().get_manifest(content_id) {
+        match c.store().get_record(content_id) {
             Ok(m) => m,
             Err(e) => {
                 warn!("[reannounce.rs] Cannot push {}: {}", content_id, e);
@@ -221,7 +221,7 @@ pub async fn run_initial_push(
     };
 
     // Push manifest to all peers first
-    let manifest_json = match serde_json::to_vec(&manifest) {
+    let record_json = match serde_json::to_vec(&manifest) {
         Ok(j) => j,
         Err(e) => {
             warn!("[reannounce.rs] Cannot serialize manifest for {}: {}", content_id, e);
@@ -235,10 +235,10 @@ pub async fn run_initial_push(
         let mut manifest_futs = Vec::new();
         for &peer in &ranked_peers {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let cmd = CraftObjCommand::PushManifest {
+            let cmd = CraftObjCommand::PushRecord {
                 peer_id: peer,
                 content_id: *content_id,
-                manifest_json: manifest_json.clone(),
+                record_json: record_json.clone(),
                 reply_tx,
             };
             if command_tx.send(cmd).is_ok() {
@@ -429,7 +429,7 @@ async fn equalize_pressure(
 
         let manifest = {
             let c = client.lock().await;
-            match c.store().get_manifest(&content_id) {
+            match c.store().get_record(&content_id) {
                 Ok(m) => m,
                 Err(_) => continue,
             }
@@ -460,16 +460,16 @@ async fn equalize_pressure(
         let per_peer = std::cmp::max(half / candidates.len(), 1);
 
         // Push manifest to all candidates first
-        let manifest_json = match serde_json::to_vec(&manifest) {
+        let record_json = match serde_json::to_vec(&manifest) {
             Ok(j) => j,
             Err(_) => continue,
         };
         for &peer in &candidates {
             let (reply_tx, _reply_rx) = oneshot::channel();
-            let _ = command_tx.send(CraftObjCommand::PushManifest {
+            let _ = command_tx.send(CraftObjCommand::PushRecord {
                 peer_id: peer,
                 content_id,
-                manifest_json: manifest_json.clone(),
+                record_json: record_json.clone(),
                 reply_tx,
             });
         }

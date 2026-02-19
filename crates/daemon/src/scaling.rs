@@ -217,7 +217,7 @@ impl ScalingCoordinator {
         }
 
         // We must hold ≥2 pieces for ANY segment to create a recombination.
-        let manifest = match store.get_manifest(&signal.content_id) {
+        let manifest = match store.get_record(&signal.content_id) {
             Ok(m) => m,
             Err(_) => {
                 debug!("No manifest for {}, skipping scaling", signal.content_id);
@@ -257,7 +257,7 @@ impl ScalingCoordinator {
         known_providers: &[PeerId],
     ) {
         // Find a segment with ≥2 pieces for recombination
-        let manifest = match store.get_manifest(&content_id) {
+        let manifest = match store.get_record(&content_id) {
             Ok(m) => m,
             Err(_) => {
                 debug!("No manifest for scaling {}", content_id);
@@ -527,7 +527,7 @@ mod tests {
                 segment_hashes: vec![],
             },
         };
-        store.store_manifest(&manifest).unwrap();
+        store.store_record(&manifest).unwrap();
         let piece_data = vec![0u8; 100];
         let coeff1 = vec![1u8, 0, 0];
         let coeff2 = vec![0u8, 1, 0];

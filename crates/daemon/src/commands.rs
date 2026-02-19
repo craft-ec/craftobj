@@ -33,7 +33,7 @@ pub enum CraftObjCommand {
         reply_tx: oneshot::Sender<Result<Vec<libp2p::PeerId>, String>>,
     },
     /// Get a manifest from the DHT.
-    GetManifest {
+    GetRecord {
         content_id: ContentId,
         reply_tx: oneshot::Sender<Result<ContentManifest, String>>,
     },
@@ -90,10 +90,10 @@ pub enum CraftObjCommand {
     /// Trigger an immediate distribution cycle (e.g. after content publish or startup import).
     TriggerDistribution,
     /// Push a manifest to a remote storage peer via persistent stream.
-    PushManifest {
+    PushRecord {
         peer_id: PeerId,
         content_id: ContentId,
-        manifest_json: Vec<u8>,
+        record_json: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Push a piece to a remote storage peer via persistent stream.

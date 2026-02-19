@@ -305,7 +305,7 @@ pub const WIRE_MAGIC: [u8; 4] = [0x43, 0x4F, 0x42, 0x4A];
 pub const TRANSFER_PROTOCOL: &str = "/craftobj/transfer/3.0.0";
 
 /// Manifest exchange protocol ID.
-pub const MANIFEST_PROTOCOL: &str = "/craftobj/manifest/2.0.0";
+pub const RECORD_PROTOCOL: &str = "/craftobj/manifest/2.0.0";
 
 /// PDP (Proof of Data Possession) protocol ID.
 pub const PDP_PROTOCOL: &str = "/craftobj/pdp/2.0.0";
@@ -314,7 +314,7 @@ pub const PDP_PROTOCOL: &str = "/craftobj/pdp/2.0.0";
 pub const PROVIDERS_DHT_PREFIX: &str = "/craftobj/providers/";
 
 /// DHT key prefix for content manifests.
-pub const MANIFEST_DHT_PREFIX: &str = "/craftobj/manifest/";
+pub const RECORD_DHT_PREFIX: &str = "/craftobj/manifest/";
 
 /// DHT key prefix for peer pubkey → PeerId records.
 pub const PEERS_DHT_PREFIX: &str = "/craftobj/peers/";
@@ -554,9 +554,9 @@ pub enum WireMessageType {
     /// Response with piece data + coefficient vector.
     PieceResponse = 1,
     /// Request the manifest for a CID.
-    ManifestRequest = 2,
+    RecordRequest = 2,
     /// Response with manifest data.
-    ManifestResponse = 3,
+    RecordResponse = 3,
     /// Push a piece to a storage peer (proactive distribution).
     PiecePush = 5,
     /// Push a manifest to a storage peer (sent before piece pushes).
@@ -568,8 +568,8 @@ impl WireMessageType {
         match v {
             0 => Some(Self::PieceRequest),
             1 => Some(Self::PieceResponse),
-            2 => Some(Self::ManifestRequest),
-            3 => Some(Self::ManifestResponse),
+            2 => Some(Self::RecordRequest),
+            3 => Some(Self::RecordResponse),
             5 => Some(Self::PiecePush),
             6 => Some(Self::ManifestPush),
             _ => None,
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     fn test_wire_message_type() {
         assert_eq!(WireMessageType::from_u8(0), Some(WireMessageType::PieceRequest));
-        assert_eq!(WireMessageType::from_u8(3), Some(WireMessageType::ManifestResponse));
+        assert_eq!(WireMessageType::from_u8(3), Some(WireMessageType::RecordResponse));
         assert_eq!(WireMessageType::from_u8(4), None);
         assert_eq!(WireMessageType::from_u8(99), None);
     }

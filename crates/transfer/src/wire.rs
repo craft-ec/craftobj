@@ -111,10 +111,10 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             Ok((TYPE_PIECE_PUSH, payload))
         }
-        CraftObjRequest::ManifestPush { content_id, manifest_json } => {
-            let inner = ManifestPushWire {
+        CraftObjRequest::ManifestPush { content_id, record_json } => {
+            let inner = RecordPushWire {
                 content_id: *content_id,
-                manifest_json: manifest_json.clone(),
+                record_json: record_json.clone(),
             };
             let payload = bincode::serialize(&inner)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -194,11 +194,11 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
             })
         }
         TYPE_MANIFEST_PUSH => {
-            let inner: ManifestPushWire = bincode::deserialize(payload)
+            let inner: RecordPushWire = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(CraftObjRequest::ManifestPush {
                 content_id: inner.content_id,
-                manifest_json: inner.manifest_json,
+                record_json: inner.record_json,
             })
         }
         TYPE_PIECE_MAP_QUERY => {
@@ -400,9 +400,9 @@ struct PiecePushWire {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ManifestPushWire {
+struct RecordPushWire {
     content_id: ContentId,
-    manifest_json: Vec<u8>,
+    record_json: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
