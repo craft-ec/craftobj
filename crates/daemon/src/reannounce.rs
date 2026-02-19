@@ -395,13 +395,79 @@ pub async fn run_initial_push(
         info!("[reannounce.rs] Peer {}: {} successes, {} failures", peer, count, failures);
     }
 
-    // TODO: Implement retry logic for failed pieces
-    if !failed_pieces.is_empty() {
-        warn!("[reannounce.rs] {} pieces failed distribution - retry logic not yet implemented", failed_pieces.len());
-        // For now, continue without retries - RLNC self-healing will handle gaps
+    // Retry failed pieces with different peers
+    if !failed_pieces.is_empty() && manifest_ok_peers.len() > 1 {
+        info!("[reannounce.rs] Retrying {} failed pieces with different peers", failed_pieces.len());
+        
+        let mut retry_futures = Vec::new();
+        let retry_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PIECES));
+        
+        for (i, piece_id) in failed_pieces.iter().enumerate() {
+            // Find the segment index for this piece_id
+            let seg_idx = all_pieces.iter()
+                .find(|(_, pid)| pid == piece_id)
+                .map(|(seg, _)| *seg)
+                .unwrap_or(0);
+            
+            // Try a different peer (offset by 1 from original round-robin)
+            let retry_peer = manifest_ok_peers[(i + 1) % manifest_ok_peers.len()];
+            
+            let (piece_data, coefficients) = {
+                let c = client.lock().await;
+                match c.store().get_piece(&cid, seg_idx, piece_id) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            };
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = CraftObjCommand::PushPiece {
+                peer_id: retry_peer,
+                content_id: cid,
+                segment_index: seg_idx,
+                piece_id: *piece_id,
+                coefficients,
+                piece_data,
+                reply_tx,
+            };
+
+            if command_tx.send(cmd).is_ok() {
+                let sem = retry_semaphore.clone();
+                let piece_id_copy = *piece_id;
+                let peer_copy = retry_peer;
+                
+                retry_futures.push(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
+                        Ok(Ok(Ok(()))) => {
+                            debug!("[reannounce.rs] Retry piece {} to {} succeeded", 
+                                hex::encode(&piece_id_copy[..4]), peer_copy);
+                            true
+                        }
+                        _ => {
+                            warn!("[reannounce.rs] Retry piece {} to {} failed", 
+                                hex::encode(&piece_id_copy[..4]), peer_copy);
+                            false
+                        }
+                    }
+                });
+            }
+        }
+
+        if !retry_futures.is_empty() {
+            let retry_results = futures::future::join_all(retry_futures).await;
+            let retry_successes = retry_results.iter().filter(|&&success| success).count();
+            
+            info!("[reannounce.rs] Retry completed: {}/{} pieces recovered", 
+                retry_successes, failed_pieces.len());
+            total_pushed += retry_successes;
+        }
+    } else if !failed_pieces.is_empty() {
+        warn!("[reannounce.rs] {} pieces failed distribution - no alternative peers for retry", failed_pieces.len());
     }
 
-    info!("[reannounce.rs] Initial push for {}: pushed {}/{} pieces to {} peers", content_id, total_pushed, total_pieces, ranked_peers.len());
+    info!("[reannounce.rs] Distribution complete for {}: pushed {}/{} pieces to {} peers", content_id, total_pushed, total_pieces, ranked_peers.len());
 
     if total_pushed > 0 {
         let _ = event_tx.send(DaemonEvent::ContentDistributed {
