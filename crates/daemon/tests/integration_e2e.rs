@@ -1890,7 +1890,6 @@ async fn test_concurrent_publishes() -> Result<(), String> {
 /// Test: Large file transfer (100MB) across 3 nodes.
 /// A publishes 100MB → distributes to B → C fetches and verifies SHA-256 hash.
 #[tokio::test]
-#[ignore] // Run with --ignored (takes >60s)
 async fn test_large_file_transfer() -> Result<(), String> {
     use sha2::{Sha256, Digest};
     
@@ -1971,7 +1970,6 @@ async fn test_large_file_transfer() -> Result<(), String> {
 /// Test: Concurrent publish + fetch stress test.
 /// 4 nodes: 3 publish 1MB each simultaneously, 4th fetches all 3 CIDs.
 #[tokio::test]
-#[ignore] // Run with --ignored (stress test)
 async fn test_concurrent_stress() -> Result<(), String> {
     use sha2::{Sha256, Digest};
     
