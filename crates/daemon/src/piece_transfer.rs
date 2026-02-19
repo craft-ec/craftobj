@@ -22,7 +22,7 @@ use craftobj_store::FsStore;
 use craftobj_transfer::{CraftObjRequest, CraftObjResponse, PiecePayload};
 use craftobj_transfer::wire::{write_request_frame, write_response_frame, read_frame, StreamFrame};
 
-/// Max pieces per batch frame (~1.5MB at 100KB pieces).
+/// Max pieces per batch frame (~3.8MB at 256KB pieces).
 pub const BATCH_SIZE: usize = 15;
 
 /// Result of a send_pieces call.

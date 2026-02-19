@@ -271,7 +271,7 @@ impl ChallengerManager {
                 
                 // Use proper PDP challenge-response protocol instead of piece requests
                 let piece_id = any_piece; // For now, challenge any piece (could be randomized)
-                let byte_positions = crate::pdp::derive_byte_positions(&nonce, &piece_id, 102400, 16); // 100KB default piece size, 16 positions
+                let byte_positions = crate::pdp::derive_byte_positions(&nonce, &piece_id, craftobj_core::PIECE_SIZE as u32, 16);
                 
                 match self.send_pdp_challenge(peer, cid, segment_index, &piece_id, &nonce, &byte_positions).await {
                     Ok(craftobj_transfer::CraftObjResponse::PdpProof { piece_id: returned_piece_id, coefficients, challenged_bytes, proof_hash }) => {

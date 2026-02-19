@@ -52,7 +52,7 @@ impl std::fmt::Display for ContentId {
 /// Fixed segment size for RLNC erasure coding (10 MB).
 pub const SEGMENT_SIZE: usize = 10_485_760;
 
-/// Fixed piece size for RLNC erasure coding (100 KB).
+/// Fixed piece size for RLNC erasure coding (256 KB).
 pub const PIECE_SIZE: usize = 262_144;
 
 /// Lightweight content record replacing the old manifest.

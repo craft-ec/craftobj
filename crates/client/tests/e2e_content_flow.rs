@@ -328,7 +328,7 @@ fn tiny_file_less_than_one_piece() {
     let dir = temp_dir("tiny");
     let mut client = CraftObjClient::new(&dir).unwrap();
 
-    // 50 bytes — way smaller than 100KB piece size, so k=1
+    // 50 bytes — way smaller than 256KB piece size, so k=1
     let content = b"Hello, this is a tiny file for edge case testing!";
     let file_path = dir.join("tiny.txt");
     std::fs::write(&file_path, content).unwrap();
@@ -354,7 +354,7 @@ fn exact_one_segment_file() {
     let dir = temp_dir("exact-seg");
     let mut client = CraftObjClient::new(&dir).unwrap();
 
-    // 10MB = segment_size → exactly 1 segment, k = 10MB/100KB = 100
+    // 10MB = segment_size → exactly 1 segment, k = 10MB/256KB = 40
     let content = random_data(10_485_760);
     let file_path = dir.join("exact.bin");
     std::fs::write(&file_path, &content).unwrap();
