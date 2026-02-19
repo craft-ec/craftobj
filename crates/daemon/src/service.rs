@@ -824,7 +824,8 @@ async fn drive_swarm(
 
     // PEX — peer exchange
     let mut pex_manager = crate::pex::PexManager::new();
-    let mut pex_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let pex_interval_secs = daemon_config.lock().await.pex_interval_secs;
+    let mut pex_interval = tokio::time::interval(std::time::Duration::from_secs(pex_interval_secs));
     pex_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // (pex inbound handled inline in the inbound_rx handler)
 

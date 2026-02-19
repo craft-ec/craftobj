@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use craftec_erasure::{
-    check_independence, segmenter, CodedPiece, ErasureConfig,
+    check_independence, homomorphic, segmenter, CodedPiece, ContentVerificationRecord,
+    ErasureConfig,
 };
 use craftobj_core::{
     ContentId, ContentManifest, CraftObjError, PublishOptions, RemovalNotice, Result,
@@ -37,6 +38,8 @@ pub struct PublishResult {
     pub segment_count: usize,
     /// The manifest (for daemon to announce).
     pub manifest: ContentManifest,
+    /// Verification record with homomorphic hashes for piece verification.
+    pub verification_record: ContentVerificationRecord,
 }
 
 /// Content info returned by list().
@@ -130,8 +133,34 @@ impl CraftObjClient {
             content_id, total_size, segment_count, config.piece_size,
         );
 
-        // Store all pieces
+        // Store all pieces and compute homomorphic hashes
+        let mut segment_hashes = Vec::with_capacity(encoded_segments.len());
         for (seg_idx, pieces) in &encoded_segments {
+            // Compute homomorphic hashes for original (source) pieces only
+            // Source pieces have identity coefficient vectors (exactly one 1, rest 0)
+            let k = config.k_for_segment(
+                if (*seg_idx as usize + 1) < segment_count {
+                    config.segment_size
+                } else {
+                    content_bytes.len() - *seg_idx as usize * config.segment_size
+                },
+            );
+            let source_pieces: Vec<&CodedPiece> = pieces.iter().take(k).collect();
+            let seed = {
+                let mut s = [0u8; 32];
+                use sha2::Digest;
+                let hash = sha2::Sha256::digest(
+                    &[&content_id.0[..], &seg_idx.to_le_bytes()[..]].concat(),
+                );
+                s.copy_from_slice(&hash);
+                s
+            };
+            let hashes = homomorphic::generate_segment_hashes(
+                seed,
+                &source_pieces.iter().map(|p| (*p).clone()).collect::<Vec<_>>(),
+            );
+            segment_hashes.push(hashes);
+
             for piece in pieces {
                 let pid = piece_id_from_coefficients(&piece.coefficients);
                 self.store.store_piece(
@@ -143,6 +172,13 @@ impl CraftObjClient {
                 )?;
             }
         }
+
+        // Store verification record (homomorphic hashes)
+        let verification_record = ContentVerificationRecord {
+            file_size: total_size,
+            segment_hashes,
+        };
+        self.store.store_verification_record(&content_id, &verification_record)?;
 
         // Build and store manifest
         let content_hash = content_id.0; // CID is SHA-256 of content bytes
@@ -169,6 +205,7 @@ impl CraftObjClient {
             total_size,
             segment_count,
             manifest,
+            verification_record,
         })
     }
 
@@ -445,7 +482,27 @@ impl CraftObjClient {
             .map_err(|e| CraftObjError::ErasureError(e.to_string()))?;
         let segment_count = encoded_segments.len();
 
+        let mut new_segment_hashes = Vec::with_capacity(encoded_segments.len());
         for (seg_idx, pieces) in &encoded_segments {
+            let k = config.k_for_segment(
+                if (*seg_idx as usize + 1) < segment_count {
+                    config.segment_size
+                } else {
+                    new_ciphertext.len() - *seg_idx as usize * config.segment_size
+                },
+            );
+            let source_pieces: Vec<CodedPiece> = pieces.iter().take(k).cloned().collect();
+            let seed = {
+                let mut s = [0u8; 32];
+                use sha2::Digest;
+                let hash = sha2::Sha256::digest(
+                    &[&new_content_id.0[..], &seg_idx.to_le_bytes()[..]].concat(),
+                );
+                s.copy_from_slice(&hash);
+                s
+            };
+            new_segment_hashes.push(homomorphic::generate_segment_hashes(seed, &source_pieces));
+
             for piece in pieces {
                 let pid = piece_id_from_coefficients(&piece.coefficients);
                 self.store.store_piece(
@@ -457,6 +514,12 @@ impl CraftObjClient {
                 )?;
             }
         }
+
+        let new_verification_record = ContentVerificationRecord {
+            file_size: total_size,
+            segment_hashes: new_segment_hashes,
+        };
+        self.store.store_verification_record(&new_content_id, &new_verification_record)?;
 
         let new_manifest = ContentManifest {
             content_id: new_content_id,

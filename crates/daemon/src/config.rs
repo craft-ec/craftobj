@@ -45,6 +45,9 @@ pub struct DaemonConfig {
     /// Aggregation epoch interval in seconds (default: 600 = 10 minutes).
     /// Set to None to use the default.
     pub aggregation_epoch_secs: Option<u64>,
+    /// PEX (Peer Exchange) interval in seconds (default: 60).
+    /// Lower values speed up peer discovery at the cost of more traffic.
+    pub pex_interval_secs: u64,
 
     // ── Storage ─────────────────────────────────────────────
     /// Maximum storage in bytes (0 = unlimited).
@@ -100,6 +103,7 @@ impl Default for DaemonConfig {
             reannounce_threshold_secs: 1200,
             challenger_interval_secs: None,
             aggregation_epoch_secs: None,
+            pex_interval_secs: 60,
             max_concurrent_transfers: 64,
             piece_timeout_secs: 30,
             stream_open_timeout_secs: 10,

@@ -84,6 +84,7 @@ impl TestNode {
         daemon_config.reannounce_threshold_secs = 60;
         daemon_config.challenger_interval_secs = Some(60);
         daemon_config.aggregation_epoch_secs = Some(120);
+        daemon_config.pex_interval_secs = 2; // Fast PEX for tests
         
         // Save config to data dir
         daemon_config.save(data_dir.path())
@@ -370,7 +371,7 @@ async fn wait_for_connection(node_a: &TestNode, node_b: &TestNode, timeout_secs:
         }
         
         debug!("Connection not yet established, retrying... ({}s elapsed)", start.elapsed().as_secs());
-        sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_millis(500)).await;
     }
     
     Err(format!("Nodes {} and {} failed to connect within {}s", 
@@ -782,47 +783,46 @@ async fn test_three_nodes_pex_discovery() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_three_nodes_pex_discovery ===");
     
-    let timeout_duration = Duration::from_secs(180);
+    let timeout_duration = Duration::from_secs(60);
     timeout(timeout_duration, async {
         // Spawn Node A
         let node_a = TestNode::spawn(0, vec![]).await?;
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(1)).await;
         
         // Get Node A's boot address
         let boot_addr_a = node_a.get_boot_peer_addr().await?;
         
         // Spawn Node B with A as boot peer
         let node_b = TestNode::spawn(1, vec![boot_addr_a]).await?;
-        sleep(Duration::from_secs(3)).await;
         
         // Wait for A-B connection
-        wait_for_connection(&node_a, &node_b, 30).await?;
+        wait_for_connection(&node_a, &node_b, 15).await?;
         
         // Get Node B's boot address
         let boot_addr_b = node_b.get_boot_peer_addr().await?;
         
         // Spawn Node C with B as boot peer (NOT directly connected to A)
         let node_c = TestNode::spawn(2, vec![boot_addr_b]).await?;
-        sleep(Duration::from_secs(3)).await;
         
         // Wait for B-C connection
-        wait_for_connection(&node_b, &node_c, 30).await?;
+        wait_for_connection(&node_b, &node_c, 15).await?;
         
         // Wait for PEX discovery - A should discover C through B
+        // With pex_interval_secs=2, this should happen within a few seconds
         let start = Instant::now();
-        let discovery_timeout = Duration::from_secs(90);
+        let discovery_timeout = Duration::from_secs(30);
         let mut discovered = false;
         
         while start.elapsed() < discovery_timeout {
             if let Ok(peers_a) = node_a.connected_peers().await {
                 let c_id = node_c.peer_id.to_string();
                 if peers_a.iter().any(|id| id == &c_id) {
-                    info!("✓ PEX discovery successful - Node A discovered Node C");
+                    info!("✓ PEX discovery successful - Node A discovered Node C in {:.1}s", start.elapsed().as_secs_f64());
                     discovered = true;
                     break;
                 }
             }
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(1)).await;
         }
         
         if !discovered {

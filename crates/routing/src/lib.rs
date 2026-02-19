@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use craftec_erasure::ContentVerificationRecord;
 use craftobj_core::{
     ContentManifest, ContentId, CraftObjError, RemovalNotice, Result,
     MANIFEST_DHT_PREFIX, PROVIDERS_DHT_PREFIX, ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX,

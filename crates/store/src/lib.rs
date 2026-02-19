@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use craftec_erasure::ContentVerificationRecord;
 use craftobj_core::{ContentId, ContentManifest, CraftObjError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -192,6 +193,39 @@ impl FsStore {
         let json = std::fs::read_to_string(&path)?;
         serde_json::from_str(&json)
             .map_err(|e| CraftObjError::ManifestError(e.to_string()))
+    }
+
+    /// Store a content verification record (homomorphic hashes).
+    pub fn store_verification_record(&self, content_id: &ContentId, record: &ContentVerificationRecord) -> Result<()> {
+        let dir = self.data_dir.join("verification");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.json", content_id.to_hex()));
+        let json = serde_json::to_string(record)
+            .map_err(|e| CraftObjError::StorageError(e.to_string()))?;
+        std::fs::write(&path, json)?;
+        debug!("Stored verification record for {}", content_id);
+        Ok(())
+    }
+
+    /// Retrieve a content verification record.
+    pub fn get_verification_record(&self, content_id: &ContentId) -> Result<ContentVerificationRecord> {
+        let path = self.data_dir.join("verification").join(format!("{}.json", content_id.to_hex()));
+        if !path.exists() {
+            return Err(CraftObjError::ContentNotFound(format!(
+                "verification record for {}", content_id
+            )));
+        }
+        let json = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&json)
+            .map_err(|e| CraftObjError::StorageError(e.to_string()))
+    }
+
+    /// Check if a verification record exists.
+    pub fn has_verification_record(&self, content_id: &ContentId) -> bool {
+        self.data_dir
+            .join("verification")
+            .join(format!("{}.json", content_id.to_hex()))
+            .exists()
     }
 
     /// Check if a manifest exists.
