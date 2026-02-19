@@ -480,7 +480,7 @@ impl HealthScan {
             let mut min_ratio = f64::MAX;
 
             // Look up the manifest to get the actual k per segment.
-            // Fall back to SEGMENT_SIZE / PIECE_SIZE (103) if manifest not found.
+            // Fall back to SEGMENT_SIZE / PIECE_SIZE (40) if manifest not found.
             let manifest = {
                 let s = self.store.lock().await;
                 s.get_record(cid).ok()

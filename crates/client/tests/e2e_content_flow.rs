@@ -364,7 +364,7 @@ fn exact_one_segment_file() {
 
     let manifest = client.store().get_record(&result.content_id).unwrap();
     let k = manifest.k_for_segment(0);
-    assert_eq!(k, 103, "full segment should have k=103 (10MB/100KB)");
+    assert_eq!(k, 40, "full segment should have k=40 (10MB/256KB)");
 
     let output = dir.join("output.bin");
     client.reconstruct(&result.content_id, &output, None).unwrap();
@@ -389,8 +389,8 @@ fn multi_segment_with_partial_last() {
     let manifest = client.store().get_record(&result.content_id).unwrap();
     let k0 = manifest.k_for_segment(0);
     let k1 = manifest.k_for_segment(1);
-    assert_eq!(k0, 103, "full segment k=103 (10MB/100KB)");
-    assert!(k1 < 103 && k1 > 0, "partial segment k={} should be < 103", k1);
+    assert_eq!(k0, 40, "full segment k=40 (10MB/256KB)");
+    assert!(k1 < 40 && k1 > 0, "partial segment k={} should be < 40", k1);
 
     let output = dir.join("output.bin");
     client.reconstruct(&result.content_id, &output, None).unwrap();
