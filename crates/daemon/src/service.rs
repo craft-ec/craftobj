@@ -466,6 +466,9 @@ pub async fn run_daemon_with_config(
         health_scan_command_tx,
     );
     health_scan.set_scan_interval(std::time::Duration::from_secs(daemon_config.health_scan_interval_secs));
+    if let Some(tier_target) = daemon_config.health_scan_tier_target {
+        health_scan.set_tier_target(tier_target);
+    }
     let health_scan: Arc<Mutex<crate::health_scan::HealthScan>> = Arc::new(Mutex::new(health_scan));
 
     // Derive ed25519 signing key for capability announcement signing
@@ -859,6 +862,12 @@ async fn drive_swarm(
                         peer_reconnector.on_reconnected(&peer_id);
                         stream_manager.clear_open_cooldown(&peer_id);
                         stream_manager.ensure_opening(peer_id);
+                        // Mark peer online in PieceMap so HealthScan counts their pieces
+                        {
+                            let node_bytes = peer_id.to_bytes();
+                            let mut map = piece_map.lock().await;
+                            map.set_node_online(&node_bytes, true);
+                        }
                         // Track for heartbeat
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
                         // Track for PEX
@@ -921,6 +930,12 @@ async fn drive_swarm(
                             continue;
                         }
                         info!("[service.rs] Fully disconnected from {} — cleaning up", peer_id);
+                        // Mark peer offline in PieceMap
+                        {
+                            let node_bytes = peer_id.to_bytes();
+                            let mut map = piece_map.lock().await;
+                            map.set_node_online(&node_bytes, false);
+                        }
                         peer_scorer.lock().await.remove_peer(&peer_id);
                         pex_manager.remove_peer(&peer_id);
                         peer_last_seen.remove(&peer_id);
@@ -1874,68 +1889,6 @@ async fn handle_command(
             ).map(|_| ()).map_err(|e| e.to_string());
 
             let _ = reply_tx.send(dht_result);
-        }
-
-        CraftObjCommand::PushPiece { peer_id, content_id, segment_index, piece_id, coefficients, piece_data, reply_tx } => {
-            debug!("Handling push piece command: {}/{} to {}", content_id, segment_index, peer_id);
-            let request = CraftObjRequest::PiecePush {
-                content_id,
-                segment_index,
-                piece_id,
-                coefficients,
-                data: piece_data,
-            };
-            let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
-            let tx = outbound_tx.clone();
-            tokio::spawn(async move {
-                info!("[service.rs] PushPiece: sending to outbound queue for {}", peer_id);
-                if tx.send(msg).await.is_err() {
-                    warn!("[service.rs] PushPiece to {}: outbound channel closed", peer_id);
-                    let _ = reply_tx.send(Err("outbound channel closed".into()));
-                    return;
-                }
-                info!("[service.rs] PushPiece: waiting for ack from {} (5s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                    Ok(Ok(CraftObjResponse::Ack { status })) => {
-                        info!("[service.rs] PushPiece to {}: got ack status={:?}", peer_id, status);
-                        if status == craftobj_core::WireStatus::Ok {
-                            let _ = reply_tx.send(Ok(()));
-                        } else {
-                            let _ = reply_tx.send(Err(format!("PushPiece ack: {:?}", status)));
-                        }
-                    }
-                    Ok(Ok(other)) => { 
-                        warn!("[service.rs] PushPiece to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
-                        let _ = reply_tx.send(Err("unexpected response type".into())); 
-                    }
-                    Ok(Err(_)) => { 
-                        warn!("[service.rs] PushPiece to {}: ack channel closed", peer_id);
-                        let _ = reply_tx.send(Err("ack channel closed".into())); 
-                    }
-                    Err(_) => {
-                        warn!("[service.rs] PushPiece to {}: timed out after 5s", peer_id);
-                        let _ = reply_tx.send(Err("piece push timed out".into()));
-                    }
-                }
-            });
-        }
-
-        CraftObjCommand::PushPieceBatch { peer_id, content_id, pieces, reply_tx } => {
-            debug!("Handling push piece batch command for {} to {} ({} pieces)", content_id, peer_id, pieces.len());
-            let msg = crate::stream_manager::DistributionMessage {
-                peer: peer_id,
-                content_id,
-                pieces,
-                reply_tx,
-            };
-            let tx = distribution_tx.clone();
-            tokio::spawn(async move {
-                info!("[service.rs] PushPieceBatch: sending to distribution queue for {}", peer_id);
-                if tx.send(msg).await.is_err() {
-                    warn!("[service.rs] PushPieceBatch to {}: distribution channel closed", peer_id);
-                }
-            });
         }
 
         CraftObjCommand::DistributePieces { peer_id, content_id, pieces, reply_tx } => {

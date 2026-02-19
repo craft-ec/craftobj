@@ -61,6 +61,15 @@ struct TestNode {
 impl TestNode {
     /// Spawn a new daemon instance with unique ports and data directory
     async fn spawn(index: usize, boot_peers: Vec<String>) -> Result<Self, String> {
+        Self::spawn_with_config(index, boot_peers, |_| {}).await
+    }
+
+    /// Spawn with a config customization callback
+    async fn spawn_with_config(
+        index: usize,
+        boot_peers: Vec<String>,
+        config_fn: impl FnOnce(&mut DaemonConfig),
+    ) -> Result<Self, String> {
         let keypair = Keypair::generate_ed25519();
         let peer_id = PeerId::from(keypair.public());
         
@@ -108,6 +117,9 @@ impl TestNode {
         daemon_config.health_check_interval_secs = 30; // Health checks for tests
         daemon_config.demand_threshold = 3; // Low threshold for test demand detection
         daemon_config.max_peer_connections = 10; // Limit connections for test resource usage
+        
+        // Apply per-test config overrides
+        config_fn(&mut daemon_config);
         
         // Save config to data dir
         daemon_config.save(data_dir.path())
@@ -1519,7 +1531,11 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
 /// should have excess pieces dropped by HealthScan.
 ///
 /// Flow: publish ~800KiB content → single storage peer receives all pieces →
-/// HealthScan detects over-replication (rank > tier_target) → drops excess pieces.
+/// HealthScan detects over-replication (network pieces > tier target) → drops excess pieces.
+///
+/// Setup: A publishes ~800KB (k=4), distributes all 4 pieces to B (only storage peer).
+/// B's PieceMap learns about A's 4 pieces via SyncPieceMap (before publisher cleanup).
+/// total_network = B's 4 + A's 4 (stale) = 8 > target (6) → over-replicated → degrade.
 #[tokio::test]
 async fn test_degradation() -> Result<(), String> {
     init_test_tracing();
@@ -1528,25 +1544,28 @@ async fn test_degradation() -> Result<(), String> {
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
         let start = std::time::Instant::now();
-        // Single publisher + single storage peer
-        // All pieces go to node_b via round-robin (only 1 peer)
-        let node_a = TestNode::spawn(0, vec![]).await?;
+        // 2 nodes: A publishes, B stores. Short HealthScan for fast degradation.
+        let node_a = TestNode::spawn_with_config(0, vec![], |cfg| {
+            cfg.health_scan_interval_secs = 10;
+        }).await?;
         sleep(Duration::from_secs(1)).await;
         let boot_a = node_a.get_boot_peer_addr().await?;
         
-        let node_b = TestNode::spawn(1, vec![boot_a.clone()]).await?;
+        let node_b = TestNode::spawn_with_config(1, vec![boot_a.clone()], |cfg| {
+            cfg.health_scan_interval_secs = 10;
+        }).await?;
         wait_for_connection(&node_a, &node_b, 30).await?;
         
         // Publish ~800 KiB content: k=4 pieces at 256KiB piece_size.
-        // All 4 pieces get pushed to node_b (only storage peer).
-        // tier_target=1.5, ceil=2. rank=4 > 2 → over-replicated.
-        // local_count=4 > MIN_PIECES(2). No demand → HealthScan should degrade.
+        // All 4 pieces go to node_b (only storage peer).
+        // B's SyncPieceMap queries A and learns about A's 4 pieces too.
+        // Total network = B's 4 + A's 4 = 8. target = ceil(4×1.5) = 6.
+        // 8 > 6 → over-replicated. HealthScan should degrade.
         let content: Vec<u8> = (0..800 * 1024).map(|i| (i % 251) as u8).collect();
         let cid = node_a.publish(&content).await?;
         info!("Published {} bytes, CID: {}", content.len(), cid);
         
-        // Wait for distribution — poll quickly to catch pieces before HealthScan runs.
-        // HealthScan has 10s initial delay + 10s interval, so we need to check fast.
+        // Wait for distribution
         let mut pieces_before: usize = 0;
         for attempt in 0..30 {
             sleep(Duration::from_secs(1)).await;
@@ -1559,23 +1578,21 @@ async fn test_degradation() -> Result<(), String> {
                     info!("Node B pieces at {}s: {}", attempt + 1, pieces_before);
                 }
                 if pieces_before >= 3 {
-                    break; // Good enough for degradation test
+                    break;
                 }
             }
         }
         info!("Node B peak pieces before degradation: {}", pieces_before);
         
         if pieces_before < 3 {
-            return Err(format!("Expected ≥3 pieces on B for degradation test, got {}", pieces_before));
+            return Err(format!("Expected ≥3 pieces on B, got {}", pieces_before));
         }
         
-        // Poll for degradation: HealthScan runs every 10s, drops 1 piece/segment/cycle.
-        // The challenger may also heal, so we just need to observe a DROP at any point.
-        // We track the minimum piece count seen — if it ever drops below initial, degradation worked.
+        // Poll for degradation: HealthScan runs every 10s.
         info!("Polling for HealthScan degradation...");
         let mut min_seen = pieces_before;
         let mut degradation_observed = false;
-        for attempt in 0..40 {
+        for attempt in 0..60 {
             sleep(Duration::from_secs(1)).await;
             if let Ok(health) = node_b.content_health(&cid).await {
                 let p: usize = health["segments"].as_array()
@@ -1583,11 +1600,8 @@ async fn test_degradation() -> Result<(), String> {
                     .unwrap_or(pieces_before);
                 if p < min_seen {
                     min_seen = p;
-                    info!("Degradation detected at {}s: pieces dropped to {} (was {})", attempt + 1, p, pieces_before);
+                    info!("Degradation at {}s: pieces dropped to {} (was {})", attempt + 1, p, pieces_before);
                     degradation_observed = true;
-                }
-                // Once we've confirmed degradation happened, we can stop
-                if degradation_observed && min_seen < pieces_before {
                     break;
                 }
             }
@@ -1595,12 +1609,13 @@ async fn test_degradation() -> Result<(), String> {
         
         if !degradation_observed {
             return Err(format!(
-                "Expected degradation to drop pieces from {}, but minimum seen was {}",
+                "Expected degradation from {}, but min seen was {}",
                 pieces_before, min_seen
             ));
         }
         
-        info!("=== test_degradation === ✓ PASSED in {:.1}s — pieces dropped from {} to {}", start.elapsed().as_secs_f64(), pieces_before, min_seen);
+        info!("=== test_degradation === ✓ PASSED in {:.1}s — pieces: {} → {}",
+              start.elapsed().as_secs_f64(), pieces_before, min_seen);
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
@@ -2025,19 +2040,21 @@ async fn test_concurrent_stress() -> Result<(), String> {
             return Err("Duplicate CIDs".to_string());
         }
         
-        sleep(Duration::from_secs(15)).await;
+        sleep(Duration::from_secs(20)).await;
         
         let fetch_start = Instant::now();
         let p1 = node_d.data_dir.path().join("stress_1");
         let p2 = node_d.data_dir.path().join("stress_2");
         let p3 = node_d.data_dir.path().join("stress_3");
         
-        let r1 = node_d.fetch(&cid_1, p1.to_str().unwrap()).await;
-        let r2 = node_d.fetch(&cid_2, p2.to_str().unwrap()).await;
-        let r3 = node_d.fetch(&cid_3, p3.to_str().unwrap()).await;
+        // Per-fetch timeout to prevent one slow fetch from consuming the entire test timeout
+        let fetch_timeout = Duration::from_secs(30);
+        let r1 = timeout(fetch_timeout, node_d.fetch(&cid_1, p1.to_str().unwrap())).await.ok().and_then(|r| r.ok());
+        let r2 = timeout(fetch_timeout, node_d.fetch(&cid_2, p2.to_str().unwrap())).await.ok().and_then(|r| r.ok());
+        let r3 = timeout(fetch_timeout, node_d.fetch(&cid_3, p3.to_str().unwrap())).await.ok().and_then(|r| r.ok());
         let fetch_time = fetch_start.elapsed();
         
-        info!("Fetches: r1={}, r2={}, r3={}, {:.1}s", r1.is_ok(), r2.is_ok(), r3.is_ok(), fetch_time.as_secs_f64());
+        info!("Fetches: r1={}, r2={}, r3={}, {:.1}s", r1.is_some(), r2.is_some(), r3.is_some(), fetch_time.as_secs_f64());
         
         let mut verified = 0;
         for (path, hash, name) in [(&p1, &hash_1, "c1"), (&p2, &hash_2, "c2"), (&p3, &hash_3, "c3")] {

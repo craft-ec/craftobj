@@ -77,6 +77,9 @@ pub struct DaemonConfig {
     /// HealthScan periodic scan interval in seconds (default: 300).
     /// Controls how often the HealthScan loop runs to detect repair/degradation needs.
     pub health_scan_interval_secs: u64,
+    /// HealthScan tier target multiplier (default: 1.5). Content with more than
+    /// k × tier_target pieces on the network is considered over-replicated.
+    pub health_scan_tier_target: Option<f64>,
     /// Minimum fetches in the demand window to consider content "hot" (default: 10).
     pub demand_threshold: u32,
 
@@ -114,6 +117,7 @@ impl Default for DaemonConfig {
             stream_open_timeout_secs: 10,
             health_check_interval_secs: 300,
             health_scan_interval_secs: 300,
+            health_scan_tier_target: None,
             demand_threshold: 10,
             max_storage_bytes: 0,
             gc_interval_secs: 3600,

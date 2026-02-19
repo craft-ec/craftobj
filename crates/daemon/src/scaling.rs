@@ -331,18 +331,21 @@ impl ScalingCoordinator {
             }
         };
 
-        // Push piece to target node
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        if self.command_tx.send(CraftObjCommand::PushPiece {
-            peer_id: target_peer,
-            content_id,
+        // Push piece to target node via DistributePieces (unified send_pieces)
+        let payload = craftobj_transfer::PiecePayload {
             segment_index,
             piece_id: new_pid,
             coefficients: new_piece.coefficients,
-            piece_data: new_piece.data,
+            data: new_piece.data,
+        };
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        if self.command_tx.send(CraftObjCommand::DistributePieces {
+            peer_id: target_peer,
+            content_id,
+            pieces: vec![payload],
             reply_tx,
         }).is_err() {
-            warn!("Failed to send PushPiece command for scaling {}", content_id);
+            warn!("Failed to send DistributePieces command for scaling {}", content_id);
         } else {
             info!("Scaling: pushing piece to {} for {}/seg{}", target_peer, content_id, segment_index);
         }

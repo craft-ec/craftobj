@@ -96,23 +96,6 @@ pub enum CraftObjCommand {
         record_json: Vec<u8>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
-    /// Push a piece to a remote storage peer via persistent stream.
-    PushPiece {
-        peer_id: PeerId,
-        content_id: ContentId,
-        segment_index: u32,
-        piece_id: [u8; 32],
-        coefficients: Vec<u8>,
-        piece_data: Vec<u8>,
-        reply_tx: oneshot::Sender<Result<(), String>>,
-    },
-    /// Push multiple pieces to a remote storage peer via persistent stream (pipelined).
-    PushPieceBatch {
-        peer_id: PeerId,
-        content_id: ContentId,
-        pieces: Vec<craftobj_transfer::PiecePayload>,
-        reply_tx: oneshot::Sender<craftobj_transfer::CraftObjResponse>,
-    },
     /// Distribute all pieces for a content to a peer using unified send_pieces().
     /// Opens a stream and sends all pieces in BATCH_SIZE chunks with ack per batch.
     DistributePieces {
