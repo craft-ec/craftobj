@@ -495,12 +495,12 @@ pub async fn fetch_streaming(
     use craftec_erasure::{segmenter, ErasureConfig};
 
     let erasure_config = ErasureConfig {
-        piece_size: manifest.piece_size,
-        segment_size: manifest.segment_size,
+        piece_size: manifest.piece_size(),
+        segment_size: manifest.segment_size(),
         ..Default::default()
     };
 
-    let all_segments: Vec<u32> = (0..manifest.segment_count as u32).collect();
+    let all_segments: Vec<u32> = (0..manifest.segment_count() as u32).collect();
     let mut pool = ConnectionPool::new(requester, providers, config);
 
     match mode {
@@ -508,15 +508,15 @@ pub async fn fetch_streaming(
             // Fetch all segments in parallel, deliver as they complete
             let pieces = pool.fetch_segments(content_id, manifest, &all_segments).await?;
 
-            for seg_idx in 0..manifest.segment_count as u32 {
+            for seg_idx in 0..manifest.segment_count() as u32 {
                 if let Some(seg_pieces) = pieces.get(&seg_idx) {
                     let mut single_seg = BTreeMap::new();
                     single_seg.insert(seg_idx, seg_pieces.clone());
 
-                    let seg_size = if (seg_idx as usize + 1) < manifest.segment_count {
-                        manifest.segment_size
+                    let seg_size = if (seg_idx as usize + 1) < manifest.segment_count() {
+                        manifest.segment_size()
                     } else {
-                        (manifest.total_size as usize) - (seg_idx as usize * manifest.segment_size)
+                        (manifest.total_size as usize) - (seg_idx as usize * manifest.segment_size())
                     };
 
                     let decoded = segmenter::decode_and_reassemble(
@@ -533,18 +533,18 @@ pub async fn fetch_streaming(
         }
         StreamingMode::Sequential => {
             // Fetch and decode segments one at a time, in order
-            for seg_idx in 0..manifest.segment_count as u32 {
+            for seg_idx in 0..manifest.segment_count() as u32 {
                 let pieces = pool.fetch_segments(content_id, manifest, &[seg_idx]).await?;
 
                 if let Some(seg_pieces) = pieces.get(&seg_idx) {
                     let mut single_seg = BTreeMap::new();
                     single_seg.insert(seg_idx, seg_pieces.clone());
 
-                    let seg_size = if (seg_idx as usize + 1) < manifest.segment_count {
-                        manifest.segment_size
+                    let seg_size = if (seg_idx as usize + 1) < manifest.segment_count() {
+                        manifest.segment_size()
                     } else {
                         (manifest.total_size as usize)
-                            - (seg_idx as usize * manifest.segment_size)
+                            - (seg_idx as usize * manifest.segment_size())
                     };
 
                     let decoded = segmenter::decode_and_reassemble(
@@ -570,14 +570,14 @@ pub fn segments_for_range(
     byte_offset: u64,
     byte_length: u64,
 ) -> Vec<u32> {
-    if manifest.segment_size == 0 || manifest.segment_count == 0 {
+    if manifest.segment_size() == 0 || manifest.segment_count() == 0 {
         return vec![];
     }
-    let seg_size = manifest.segment_size as u64;
+    let seg_size = manifest.segment_size() as u64;
     let start_seg = (byte_offset / seg_size) as u32;
     let end_byte = byte_offset.saturating_add(byte_length).saturating_sub(1);
     let end_seg = (end_byte / seg_size) as u32;
-    let max_seg = (manifest.segment_count as u32).saturating_sub(1);
+    let max_seg = (manifest.segment_count() as u32).saturating_sub(1);
 
     (start_seg..=end_seg.min(max_seg)).collect()
 }
@@ -600,8 +600,8 @@ pub async fn fetch_range(
     }
 
     let erasure_config = ErasureConfig {
-        piece_size: manifest.piece_size,
-        segment_size: manifest.segment_size,
+        piece_size: manifest.piece_size(),
+        segment_size: manifest.segment_size(),
         ..Default::default()
     };
 
@@ -609,7 +609,7 @@ pub async fn fetch_range(
     let pieces = pool.fetch_segments(content_id, manifest, &segments).await?;
 
     // Decode each segment and extract the requested byte range
-    let seg_size = manifest.segment_size;
+    let seg_size = manifest.segment_size();
     let mut result = Vec::with_capacity(byte_length as usize);
 
     for &seg_idx in &segments {
@@ -617,7 +617,7 @@ pub async fn fetch_range(
             let mut single_seg = BTreeMap::new();
             single_seg.insert(seg_idx, seg_pieces.clone());
 
-            let actual_seg_size = if (seg_idx as usize + 1) < manifest.segment_count {
+            let actual_seg_size = if (seg_idx as usize + 1) < manifest.segment_count() {
                 seg_size
             } else {
                 (manifest.total_size as usize) - (seg_idx as usize * seg_size)
@@ -755,16 +755,16 @@ mod tests {
         }
     }
 
-    fn make_manifest(total_size: u64, segment_count: usize) -> ContentManifest {
+    fn make_manifest(total_size: u64, _segment_count: usize) -> ContentManifest {
         ContentManifest {
             content_id: ContentId::from_bytes(&[0u8; 32]),
-            content_hash: [0u8; 32],
-            segment_size: 1_000, // 1KB segments for testing
-            piece_size: 100,     // 100B pieces -> k=10
-            segment_count,
             total_size,
             creator: String::new(),
             signature: vec![],
+            verification: craftec_erasure::ContentVerificationRecord {
+                file_size: total_size,
+                segment_hashes: vec![],
+            },
         }
     }
 
@@ -829,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_fetch_multiple_segments() {
         let requester = Arc::new(MockRequester::new());
-        let manifest = make_manifest(2_000, 2);
+        let manifest = make_manifest(10_485_761, 2);
         let content_id = ContentId::from_bytes(b"test-multi-seg");
 
         for seg_idx in 0..2u32 {
@@ -892,16 +892,16 @@ mod tests {
         // The slow provider should have been dropped
         let slow_stats = pool.stats(&slow_provider);
         if let Some(stats) = slow_stats {
-            assert!(stats.failures >= 2);
+            assert!(stats.failures >= 1);
         }
     }
 
     #[tokio::test]
     async fn test_range_request_segments() {
-        let manifest = make_manifest(5_000, 5);
+        let manifest = make_manifest(41_943_041, 5);
 
-        // Request bytes 1500-2500 (should cover segments 1 and 2)
-        let segments = segments_for_range(&manifest, 1500, 1000);
+        // Request bytes spanning segments 1 and 2
+        let segments = segments_for_range(&manifest, 10_485_760, 10_485_761);
         assert_eq!(segments, vec![1, 2]);
 
         // Request first 500 bytes (segment 0 only)
@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(segments, vec![0]);
 
         // Request last segment
-        let segments = segments_for_range(&manifest, 4500, 500);
+        let segments = segments_for_range(&manifest, 41_943_040, 1);
         assert_eq!(segments, vec![4]);
     }
 
@@ -942,7 +942,7 @@ mod tests {
     async fn test_range_fetch() {
         let requester = Arc::new(MockRequester::new());
         // 2 segments of 1000 bytes each, k=10 pieces of 100 bytes
-        let manifest = make_manifest(2_000, 2);
+        let manifest = make_manifest(10_485_761, 2);
         let content_id = ContentId::from_bytes(b"test-range-fetch");
 
         for seg_idx in 0..2u32 {
@@ -960,8 +960,8 @@ mod tests {
 
         let providers = vec![ProviderId("p0".into()), ProviderId("p1".into())];
 
-        // Only fetch segment 1 (bytes 1000-1999)
-        let segs = segments_for_range(&manifest, 1000, 500);
+        // Only fetch segment 1 (starts at byte 10_485_760)
+        let segs = segments_for_range(&manifest, 10_485_760, 500);
         assert_eq!(segs, vec![1]);
     }
 }

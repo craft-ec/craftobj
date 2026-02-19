@@ -266,7 +266,7 @@ pub async fn run_initial_push(
 
     // Collect all local pieces
     let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let piece_ids = {
             let c = client.lock().await;
             c.store().list_pieces(content_id, seg_idx).unwrap_or_default()
@@ -437,7 +437,7 @@ async fn equalize_pressure(
 
         // Collect all local pieces
         let mut all_pieces: Vec<(u32, [u8; 32])> = Vec::new();
-        for seg in 0..manifest.segment_count as u32 {
+        for seg in 0..manifest.segment_count() as u32 {
             let pieces = {
                 let c = client.lock().await;
                 c.store().list_pieces(&content_id, seg).unwrap_or_default()

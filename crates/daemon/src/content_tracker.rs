@@ -110,14 +110,14 @@ impl ContentTracker {
         let k = manifest.k();
         // Count initial pieces: k + parity per segment
         let initial_parity = 20; // default
-        let local_pieces = manifest.segment_count * (k + initial_parity);
+        let local_pieces = manifest.segment_count() * (k + initial_parity);
         let now = now_secs();
 
         let state = ContentState {
             content_id,
             stage: ContentStage::Stored,
             local_pieces,
-            segment_count: manifest.segment_count,
+            segment_count: manifest.segment_count(),
             k,
             provider_count: 0,
             last_announced: None,
@@ -161,7 +161,7 @@ impl ContentTracker {
             content_id,
             stage: ContentStage::Distributed,
             local_pieces: 0,
-            segment_count: manifest.segment_count,
+            segment_count: manifest.segment_count(),
             k,
             provider_count: 2, // At minimum: publisher + self
             last_announced: None,
@@ -300,14 +300,14 @@ impl ContentTracker {
                 Ok(manifest) => {
                     // Count actual pieces in store
                     let mut local_pieces = 0;
-                    for seg in 0..manifest.segment_count as u32 {
+                    for seg in 0..manifest.segment_count() as u32 {
                         local_pieces += store.list_pieces(&cid, seg).unwrap_or_default().len();
                     }
                     let state = ContentState {
                         content_id: cid,
                         stage: ContentStage::Stored,
                         local_pieces,
-                        segment_count: manifest.segment_count,
+                        segment_count: manifest.segment_count(),
                         k: manifest.k(),
                         provider_count: 0,
                         last_announced: None,
@@ -373,7 +373,7 @@ impl ContentTracker {
                     }
                 };
                 let mut count = 0usize;
-                for seg in 0..manifest.segment_count as u32 {
+                for seg in 0..manifest.segment_count() as u32 {
                     count += store.list_pieces(&cid, seg).unwrap_or_default().len();
                 }
                 count
@@ -469,14 +469,14 @@ mod tests {
 
     fn test_manifest(content_id: ContentId) -> ContentManifest {
         ContentManifest {
-            content_id,
-            content_hash: content_id.0,
-            segment_size: 10_485_760,
-            piece_size: 262_144,
-            segment_count: 1,
+            content_id: content_id,
             total_size: 100_000,
             creator: String::new(),
             signature: vec![],
+            verification: craftec_erasure::ContentVerificationRecord {
+                file_size: 100_000,
+                segment_hashes: vec![],
+            },
         }
     }
 

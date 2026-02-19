@@ -209,7 +209,7 @@ impl ChallengerManager {
             .map_err(|e| format!("Failed to get manifest: {}", e))?;
 
         // Determine which segments to sample: all if ≤5, random subset otherwise
-        let segment_count = manifest.segment_count as u32;
+        let segment_count = manifest.segment_count() as u32;
         let segments_to_check: Vec<u32> = if segment_count <= 5 {
             (0..segment_count).collect()
         } else {

@@ -58,7 +58,7 @@ impl CraftObjHandler {
         manifest: &craftobj_core::ContentManifest,
         include_provider_details: bool,
     ) -> CidNetworkHealth {
-        let seg_count = manifest.segment_count;
+        let seg_count = manifest.segment_count();
         let mut network_seg_pieces = vec![0usize; seg_count];
         let mut providers: Vec<Value> = Vec::new();
         let mut network_total: usize = 0;
@@ -555,17 +555,12 @@ impl CraftObjHandler {
                         // No manifest — try verification record and derive manifest from it
                         if let Ok(vr) = client.store().get_verification_record(&cid) {
                             info!("[handler.rs] No manifest but found verification record for {}, deriving manifest from file_size={}", cid, vr.file_size);
-                            let config = craftec_erasure::ErasureConfig::default();
-                            let seg_count = vr.segment_count();
                             let manifest = craftobj_core::ContentManifest {
                                 content_id: cid,
-                                content_hash: cid.0,
-                                segment_size: config.segment_size,
-                                piece_size: config.piece_size,
-                                segment_count: seg_count,
                                 total_size: vr.file_size,
                                 creator: String::new(),
                                 signature: vec![],
+                                verification: vr,
                             };
                             // Store synthetic manifest so reconstruct() can find it
                             let _ = client.store().store_manifest(&manifest);
@@ -587,7 +582,7 @@ impl CraftObjHandler {
                     let local_node = map.local_node().to_vec();
                     // Collect unique providers across all segments
                     let mut seen = std::collections::HashSet::new();
-                    for seg in 0..manifest.segment_count as u32 {
+                    for seg in 0..manifest.segment_count() as u32 {
                         for (node, _pid, _coeff) in map.pieces_for_segment(&cid, seg) {
                             if node == &local_node { continue; }
                             if seen.insert(node.clone()) {
@@ -628,7 +623,7 @@ impl CraftObjHandler {
                             // Verify we actually have enough pieces for all segments
                             let all_segments_complete = {
                                 let client = self.client.lock().await;
-                                (0..manifest.segment_count as u32).all(|seg_idx| {
+                                (0..manifest.segment_count() as u32).all(|seg_idx| {
                                     let k = manifest.k_for_segment(seg_idx as usize);
                                     let piece_ids = client.store().list_pieces(&cid, seg_idx).unwrap_or_default();
                                     let coeffs: Vec<Vec<u8>> = piece_ids.iter()
@@ -1023,7 +1018,7 @@ impl CraftObjHandler {
         // Fetch all segments in parallel (Bug 3 fix: was sequential, seg0 consumed all time)
         let mut segment_join_set: JoinSet<Result<(), String>> = JoinSet::new();
 
-        for seg_idx in 0..manifest.segment_count as u32 {
+        for seg_idx in 0..manifest.segment_count() as u32 {
             let k = manifest.k_for_segment(seg_idx as usize);
             let client = self.client.clone();
             let peer_scorer = self.peer_scorer.clone();
@@ -2027,7 +2022,7 @@ impl CraftObjHandler {
         let pinned = client.is_pinned(&cid);
 
         // Collect local per-segment piece counts
-        let seg_count = manifest.segment_count;
+        let seg_count = manifest.segment_count();
         let mut local_seg_pieces = vec![0usize; seg_count];
         let segments_list = store.list_segments(&cid).unwrap_or_default();
         for &seg in &segments_list {
@@ -2157,7 +2152,7 @@ impl CraftObjHandler {
         let mut cid_data: Vec<(craftobj_core::ContentId, Vec<usize>, Option<craftobj_core::ContentManifest>, u64)> = Vec::new();
         for item in &items {
             let manifest = client.store().get_manifest(&item.content_id).ok();
-            let seg_count = manifest.as_ref().map(|m| m.segment_count).unwrap_or(0);
+            let seg_count = manifest.as_ref().map(|m| m.segment_count()).unwrap_or(0);
             let mut local_seg_pieces = vec![0usize; seg_count];
             let segments = client.store().list_segments(&item.content_id).unwrap_or_default();
             for &seg in &segments {

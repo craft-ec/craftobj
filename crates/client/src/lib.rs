@@ -180,17 +180,13 @@ impl CraftObjClient {
         };
         self.store.store_verification_record(&content_id, &verification_record)?;
 
-        // Build and store manifest
-        let content_hash = content_id.0; // CID is SHA-256 of content bytes
+        // Build and store content record
         let manifest = ContentManifest {
             content_id,
-            content_hash,
-            segment_size: config.segment_size,
-            piece_size: config.piece_size,
-            segment_count,
             total_size,
             creator: String::new(),
             signature: vec![],
+            verification: verification_record.clone(),
         };
         self.store.store_manifest(&manifest)?;
 
@@ -257,14 +253,14 @@ impl CraftObjClient {
     ) -> Result<()> {
         let manifest = self.store.get_manifest(content_id)?;
         let config = ErasureConfig {
-            piece_size: manifest.piece_size,
-            segment_size: manifest.segment_size,
+            piece_size: manifest.piece_size(),
+            segment_size: manifest.segment_size(),
             ..Default::default()
         };
 
         let mut segments: BTreeMap<u32, Vec<CodedPiece>> = BTreeMap::new();
 
-        for seg_idx in 0..manifest.segment_count as u32 {
+        for seg_idx in 0..manifest.segment_count() as u32 {
             let k = manifest.k_for_segment(seg_idx as usize);
             let piece_ids = self.store.list_pieces(content_id, seg_idx)?;
 
@@ -287,7 +283,7 @@ impl CraftObjClient {
 
         let reconstructed = segmenter::decode_and_reassemble(
             &segments,
-            manifest.segment_count as u32,
+            manifest.segment_count() as u32,
             &config,
             manifest.total_size as usize,
         )
@@ -341,7 +337,7 @@ impl CraftObjClient {
                 result.push(ContentInfo {
                     content_id: cid,
                     total_size: manifest.total_size,
-                    segment_count: manifest.segment_count,
+                    segment_count: manifest.segment_count(),
                     pinned: self.pin_manager.is_pinned(&cid),
                 });
             }
@@ -357,7 +353,7 @@ impl CraftObjClient {
         for cid in &content {
             if let Ok(manifest) = self.store.get_manifest(cid) {
                 stored_bytes += manifest.total_size;
-                for seg in 0..manifest.segment_count as u32 {
+                for seg in 0..manifest.segment_count() as u32 {
                     piece_count += self.store.list_pieces(cid, seg).unwrap_or_default().len();
                 }
             }
@@ -444,13 +440,13 @@ impl CraftObjClient {
         // 1. Reconstruct original ciphertext from pieces
         let manifest = self.store.get_manifest(old_content_id)?;
         let config = ErasureConfig {
-            piece_size: manifest.piece_size,
-            segment_size: manifest.segment_size,
+            piece_size: manifest.piece_size(),
+            segment_size: manifest.segment_size(),
             ..Default::default()
         };
 
         let mut segments: BTreeMap<u32, Vec<CodedPiece>> = BTreeMap::new();
-        for seg_idx in 0..manifest.segment_count as u32 {
+        for seg_idx in 0..manifest.segment_count() as u32 {
             let piece_ids = self.store.list_pieces(old_content_id, seg_idx)?;
             let mut collected: Vec<CodedPiece> = Vec::new();
             for pid in &piece_ids {
@@ -463,7 +459,7 @@ impl CraftObjClient {
 
         let ciphertext = segmenter::decode_and_reassemble(
             &segments,
-            manifest.segment_count as u32,
+            manifest.segment_count() as u32,
             &config,
             manifest.total_size as usize,
         )
@@ -523,13 +519,10 @@ impl CraftObjClient {
 
         let new_manifest = ContentManifest {
             content_id: new_content_id,
-            content_hash: new_content_id.0,
-            segment_size: config.segment_size,
-            piece_size: config.piece_size,
-            segment_count,
             total_size,
             creator: String::new(),
             signature: vec![],
+            verification: new_verification_record.clone(),
         };
         self.store.store_manifest(&new_manifest)?;
         self.pin_manager.pin(&new_content_id)?;

@@ -1983,10 +1983,10 @@ async fn handle_protocol_events(
             }
             
             CraftObjEvent::ManifestRetrieved { content_id, manifest } => {
-                info!("[service.rs] Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count);
+                info!("[service.rs] Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count());
                 let _ = daemon_event_tx.send(DaemonEvent::ManifestRetrieved {
                     content_id: content_id.to_hex(),
-                    segments: manifest.segment_count,
+                    segments: manifest.segment_count(),
                 });
                 
                 // Find and respond to the waiting request

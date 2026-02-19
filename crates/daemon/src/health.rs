@@ -229,7 +229,7 @@ pub fn heal_content(
     let mut generated = 0;
     let mut errors = Vec::new();
 
-    for seg_idx in 0..manifest.segment_count as u32 {
+    for seg_idx in 0..manifest.segment_count() as u32 {
         let piece_ids = match store.list_pieces(&manifest.content_id, seg_idx) {
             Ok(ids) => ids,
             Err(e) => {

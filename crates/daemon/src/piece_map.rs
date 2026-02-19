@@ -138,12 +138,12 @@ impl PieceMap {
     /// Compute health as min(rank/k) across all segments.
     /// Returns 0.0 if manifest has no segments or k=0.
     pub fn compute_health(&self, cid: &ContentId, manifest: &ContentManifest, online_only: bool) -> f64 {
-        if manifest.segment_count == 0 {
+        if manifest.segment_count() == 0 {
             return 0.0;
         }
 
         let mut min_health = f64::MAX;
-        for seg in 0..manifest.segment_count {
+        for seg in 0..manifest.segment_count() {
             let k = manifest.k_for_segment(seg);
             if k == 0 {
                 continue;

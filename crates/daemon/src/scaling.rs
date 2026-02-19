@@ -226,7 +226,7 @@ impl ScalingCoordinator {
         };
 
         let mut total_local = 0usize;
-        for seg in 0..manifest.segment_count as u32 {
+        for seg in 0..manifest.segment_count() as u32 {
             total_local += store.list_pieces(&signal.content_id, seg).unwrap_or_default().len();
         }
 
@@ -266,7 +266,7 @@ impl ScalingCoordinator {
         };
 
         let mut best_seg: Option<(u32, Vec<[u8; 32]>)> = None;
-        for seg in 0..manifest.segment_count as u32 {
+        for seg in 0..manifest.segment_count() as u32 {
             if let Ok(ids) = store.list_pieces(&content_id, seg) {
                 if ids.len() >= 2 && (best_seg.is_none() || ids.len() > best_seg.as_ref().unwrap().1.len()) {
                     best_seg = Some((seg, ids));
@@ -519,13 +519,13 @@ mod tests {
         let store = craftobj_store::FsStore::new(tmp.path()).unwrap();
         let manifest = craftobj_core::ContentManifest {
             content_id: cid,
-            content_hash: cid.0,
-            segment_size: 10_485_760,
-            piece_size: 262_144,
-            segment_count: 1,
             total_size: 200,
             creator: String::new(),
             signature: vec![],
+            verification: craftec_erasure::ContentVerificationRecord {
+                file_size: 200,
+                segment_hashes: vec![],
+            },
         };
         store.store_manifest(&manifest).unwrap();
         let piece_data = vec![0u8; 100];
