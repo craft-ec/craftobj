@@ -489,7 +489,7 @@ impl HealthScan {
 
             for &seg in segments {
                 let rank = map.compute_rank(cid, seg, true);
-                let _total_pieces = map.segment_pieces(cid, seg);
+                let total_pieces = map.segment_pieces(cid, seg);
                 let k = manifest
                     .as_ref()
                     .map(|m| m.k_for_segment(seg as usize))
@@ -500,7 +500,9 @@ impl HealthScan {
                     .map(|(node, _, _)| (*node).clone())
                     .collect::<std::collections::HashSet<_>>()
                     .len();
-                let ratio = if k > 0 { rank as f64 / k as f64 } else { 0.0 };
+                // Use total_pieces/k for health ratio — rank maxes at k so rank/k
+                // can never exceed 1.0, but piece count reflects actual redundancy.
+                let ratio = if k > 0 { total_pieces as f64 / k as f64 } else { 0.0 };
                 if ratio < min_ratio {
                     min_ratio = ratio;
                 }
@@ -508,6 +510,7 @@ impl HealthScan {
                     index: seg,
                     rank,
                     k,
+                    total_pieces,
                     provider_count: providers,
                 });
             }

@@ -651,6 +651,9 @@ pub struct SegmentSnapshot {
     pub rank: usize,
     /// k value for this segment (pieces needed for reconstruction).
     pub k: usize,
+    /// Total pieces across all providers (including redundant/dependent).
+    #[serde(default)]
+    pub total_pieces: usize,
     /// Number of unique providers for this segment.
     pub provider_count: usize,
 }
@@ -1033,8 +1036,8 @@ mod tests {
             content_id: ContentId([1u8; 32]),
             segment_count: 2,
             segments: vec![
-                SegmentSnapshot { index: 0, rank: 3, k: 3, provider_count: 2 },
-                SegmentSnapshot { index: 1, rank: 2, k: 3, provider_count: 1 },
+                SegmentSnapshot { index: 0, rank: 3, k: 3, total_pieces: 5, provider_count: 2 },
+                SegmentSnapshot { index: 1, rank: 2, k: 3, total_pieces: 3, provider_count: 1 },
             ],
             provider_count: 2,
             health_ratio: 0.667,
