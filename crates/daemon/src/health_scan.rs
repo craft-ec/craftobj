@@ -556,12 +556,18 @@ impl HealthScan {
         let rank_f = rank as f64;
         let k_f = k as f64;
         let target_rank = (k_f * self.tier_target).ceil() as usize;
+        let target_pieces = target_rank; // same value, clearer name for piece-count checks
+
+        let total_network_pieces: usize = provider_counts.values().sum();
+        debug!("HealthScan: {}/seg{} rank={} k={} target={} network_pieces={} local={} tier={:.1}",
+            cid, segment, rank, k, target_pieces, total_network_pieces, local_count, self.tier_target);
 
         // Check for under-replication → deterministic repair
-        if rank < target_rank && local_count >= MIN_PIECES_PER_SEGMENT {
+        // Use piece count, not rank (rank maxes at k, can't exceed target when tier >= 1.0).
+        if total_network_pieces < target_pieces && local_count >= MIN_PIECES_PER_SEGMENT {
             let deficit = target_rank - rank;
 
-            let mut sorted_providers: Vec<(Vec<u8>, usize)> = provider_counts.into_iter().collect();
+            let mut sorted_providers: Vec<(Vec<u8>, usize)> = provider_counts.iter().map(|(k,v)| (k.clone(), *v)).collect();
             sorted_providers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
             let my_position = sorted_providers
@@ -587,16 +593,18 @@ impl HealthScan {
             return None;
         }
 
-        // Check for over-replication → degradation (rank exceeds tier target)
-        if rank > target_rank && local_count > MIN_PIECES_PER_SEGMENT {
+        // Check for over-replication → degradation
+        // Use total network piece count, not rank (rank maxes at k, can't exceed target).
+        // If the network has more pieces than k * tier_target, it's over-replicated.
+        if total_network_pieces > target_pieces && local_count > MIN_PIECES_PER_SEGMENT {
             let has_demand = {
                 let dt = self.demand_tracker.lock().await;
                 dt.has_recent_signal(&cid)
             };
             if !has_demand {
                 debug!(
-                    "HealthScan: {}/seg{} over-replicated (rank={}, target={} (k={}×{:.1}), local={}), degrading",
-                    cid, segment, rank, target_rank, k, self.tier_target, local_count
+                    "HealthScan: {}/seg{} over-replicated (pieces={}, target={} (k={}×{:.1}), local={}), degrading",
+                    cid, segment, total_network_pieces, target_pieces, k, self.tier_target, local_count
                 );
                 self.attempt_degradation(cid, segment, &local_node).await;
                 return Some(HealthAction::Degraded { segment });
@@ -871,70 +879,24 @@ mod tests {
         let (pm, store, dt, local, dir) = setup_test();
         let tx = make_tx();
         let mut scan = HealthScan::new(pm.clone(), store.clone(), dt, local, tx);
-        scan.set_tier_target(0.5); // k=4, target_rank = ceil(4*0.5) = 2, rank=4 > 2 → should degrade
+        scan.set_tier_target(1.2); // k=3, target_pieces = ceil(3*1.2) = 4
 
         let cid = ContentId([1u8; 32]);
         let local_bytes = local.to_bytes().to_vec();
+        let remote_node = vec![99u8; 38]; // simulated remote peer
 
-        // Store 4 local pieces with k=4 (identity vectors, rank=4)
-        // target_rank = ceil(4*0.5) = 2, so rank=4 > 2 → over-replicated
+        // k=3. Local has 3 pieces, remote has 3 pieces = 6 total network pieces.
+        // target_pieces = ceil(3 * 1.2) = 4. 6 > 4 → over-replicated → degrade.
         {
             let s = store.lock().await;
             let mut map = pm.lock().await;
             map.set_node_online(&local_bytes, true);
+            map.set_node_online(&remote_node, true);
             map.track_segment(cid, 0);
 
-            for i in 0..4u8 {
-                let mut coeff = vec![0u8; 4]; // k=4
-                coeff[i as usize] = 1; // identity vectors
-                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
-                s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
-                let seq = map.next_seq();
-                map.apply_event(&PieceEvent::Stored(PieceStored {
-                    node: local_bytes.clone(),
-                    cid,
-                    segment: 0,
-                    piece_id: pid,
-                    coefficients: coeff,
-                    seq,
-                    timestamp: 1000,
-                    signature: vec![],
-                }));
-            }
-        }
-
-        // Run scan — should trigger degradation (rank=4 > target=2, no demand, local=4 > 2)
-        scan.run_scan().await;
-
-        // After degradation, local should have 3 pieces (dropped 1)
-        let local_count = {
-            let map = pm.lock().await;
-            map.local_pieces(&cid, 0)
-        };
-        assert_eq!(local_count, 3, "Should have dropped 1 piece via degradation");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_scan_demand_blocks_degradation() {
-        let (pm, store, dt, local, dir) = setup_test();
-        let tx = make_tx();
-        let mut scan = HealthScan::new(pm.clone(), store.clone(), dt.clone(), local, tx);
-        scan.set_tier_target(0.5); // k=4, target_rank=2, rank=4 > 2 → would degrade without demand
-
-        let cid = ContentId([1u8; 32]);
-        let local_bytes = local.to_bytes().to_vec();
-
-        // Store 4 pieces with k=4 (over-replicated relative to target 0.5)
-        {
-            let s = store.lock().await;
-            let mut map = pm.lock().await;
-            map.set_node_online(&local_bytes, true);
-            map.track_segment(cid, 0);
-
-            for i in 0..4u8 {
-                let mut coeff = vec![0u8; 4];
+            // Local: 3 identity pieces
+            for i in 0..3u8 {
+                let mut coeff = vec![0u8; 3];
                 coeff[i as usize] = 1;
                 let pid = craftobj_store::piece_id_from_coefficients(&coeff);
                 s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
@@ -950,9 +912,95 @@ mod tests {
                     signature: vec![],
                 }));
             }
+
+            // Remote: 3 different pieces (random coefficients)
+            for i in 0..3u8 {
+                let coeff = vec![i.wrapping_add(10), i.wrapping_add(20), i.wrapping_add(30)];
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
+                let seq = map.next_seq();
+                map.apply_event(&PieceEvent::Stored(PieceStored {
+                    node: remote_node.clone(),
+                    cid,
+                    segment: 0,
+                    piece_id: pid,
+                    coefficients: coeff,
+                    seq,
+                    timestamp: 1000,
+                    signature: vec![],
+                }));
+            }
         }
 
-        // Add demand signal — should prevent degradation
+        // Run scan — should trigger degradation (6 pieces > target 4, no demand, local=3 > 2)
+        scan.run_scan().await;
+
+        // After degradation, local should have 2 pieces (dropped 1)
+        let local_count = {
+            let map = pm.lock().await;
+            map.local_pieces(&cid, 0)
+        };
+        assert_eq!(local_count, 2, "Should have dropped 1 piece via degradation");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_scan_demand_blocks_degradation() {
+        let (pm, store, dt, local, dir) = setup_test();
+        let tx = make_tx();
+        let mut scan = HealthScan::new(pm.clone(), store.clone(), dt.clone(), local, tx);
+        scan.set_tier_target(1.2); // k=3, target_pieces=4, network=6 > 4 → would degrade without demand
+
+        let cid = ContentId([1u8; 32]);
+        let local_bytes = local.to_bytes().to_vec();
+        let remote_node = vec![99u8; 38];
+
+        // Same setup as degradation test: 3 local + 3 remote = 6 > target 4
+        {
+            let s = store.lock().await;
+            let mut map = pm.lock().await;
+            map.set_node_online(&local_bytes, true);
+            map.set_node_online(&remote_node, true);
+            map.track_segment(cid, 0);
+
+            for i in 0..3u8 {
+                let mut coeff = vec![0u8; 3];
+                coeff[i as usize] = 1;
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
+                s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
+                let seq = map.next_seq();
+                map.apply_event(&PieceEvent::Stored(PieceStored {
+                    node: local_bytes.clone(),
+                    cid,
+                    segment: 0,
+                    piece_id: pid,
+                    coefficients: coeff,
+                    seq,
+                    timestamp: 1000,
+                    signature: vec![],
+                }));
+            }
+
+            for i in 0..3u8 {
+                let coeff = vec![i.wrapping_add(10), i.wrapping_add(20), i.wrapping_add(30)];
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
+                let seq = map.next_seq();
+                map.apply_event(&PieceEvent::Stored(PieceStored {
+                    node: remote_node.clone(),
+                    cid,
+                    segment: 0,
+                    piece_id: pid,
+                    coefficients: coeff,
+                    seq,
+                    timestamp: 1000,
+                    signature: vec![],
+                }));
+            }
+        }
+
+        // Add demand signal — should prevent degradation even though over-replicated
         {
             let mut tracker = dt.lock().await;
             tracker.record_signal(cid);
@@ -964,7 +1012,7 @@ mod tests {
             let map = pm.lock().await;
             map.local_pieces(&cid, 0)
         };
-        assert_eq!(local_count, 4, "Demand should block degradation");
+        assert_eq!(local_count, 3, "Demand should block degradation");
 
         std::fs::remove_dir_all(&dir).ok();
     }
