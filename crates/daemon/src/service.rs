@@ -863,6 +863,11 @@ async fn drive_swarm(
                         peer_last_seen.insert(peer_id, std::time::Instant::now());
                         // Track for PEX
                         pex_manager.add_peer(peer_id, vec![endpoint.get_remote_address().clone()]);
+                        // Trigger Kademlia bootstrap so the routing table populates
+                        // (critical when mDNS is disabled — e.g., in tests or production)
+                        if let Err(e) = swarm.behaviour_mut().craft.bootstrap() {
+                            debug!("Kademlia bootstrap after ConnectionEstablished: {:?}", e);
+                        }
                         let _ = event_tx.send(DaemonEvent::PeerConnected {
                             peer_id: peer_id.to_string(),
                             address: endpoint.get_remote_address().to_string(),
@@ -947,6 +952,15 @@ async fn drive_swarm(
                                 {
                                     let mut scorer = peer_scorer.lock().await;
                                     scorer.evict_stale(std::time::Duration::from_secs(900));
+                                }
+                                // Handle Identify: add peer's listen addresses to Kademlia routing table.
+                                // libp2p 0.54+ no longer does this automatically.
+                                if let craftec_network::behaviour::CraftBehaviourEvent::Identify(
+                                    libp2p::identify::Event::Received { peer_id, info, .. }
+                                ) = craft_event {
+                                    for addr in &info.listen_addrs {
+                                        swarm.behaviour_mut().craft.add_address(peer_id, addr.clone());
+                                    }
                                 }
                                 // Handle Kademlia events for DHT queries
                                 if let craftec_network::behaviour::CraftBehaviourEvent::Kademlia(ref kad_event) = craft_event {
