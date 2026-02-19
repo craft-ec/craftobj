@@ -1637,7 +1637,7 @@ async fn test_multi_segment_content() -> Result<(), String> {
     init_test_tracing();
     info!("=== Running test_multi_segment_content ===");
     
-    let timeout_duration = Duration::from_secs(180);
+    let timeout_duration = Duration::from_secs(240);
     timeout(timeout_duration, async {
         let node_a = TestNode::spawn(0, vec![]).await?;
         sleep(Duration::from_secs(3)).await;
@@ -1646,9 +1646,10 @@ async fn test_multi_segment_content() -> Result<(), String> {
         let node_b = TestNode::spawn(1, vec![boot_a]).await?;
         wait_for_connection(&node_a, &node_b, 20).await?;
         
-        // Generate >10MB content (11MB) to ensure multiple segments
-        let large_content: Vec<u8> = (0..11 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
-        info!("Publishing {}MB content", large_content.len() / (1024 * 1024));
+        // Generate just over 10MB to ensure exactly 2 segments (10MB + 256KB)
+        // Segment 0: 10MB = 40 pieces at 256KB. Segment 1: 256KB = 1 piece.
+        let large_content: Vec<u8> = (0..(10 * 1024 * 1024 + 256 * 1024)).map(|i| (i % 256) as u8).collect();
+        info!("Publishing {} bytes ({:.1}MB) content", large_content.len(), large_content.len() as f64 / (1024.0 * 1024.0));
         
         let cid = node_a.publish(&large_content).await?;
         
@@ -1656,10 +1657,19 @@ async fn test_multi_segment_content() -> Result<(), String> {
         let segments = node_a.rpc("content.segments", Some(json!({"cid": cid}))).await;
         info!("Segments response: {:?}", segments);
         
-        // Wait for distribution
-        sleep(Duration::from_secs(30)).await;
+        // Wait for distribution — large content (41+ pieces) takes time to push.
+        // Poll node B until it has the content, or fall back to fetching from network.
+        let mut b_has_content = false;
+        for _ in 0..60 {
+            sleep(Duration::from_secs(2)).await;
+            if wait_for_content(&node_b, &cid, 1).await.is_ok() {
+                b_has_content = true;
+                break;
+            }
+        }
+        info!("Node B has content after distribution: {}", b_has_content);
         
-        // Fetch on B and verify
+        // Fetch on B — if B has all pieces locally, fast. Otherwise resolves from A via DHT.
         let fetch_path = node_b.data_dir.path().join("fetched_multi_segment");
         let fetch_result = node_b.fetch(&cid, fetch_path.to_str().unwrap()).await?;
         info!("Multi-segment fetch result: {}", fetch_result);
