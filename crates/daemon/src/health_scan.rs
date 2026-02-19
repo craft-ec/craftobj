@@ -82,6 +82,8 @@ pub struct HealthScan {
     data_dir: Option<PathBuf>,
     /// Cache of last-known Merkle roots from providers, keyed by (peer, cid).
     merkle_root_cache: HashMap<MerkleCacheKey, [u8; 32]>,
+    /// Current position in the sorted CID list for rotational scanning.
+    rotation_cursor: usize,
 }
 
 impl HealthScan {
@@ -103,6 +105,7 @@ impl HealthScan {
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
             data_dir: None,
             merkle_root_cache: HashMap::new(),
+            rotation_cursor: 0,
         }
     }
 
@@ -420,13 +423,39 @@ impl HealthScan {
     /// 2. For each segment: compute rank and trigger repair or degradation
     /// 3. Persist health snapshots
     pub async fn run_scan(&mut self) {
-        // Collect owned CIDs and segments from PieceMap
-        let (owned_segments, unique_cids): (Vec<(ContentId, u32)>, Vec<ContentId>) = {
+        // Get sorted CID list for deterministic rotation
+        let all_cids_sorted: Vec<ContentId> = {
             let map = self.piece_map.lock().await;
-            let cids = map.all_cids();
+            let mut cids: Vec<ContentId> = map.all_cids().into_iter().collect();
+            cids.sort_by(|a, b| a.0.cmp(&b.0));
+            cids
+        };
+
+        if all_cids_sorted.is_empty() {
+            debug!("HealthScan: no owned segments to scan");
+            return;
+        }
+
+        // Compute 1% batch (at least 1 CID)
+        let total = all_cids_sorted.len();
+        let batch_size = (total / 100).max(1);
+        let cursor = self.rotation_cursor % total;
+        let end = std::cmp::min(cursor + batch_size, total);
+        let batch_cids = &all_cids_sorted[cursor..end];
+
+        info!(
+            "HealthScan: scanning batch {}..{} of {} CIDs (1% rotation)",
+            cursor, end, total
+        );
+
+        // Advance cursor, wrapping around
+        self.rotation_cursor = if end >= total { 0 } else { end };
+
+        // Collect owned segments for batch CIDs only
+        let owned_segments: Vec<(ContentId, u32)> = {
+            let map = self.piece_map.lock().await;
             let mut segments = Vec::new();
-            let mut seen_cids = Vec::new();
-            for cid in &cids {
+            for cid in batch_cids {
                 let local_pieces = map.pieces_for_cid_local(cid);
                 let mut seen_segments = std::collections::HashSet::new();
                 for (seg, _pid) in local_pieces {
@@ -434,21 +463,20 @@ impl HealthScan {
                         segments.push((*cid, seg));
                     }
                 }
-                seen_cids.push(*cid);
             }
-            (segments, seen_cids)
+            segments
         };
 
         if owned_segments.is_empty() {
-            debug!("HealthScan: no owned segments to scan");
+            debug!("HealthScan: no owned segments in current batch");
             return;
         }
 
         debug!("HealthScan: scanning {} owned segments", owned_segments.len());
 
-        // Step 1: Pull Merkle diffs from providers for each CID
-        for &cid in &unique_cids {
-            self.pull_merkle_for_cid(cid).await;
+        // Step 1: Pull Merkle diffs from providers for batch CIDs
+        for cid in batch_cids {
+            self.pull_merkle_for_cid(*cid).await;
         }
 
         // Group segments by CID for snapshot generation
@@ -1390,6 +1418,68 @@ mod tests {
         scan.merkle_root_cache.insert(cache_key.clone(), [0xEE; 32]);
         assert_eq!(scan.merkle_root_cache.get(&cache_key), Some(&[0xEE; 32]));
         
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_rotation_scans_all_cids_over_multiple_cycles() {
+        let (pm, store, dt, local, dir) = setup_test();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drain_commands(rx);
+        let mut scan = HealthScan::new(pm.clone(), store.clone(), dt, local, tx);
+
+        let local_bytes = local.to_bytes().to_vec();
+
+        // Create 10 CIDs, each with 1 segment and 2 local pieces (k=2)
+        for i in 0..10u8 {
+            let mut raw = [0u8; 32];
+            raw[0] = i;
+            let cid = ContentId(raw);
+
+            let s = store.lock().await;
+            let mut map = pm.lock().await;
+            map.set_node_online(&local_bytes, true);
+            map.track_segment(cid, 0);
+
+            for j in 0..2u8 {
+                let mut coeff = vec![0u8; 2];
+                coeff[j as usize] = 1;
+                let pid = craftobj_store::piece_id_from_coefficients(&coeff);
+                s.store_piece(&cid, 0, &pid, b"data", &coeff).unwrap();
+                let seq = map.next_seq();
+                map.apply_event(&PieceEvent::Stored(PieceStored {
+                    node: local_bytes.clone(),
+                    cid,
+                    segment: 0,
+                    piece_id: pid,
+                    coefficients: coeff,
+                    seq,
+                    timestamp: 1000,
+                    signature: vec![],
+                }));
+            }
+        }
+
+        // 10 CIDs, batch_size = max(10/100, 1) = 1. Need 10 cycles to cover all.
+        assert_eq!(scan.rotation_cursor, 0);
+
+        // Run 10 cycles — each should advance cursor by 1
+        for cycle in 0..10 {
+            let cursor_before = scan.rotation_cursor;
+            scan.run_scan().await;
+            if cycle < 9 {
+                assert_eq!(scan.rotation_cursor, cursor_before + 1,
+                    "Cursor should advance by 1 each cycle (cycle {})", cycle);
+            } else {
+                // Last cycle wraps to 0
+                assert_eq!(scan.rotation_cursor, 0,
+                    "Cursor should wrap to 0 after full rotation");
+            }
+        }
+
+        // After 10 cycles, cursor should be back to 0
+        assert_eq!(scan.rotation_cursor, 0, "Cursor should wrap after full rotation");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
