@@ -183,10 +183,6 @@ pub struct ConnectionPool {
     active_providers: Vec<ProviderId>,
     /// Backup providers not yet in use.
     backup_providers: VecDeque<ProviderId>,
-    /// Known regions per provider (from capability announcements).
-    provider_regions: HashMap<ProviderId, String>,
-    /// Our own region for geographic preference.
-    local_region: Option<String>,
 }
 
 impl ConnectionPool {
@@ -237,8 +233,6 @@ impl ConnectionPool {
             provider_stats,
             active_providers,
             backup_providers,
-            provider_regions,
-            local_region,
         }
     }
 

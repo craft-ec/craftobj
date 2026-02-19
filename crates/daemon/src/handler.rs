@@ -1066,13 +1066,15 @@ impl CraftObjHandler {
             let mut total_fetched = have_pieces.len();
 
             for (attempt, &provider) in ranked_providers.iter().enumerate() {
-                if total_fetched >= k {
+                if current_rank >= k {
                     break;
                 }
 
-                let still_needed = (k - total_fetched) as u16;
-                info!("[fetch] seg{} attempt#{} to {} (have={}, need={})", 
-                    seg_idx, attempt, &provider.to_string()[..8], total_fetched, still_needed);
+                let rank_deficit = (k - current_rank) as u16;
+                // Request extra pieces to account for possible linear dependence
+                let still_needed = rank_deficit.saturating_add(rank_deficit / 2).max(rank_deficit + 1);
+                info!("[fetch] seg{} attempt#{} to {} (have={}, rank={}/{}, requesting={})", 
+                    seg_idx, attempt, &provider.to_string()[..8], total_fetched, current_rank, k, still_needed);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let command = CraftObjCommand::FetchPieces {
@@ -1092,8 +1094,25 @@ impl CraftObjHandler {
                         let got = piece_ids.len().saturating_sub(total_fetched);
                         total_fetched = piece_ids.len();
                         have_pieces = piece_ids;
-                        info!("[fetch] seg{} got {} new pieces from {} (total: {}/{})", 
-                            seg_idx, got, &provider.to_string()[..8], total_fetched, k);
+                        
+                        // Recompute rank with all current pieces to check independence
+                        {
+                            let client_guard = client.lock().await;
+                            coeff_matrix.clear();
+                            for pid in &have_pieces {
+                                if let Ok((_data, coeff)) = client_guard.store().get_piece(&cid, seg_idx, pid) {
+                                    coeff_matrix.push(coeff);
+                                }
+                            }
+                            current_rank = if coeff_matrix.is_empty() {
+                                0
+                            } else {
+                                craftec_erasure::check_independence(&coeff_matrix)
+                            };
+                        }
+                        
+                        info!("[fetch] seg{} got {} new pieces from {} (total: {}, rank: {}/{})", 
+                            seg_idx, got, &provider.to_string()[..8], total_fetched, current_rank, k);
                     }
                     Ok(Ok(Err(e))) => {
                         warn!("[fetch] seg{} provider {} failed: {}", seg_idx, &provider.to_string()[..8], e);
@@ -1107,11 +1126,11 @@ impl CraftObjHandler {
                 }
             }
 
-            if total_fetched >= k {
-                info!("[fetch] seg{} COMPLETE: {} pieces in {:.1}s", seg_idx, total_fetched, seg_start.elapsed().as_secs_f64());
+            if current_rank >= k {
+                info!("[fetch] seg{} COMPLETE: {} pieces (rank {}) in {:.1}s", seg_idx, total_fetched, current_rank, seg_start.elapsed().as_secs_f64());
             } else {
-                warn!("[fetch] seg{} INCOMPLETE: {}/{} after all providers, {:.1}s", seg_idx, total_fetched, k, seg_start.elapsed().as_secs_f64());
-                return Err(format!("Segment {} incomplete: {}/{}", seg_idx, total_fetched, k));
+                warn!("[fetch] seg{} INCOMPLETE: rank {}/{} ({} pieces) after all providers, {:.1}s", seg_idx, current_rank, k, total_fetched, seg_start.elapsed().as_secs_f64());
+                return Err(format!("Segment {} incomplete: rank {}/{}", seg_idx, current_rank, k));
             }
 
             Ok(())
@@ -2285,6 +2304,21 @@ impl CraftObjHandler {
             "segments": segments_json,
         }))
     }
+
+    // -----------------------------------------------------------------------
+    // Aggregator RPC
+    // -----------------------------------------------------------------------
+
+    async fn handle_aggregator_status(&self) -> Result<Value, String> {
+        // TODO: wire up real aggregator state once shared state is plumbed through
+        Ok(serde_json::json!({
+            "running": false,
+            "last_epoch": 0,
+            "receipts_collected": 0,
+            "last_merkle_root": null,
+            "next_epoch_secs": 0
+        }))
+    }
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
@@ -2345,6 +2379,7 @@ impl IpcHandler for CraftObjHandler {
                 "content.segments" => self.handle_content_segments(params).await,
                 "network.health" => self.handle_network_health().await,
                 "node.stats" => self.handle_node_stats().await,
+                "aggregator.status" => self.handle_aggregator_status().await,
                 "shutdown" => {
                     info!("[handler.rs] Shutdown requested via RPC");
                     // Emit event

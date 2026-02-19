@@ -17,7 +17,7 @@ use libp2p::PeerId;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::commands::{CraftObjCommand, MerkleDiffResult};
+use crate::commands::CraftObjCommand;
 use crate::piece_map::PieceMap;
 use crate::scaling::DemandSignalTracker;
 
@@ -230,6 +230,8 @@ impl HealthScan {
     ///
     /// Gets the Merkle root and diff for each segment separately from a peer.
     /// This properly handles multi-segment content instead of just segment 0.
+    // Used in tests only; keeping for test coverage of multi-segment merkle pulls
+    #[allow(dead_code)]
     async fn send_merkle_pull(
         &self,
         peer_id: PeerId,
@@ -568,7 +570,6 @@ impl HealthScan {
             let pieces = map.pieces_for_segment(&cid, segment);
             pieces.first().map(|(_, _, coeff)| coeff.len()).unwrap_or(local_count)
         };
-        let rank_f = rank as f64;
         let k_f = k as f64;
         let target_rank = (k_f * self.tier_target).ceil() as usize;
         let target_pieces = target_rank; // same value, clearer name for piece-count checks
