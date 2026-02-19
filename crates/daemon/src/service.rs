@@ -1518,13 +1518,10 @@ async fn handle_command(
             let local_peer_id = *swarm.local_peer_id();
             
             let result = async {
-                // Don't announce publisher as provider here — publishers delete all
-                // pieces after distribution. Storage nodes announce themselves in the
-                // PushRecord handler when they receive the manifest.
-                // We only publish the manifest to DHT so fetchers can find it.
+                // Publish manifest to DHT so fetchers can find it.
                 protocol.publish_manifest(&mut swarm.behaviour_mut().craft, &manifest, &local_peer_id).await
                     .map_err(|e| format!("Failed to publish manifest: {}", e))?;
-
+                
                 // Also publish verification record (homomorphic hashes) if provided
                 if let Some(ref vr) = verification_record {
                     if let Err(e) = craftobj_routing::ContentRouter::publish_verification_record(

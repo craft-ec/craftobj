@@ -279,7 +279,8 @@ pub async fn run_initial_push(
     // Push ALL pieces round-robin across peers. Publisher uploads everything (1.2x content size).
     // Skip failed peers for remaining pieces. Emit progress events periodically.
     let total_pieces = all_pieces.len();
-    let mut failed_peers: std::collections::HashSet<libp2p::PeerId> = std::collections::HashSet::new();
+    let mut peer_failures: std::collections::HashMap<libp2p::PeerId, usize> = std::collections::HashMap::new();
+    const MAX_PEER_FAILURES: usize = 5; // Allow up to 5 failures before marking dead
     let mut total_pushed: usize = 0;
     let progress_interval = std::cmp::max(total_pieces / 20, 10); // ~5% or every 10
 
@@ -287,7 +288,7 @@ pub async fn run_initial_push(
     for (i, (seg_idx, piece_id)) in all_pieces.iter().enumerate() {
         // Find next available peer (round-robin, skipping failed)
         let available_peers: Vec<libp2p::PeerId> = manifest_ok_peers.iter()
-            .filter(|p| !failed_peers.contains(p))
+            .filter(|p| peer_failures.get(p).copied().unwrap_or(0) < MAX_PEER_FAILURES)
             .copied()
             .collect();
         if available_peers.is_empty() {
@@ -325,22 +326,25 @@ pub async fn run_initial_push(
                 info!("[reannounce.rs] Pushed piece {}/{} for {} to {}", total_pushed, total_pieces, content_id, peer);
             }
             Ok(Ok(Err(e))) => {
-                warn!("[reannounce.rs] Push piece {}/{} to {} failed: {}, marking as dead", i+1, total_pieces, peer, e);
-                failed_peers.insert(peer);
+                let count = peer_failures.entry(peer).or_insert(0);
+                *count += 1;
+                warn!("[reannounce.rs] Push piece {}/{} to {} failed: {} (failure {}/{})", i+1, total_pieces, peer, e, count, MAX_PEER_FAILURES);
             }
             Ok(Err(_)) => {
-                warn!("[reannounce.rs] Push piece {}/{} to {} — reply channel dropped, marking as dead", i+1, total_pieces, peer);
-                failed_peers.insert(peer);
+                let count = peer_failures.entry(peer).or_insert(0);
+                *count += 1;
+                warn!("[reannounce.rs] Push piece {}/{} to {} — reply channel dropped (failure {}/{})", i+1, total_pieces, peer, count, MAX_PEER_FAILURES);
             }
             Err(_) => {
-                warn!("[reannounce.rs] Push piece {}/{} to {} timed out (10s), marking as dead", i+1, total_pieces, peer);
-                failed_peers.insert(peer);
+                let count = peer_failures.entry(peer).or_insert(0);
+                *count += 1;
+                warn!("[reannounce.rs] Push piece {}/{} to {} timed out (10s) (failure {}/{})", i+1, total_pieces, peer, count, MAX_PEER_FAILURES);
             }
         }
 
         // Emit progress event periodically
         if total_pushed > 0 && (total_pushed % progress_interval == 0 || i == total_pieces - 1) {
-            let active_peers = ranked_peers.len() - failed_peers.len();
+            let active_peers = ranked_peers.len() - peer_failures.values().filter(|&&c| c >= MAX_PEER_FAILURES).count();
             let _ = event_tx.send(DaemonEvent::DistributionProgress {
                 content_id: content_id.to_hex(),
                 pieces_pushed: total_pushed,
