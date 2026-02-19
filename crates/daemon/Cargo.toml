@@ -43,6 +43,7 @@ craftec-settlement = { workspace = true }
 craftec-prover = { workspace = true }
 craftec-prover-guest-types = { workspace = true }
 async-trait = { workspace = true }
+clap = { workspace = true }
 tokio-tungstenite = "0.24"
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
