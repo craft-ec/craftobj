@@ -113,6 +113,14 @@ pub enum CraftObjCommand {
         pieces: Vec<craftobj_transfer::PiecePayload>,
         reply_tx: oneshot::Sender<craftobj_transfer::CraftObjResponse>,
     },
+    /// Distribute all pieces for a content to a peer using unified send_pieces().
+    /// Opens a stream and sends all pieces in BATCH_SIZE chunks with ack per batch.
+    DistributePieces {
+        peer_id: PeerId,
+        content_id: ContentId,
+        pieces: Vec<craftobj_transfer::PiecePayload>,
+        reply_tx: oneshot::Sender<Result<crate::piece_transfer::TransferResult, String>>,
+    },
     /// Fetch pieces from a peer using unified piece_transfer protocol.
     /// Opens stream, sends PieceSync, then receives batched PieceBatchPush frames.
     /// Returns (confirmed_count, piece_ids) when transfer completes.

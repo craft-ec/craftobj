@@ -1938,6 +1938,30 @@ async fn handle_command(
             });
         }
 
+        CraftObjCommand::DistributePieces { peer_id, content_id, pieces, reply_tx } => {
+            let piece_count = pieces.len();
+            info!("[service.rs] DistributePieces: {} pieces for {} to {}", piece_count, content_id, peer_id);
+            let mut ctrl = fetch_control.clone();
+            tokio::spawn(async move {
+                let label = format!("dist_stream-{}-{}", &content_id.to_string()[..8], &peer_id.to_string()[..8]);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ctrl.open_stream(peer_id, crate::stream_manager::transfer_stream_protocol()),
+                ).await {
+                    Ok(Ok(mut stream)) => {
+                        let result = crate::piece_transfer::send_pieces(&mut stream, &content_id, pieces, &label).await;
+                        let _ = reply_tx.send(result);
+                    }
+                    Ok(Err(e)) => {
+                        let _ = reply_tx.send(Err(format!("[{}] stream open failed: {}", label, e)));
+                    }
+                    Err(_) => {
+                        let _ = reply_tx.send(Err(format!("[{}] stream open timeout (10s)", label)));
+                    }
+                }
+            });
+        }
+
         CraftObjCommand::PushRecord { peer_id, content_id, record_json, reply_tx } => {
             debug!("Handling push manifest command for {} to {}", content_id, peer_id);
             let request = CraftObjRequest::ManifestPush {
