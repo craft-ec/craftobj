@@ -113,6 +113,7 @@ async fn reannounce_content(
     let cmd = CraftObjCommand::AnnounceProvider {
         content_id: *content_id,
         manifest,
+        verification_record: None,
         reply_tx,
     };
 

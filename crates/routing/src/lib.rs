@@ -58,6 +58,17 @@ pub fn removal_dht_key(content_id: &ContentId) -> Vec<u8> {
     format!("{}{}", REMOVAL_DHT_PREFIX, content_id.to_hex()).into_bytes()
 }
 
+/// DHT key prefix for verification records (homomorphic hashes).
+pub const VERIFICATION_DHT_PREFIX: &str = "/craftobj/verification/";
+
+/// TTL for verification records (30 minutes, same as manifest).
+pub const VERIFICATION_RECORD_TTL: Duration = Duration::from_secs(1800);
+
+/// Build DHT key for a verification record.
+pub fn verification_dht_key(content_id: &ContentId) -> Vec<u8> {
+    format!("{}{}", VERIFICATION_DHT_PREFIX, content_id.to_hex()).into_bytes()
+}
+
 /// Build a deterministic DHT provider key for a specific CID + segment.
 ///
 /// This is used for per-segment provider records so that fetchers can discover
@@ -114,6 +125,36 @@ impl ContentRouter {
         behaviour
             .put_record(&key, value, local_peer_id, Some(MANIFEST_RECORD_TTL))
             .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
+    }
+
+    /// Publish a verification record to the DHT.
+    pub fn publish_verification_record(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+        record: &ContentVerificationRecord,
+        local_peer_id: &PeerId,
+    ) -> Result<kad::QueryId> {
+        let key = verification_dht_key(content_id);
+        let value = serde_json::to_vec(record)
+            .map_err(|e| CraftObjError::StorageError(e.to_string()))?;
+        debug!(
+            "Publishing verification record for {} ({} bytes)",
+            content_id,
+            value.len()
+        );
+        behaviour
+            .put_record(&key, value, local_peer_id, Some(VERIFICATION_RECORD_TTL))
+            .map_err(|e| CraftObjError::NetworkError(format!("put_record: {:?}", e)))
+    }
+
+    /// Fetch a verification record from the DHT.
+    pub fn get_verification_record(
+        behaviour: &mut CraftBehaviour,
+        content_id: &ContentId,
+    ) -> kad::QueryId {
+        let key = verification_dht_key(content_id);
+        debug!("Fetching verification record for {}", content_id);
+        behaviour.get_record(&key)
     }
 
     /// Fetch a manifest from the DHT.
@@ -249,6 +290,12 @@ impl ContentRouter {
 pub fn parse_manifest_record(value: &[u8]) -> Result<ContentManifest> {
     serde_json::from_slice(value)
         .map_err(|e| CraftObjError::ManifestError(e.to_string()))
+}
+
+/// Parse a verification record from a DHT record value.
+pub fn parse_verification_record(value: &[u8]) -> Result<ContentVerificationRecord> {
+    serde_json::from_slice(value)
+        .map_err(|e| CraftObjError::StorageError(format!("parse verification record: {}", e)))
 }
 
 /// Parse an access list from a DHT record value.

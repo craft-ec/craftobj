@@ -1163,6 +1163,7 @@ name = "craftobj-routing"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "craftec-erasure",
  "craftec-network",
  "craftobj-core",
  "ed25519-dalek 2.2.0",

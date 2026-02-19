@@ -3,6 +3,7 @@
 //! Commands sent from IPC handler to the swarm event loop for DHT operations
 //! and stream-based transfers.
 
+use craftec_erasure::ContentVerificationRecord;
 use craftobj_core::{ContentId, ContentManifest};
 use craftobj_transfer::{CraftObjResponse, PieceMapEntry};
 use libp2p::PeerId;
@@ -23,6 +24,7 @@ pub enum CraftObjCommand {
     AnnounceProvider {
         content_id: ContentId,
         manifest: ContentManifest,
+        verification_record: Option<ContentVerificationRecord>,
         reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Resolve providers for a content ID.

@@ -1494,7 +1494,7 @@ async fn handle_command(
     signing_key: &Option<ed25519_dalek::SigningKey>,
 ) {
     match command {
-        CraftObjCommand::AnnounceProvider { content_id, manifest, reply_tx } => {
+        CraftObjCommand::AnnounceProvider { content_id, manifest, verification_record, reply_tx } => {
             debug!("Handling announce provider command for {}", content_id);
             
             // Get the local peer ID
@@ -1507,6 +1507,20 @@ async fn handle_command(
                 // We only publish the manifest to DHT so fetchers can find it.
                 protocol.publish_manifest(&mut swarm.behaviour_mut().craft, &manifest, &local_peer_id).await
                     .map_err(|e| format!("Failed to publish manifest: {}", e))?;
+
+                // Also publish verification record (homomorphic hashes) if provided
+                if let Some(ref vr) = verification_record {
+                    if let Err(e) = craftobj_routing::ContentRouter::publish_verification_record(
+                        &mut swarm.behaviour_mut().craft,
+                        &content_id,
+                        vr,
+                        &local_peer_id,
+                    ) {
+                        warn!("Failed to publish verification record for {}: {}", content_id, e);
+                    } else {
+                        debug!("Published verification record for {} to DHT", content_id);
+                    }
+                }
                 
                 let _ = event_tx.send(DaemonEvent::ProviderAnnounced { content_id: content_id.to_hex() });
                 debug!("Successfully started DHT operations for {}", content_id);
@@ -2011,6 +2025,7 @@ async fn handle_protocol_events(
                 let cmd = CraftObjCommand::AnnounceProvider {
                     content_id,
                     manifest: manifest.clone(),
+                    verification_record: None,
                     reply_tx,
                 };
                 if command_tx.send(cmd).is_ok() {

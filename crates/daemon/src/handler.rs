@@ -444,6 +444,7 @@ impl CraftObjHandler {
             let command = CraftObjCommand::AnnounceProvider {
                 content_id: result.content_id,
                 manifest,
+                verification_record: Some(result.verification_record.clone()),
                 reply_tx,
             };
             
@@ -947,6 +948,7 @@ impl CraftObjHandler {
             command_tx.send(CraftObjCommand::AnnounceProvider {
                 content_id: cid,
                 manifest,
+                verification_record: None,
                 reply_tx: tx,
             }).map_err(|e| e.to_string())?;
             let _ = rx.await;
@@ -986,6 +988,13 @@ impl CraftObjHandler {
             providers.to_vec()
         };
 
+        // Load verification record for homomorphic hash verification of received pieces
+        let verification_record = {
+            let client = self.client.lock().await;
+            client.store().get_verification_record(content_id).ok()
+        };
+        let verification_record = std::sync::Arc::new(verification_record);
+
         // Fetch all segments in parallel (Bug 3 fix: was sequential, seg0 consumed all time)
         let mut segment_join_set: JoinSet<Result<(), String>> = JoinSet::new();
 
@@ -999,6 +1008,7 @@ impl CraftObjHandler {
             let command_tx = command_tx.clone();
             let cid = *content_id;
             let ranked_providers = ranked_providers.clone();
+            let vr = verification_record.clone();
 
             segment_join_set.spawn(async move {
             // Load existing pieces' piece IDs and coefficient vectors for independence checking
@@ -1097,6 +1107,20 @@ impl CraftObjHandler {
                         info!("[handler.rs] Got {} pieces from {} for seg{}", batch.len(), provider, seg_idx);
                         let mut any_stored = false;
                         for (coefficients, piece_data) in batch {
+                            // Verify piece using homomorphic hash before accepting
+                            if let Some(ref record) = *vr {
+                                if let Some(seg_hashes) = record.segment_hashes.get(seg_idx as usize) {
+                                    let piece = craftec_erasure::CodedPiece {
+                                        data: piece_data.clone(),
+                                        coefficients: coefficients.clone(),
+                                    };
+                                    if !craftec_erasure::verify_piece(&piece, seg_hashes) {
+                                        warn!("[handler.rs] Piece from {} failed homomorphic hash verification for seg{}, skipping", provider, seg_idx);
+                                        continue;
+                                    }
+                                }
+                            }
+
                             // Check linear independence before storing
                             let mut test_matrix = coeff_matrix.clone();
                             test_matrix.push(coefficients.clone());
@@ -1458,6 +1482,7 @@ impl CraftObjHandler {
             command_tx.send(CraftObjCommand::AnnounceProvider {
                 content_id: revocation.new_content_id,
                 manifest,
+                verification_record: None,
                 reply_tx,
             }).map_err(|e| e.to_string())?;
             let _ = reply_rx.await;
