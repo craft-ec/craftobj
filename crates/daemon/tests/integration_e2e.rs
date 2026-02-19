@@ -15,6 +15,7 @@
 //! cargo test --test integration_e2e -- --ignored
 //! ```
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use craftec_ipc::IpcClient;
@@ -28,6 +29,11 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, info, warn};
+
+/// Global atomic port counter to ensure each TestNode gets unique ports.
+/// Each node consumes 1 port (listen_port). WS port is 0 (OS-assigned).
+/// Starting at 30000 to avoid conflicts with common services.
+static PORT_COUNTER: AtomicU16 = AtomicU16::new(30000);
 
 /// Test node that manages a daemon instance
 struct TestNode {
@@ -65,9 +71,9 @@ impl TestNode {
         // Generate unique socket path
         let socket_path = format!("/tmp/craftobj-test-{}-{}.sock", index, rand::random::<u32>());
         
-        // Use random high ports to avoid conflicts
+        // Use globally unique ports via atomic counter to avoid conflicts in parallel tests
+        let listen_port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let ws_port = 0; // OS assigns random port
-        let listen_port = 10000 + (rand::random::<u16>() % 50000); // random but known
         
         info!("Spawning test node {} with peer_id {} at {}", 
               index, peer_id, data_dir.path().display());
@@ -89,17 +95,19 @@ impl TestNode {
         daemon_config.health_scan_interval_secs = 10; // Fast HealthScan for tests
         daemon_config.health_check_interval_secs = 30; // Health checks for tests
         daemon_config.demand_threshold = 3; // Low threshold for test demand detection
+        daemon_config.max_peer_connections = 10; // Limit connections for test resource usage
         
         // Save config to data dir
         daemon_config.save(data_dir.path())
             .map_err(|e| format!("Failed to save config: {}", e))?;
         
-        // Set up network config
+        // Set up network config — mDNS disabled to prevent cross-test node discovery
         let network_config = NetworkConfig {
             listen_addrs: vec![format!("/ip4/127.0.0.1/tcp/{}", listen_port).parse()
                 .map_err(|e| format!("Failed to parse listen address: {}", e))?],
             bootstrap_peers: vec![], // Will be handled via daemon_config.boot_peers
             protocol_prefix: "craftobj".to_string(),
+            enable_mdns: false,
         };
         
         // Create shutdown channel
@@ -354,6 +362,23 @@ impl TestNode {
         
         info!("Test node {} shutdown complete", self.index);
         Ok(())
+    }
+}
+
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        // Send shutdown signal if not already sent
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Abort the daemon task if still running
+        if let Some(handle) = self.daemon_handle.take() {
+            handle.abort();
+        }
+        // Clean up socket file
+        if std::path::Path::new(&self.socket_path).exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
