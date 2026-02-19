@@ -75,12 +75,12 @@ impl ContentRecord {
         if self.total_size == 0 { return 0; }
         ((self.total_size as usize) + SEGMENT_SIZE - 1) / SEGMENT_SIZE
     }
-    pub fn k(&self) -> usize { SEGMENT_SIZE / PIECE_SIZE }
+    pub fn k(&self) -> usize { SEGMENT_SIZE.div_ceil(PIECE_SIZE) }
     pub fn k_for_segment(&self, segment_index: usize) -> usize {
         let seg_count = self.segment_count();
         if seg_count == 0 { return 0; }
         if segment_index + 1 < seg_count {
-            SEGMENT_SIZE / PIECE_SIZE
+            SEGMENT_SIZE.div_ceil(PIECE_SIZE)
         } else {
             let remaining = self.total_size as usize - segment_index * SEGMENT_SIZE;
             remaining.div_ceil(PIECE_SIZE).max(1)
