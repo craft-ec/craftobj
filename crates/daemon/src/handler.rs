@@ -1060,38 +1060,58 @@ impl CraftObjHandler {
 
             let seg_start = std::time::Instant::now();
 
-            // Use unified piece_transfer — one FetchPieces per provider per segment.
-            // Provider streams batched PieceBatchPush, we receive and store via receive_pieces.
-            let provider = ranked_providers[0];
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let command = CraftObjCommand::FetchPieces {
-                peer_id: provider,
-                content_id: cid,
-                segment_index: seg_idx,
-                have_pieces: local_piece_ids.clone(),
-                max_pieces: needed as u16,
-                reply_tx,
-            };
-            if command_tx.send(command).is_err() {
-                return Err(format!("Segment {}: command channel closed", seg_idx));
-            }
+            // Fetch from providers in order until we have k pieces.
+            // Each provider contributes what they have, we move to the next for the rest.
+            let mut have_pieces = local_piece_ids.clone();
+            let mut total_fetched = have_pieces.len();
 
-            match tokio::time::timeout(std::time::Duration::from_secs(120), reply_rx).await {
-                Ok(Ok(Ok(piece_ids))) => {
-                    let fetched = piece_ids.len();
-                    if fetched >= k {
-                        info!("[fetch] seg{} COMPLETE: {} pieces from {} in {:.1}s", seg_idx, fetched, &provider.to_string()[..8], seg_start.elapsed().as_secs_f64());
-                    } else {
-                        warn!("[fetch] seg{} INCOMPLETE: {}/{} from {} in {:.1}s", seg_idx, fetched, k, &provider.to_string()[..8], seg_start.elapsed().as_secs_f64());
-                        return Err(format!("Segment {} incomplete: {}/{}", seg_idx, fetched, k));
+            for (attempt, &provider) in ranked_providers.iter().enumerate() {
+                if total_fetched >= k {
+                    break;
+                }
+
+                let still_needed = (k - total_fetched) as u16;
+                info!("[fetch] seg{} attempt#{} to {} (have={}, need={})", 
+                    seg_idx, attempt, &provider.to_string()[..8], total_fetched, still_needed);
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let command = CraftObjCommand::FetchPieces {
+                    peer_id: provider,
+                    content_id: cid,
+                    segment_index: seg_idx,
+                    have_pieces: have_pieces.clone(),
+                    max_pieces: still_needed,
+                    reply_tx,
+                };
+                if command_tx.send(command).is_err() {
+                    return Err(format!("Segment {}: command channel closed", seg_idx));
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(60), reply_rx).await {
+                    Ok(Ok(Ok(piece_ids))) => {
+                        let got = piece_ids.len().saturating_sub(total_fetched);
+                        total_fetched = piece_ids.len();
+                        have_pieces = piece_ids;
+                        info!("[fetch] seg{} got {} new pieces from {} (total: {}/{})", 
+                            seg_idx, got, &provider.to_string()[..8], total_fetched, k);
+                    }
+                    Ok(Ok(Err(e))) => {
+                        warn!("[fetch] seg{} provider {} failed: {}", seg_idx, &provider.to_string()[..8], e);
+                    }
+                    Ok(Err(_)) => {
+                        warn!("[fetch] seg{} provider {} reply dropped", seg_idx, &provider.to_string()[..8]);
+                    }
+                    Err(_) => {
+                        warn!("[fetch] seg{} provider {} timeout", seg_idx, &provider.to_string()[..8]);
                     }
                 }
-                Ok(Ok(Err(e))) => {
-                    warn!("[fetch] seg{} FAILED: {} ({:.1}s)", seg_idx, e, seg_start.elapsed().as_secs_f64());
-                    return Err(format!("Segment {}: {}", seg_idx, e));
-                }
-                Ok(Err(_)) => return Err(format!("Segment {}: reply channel closed", seg_idx)),
-                Err(_) => return Err(format!("Segment {}: fetch timeout (120s)", seg_idx)),
+            }
+
+            if total_fetched >= k {
+                info!("[fetch] seg{} COMPLETE: {} pieces in {:.1}s", seg_idx, total_fetched, seg_start.elapsed().as_secs_f64());
+            } else {
+                warn!("[fetch] seg{} INCOMPLETE: {}/{} after all providers, {:.1}s", seg_idx, total_fetched, k, seg_start.elapsed().as_secs_f64());
+                return Err(format!("Segment {} incomplete: {}/{}", seg_idx, total_fetched, k));
             }
 
             Ok(())
