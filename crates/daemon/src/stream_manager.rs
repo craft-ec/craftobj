@@ -284,18 +284,37 @@ impl StreamManager {
     ) {
         info!("[stream_mgr] Starting distribution stream task for {}", peer);
         
-        // Simple approach: handle requests sequentially but on a persistent stream
-        // This still provides better performance than opening a new stream per piece
+        let mut current_stream: Option<libp2p::Stream> = None;
+        let mut seq_id = 1u64;
+        
         while let Some(pending) = piece_rx.recv().await {
-            // Open stream for this batch (reuse if possible)
-            let mut stream = match control.open_stream(peer, transfer_stream_protocol()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("[stream_mgr] Failed to open distribution stream to {}: {}", peer, e);
-                    let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
-                        status: craftobj_core::WireStatus::Error 
-                    });
-                    continue;
+            // Try to reuse existing stream, or open a new one if needed
+            let mut stream = match current_stream.take() {
+                Some(s) => s,
+                None => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        control.open_stream(peer, transfer_stream_protocol())
+                    ).await {
+                        Ok(Ok(s)) => {
+                            info!("[stream_mgr] Opened new distribution stream to {}", peer);
+                            s
+                        }
+                        Ok(Err(e)) => {
+                            error!("[stream_mgr] Failed to open distribution stream to {}: {}", peer, e);
+                            let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
+                                status: craftobj_core::WireStatus::Error 
+                            });
+                            continue;
+                        }
+                        Err(_) => {
+                            error!("[stream_mgr] Timeout opening distribution stream to {}", peer);
+                            let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
+                                status: craftobj_core::WireStatus::Error 
+                            });
+                            continue;
+                        }
+                    }
                 }
             };
             
@@ -304,36 +323,63 @@ impl StreamManager {
                 pieces: pending.pieces,
             };
             
-            // Send batch request
-            match write_request_frame(&mut stream, 1, &request).await {
-                Ok(()) => {
-                    debug!("[stream_mgr] Sent batch {} to {}", pending.content_id, peer);
+            // Send batch request on the persistent stream
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                write_request_frame(&mut stream, seq_id, &request)
+            ).await {
+                Ok(Ok(())) => {
+                    debug!("[stream_mgr] Sent batch {} to {} via persistent stream", pending.content_id, peer);
                     
-                    // Read response
-                    match read_frame(&mut stream).await {
-                        Ok(StreamFrame::Response { response, .. }) => {
-                            debug!("[stream_mgr] Got batch response from {}", peer);
+                    // Read response on the same stream
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        read_frame(&mut stream)
+                    ).await {
+                        Ok(Ok(StreamFrame::Response { response, .. })) => {
+                            debug!("[stream_mgr] Got batch response from {} on persistent stream", peer);
                             let _ = pending.reply_tx.send(response);
+                            
+                            // Keep the stream for the next batch
+                            current_stream = Some(stream);
+                            seq_id += 1;
                         }
-                        Ok(_) => {
-                            warn!("[stream_mgr] Unexpected frame type from {}", peer);
+                        Ok(Ok(_)) => {
+                            warn!("[stream_mgr] Unexpected frame type from {} on persistent stream", peer);
                             let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
                                 status: craftobj_core::WireStatus::Error 
                             });
+                            // Stream is corrupted, don't reuse
                         }
-                        Err(e) => {
-                            error!("[stream_mgr] Failed to read batch response from {}: {}", peer, e);
+                        Ok(Err(e)) => {
+                            error!("[stream_mgr] Failed to read batch response from {} on persistent stream: {}", peer, e);
                             let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
                                 status: craftobj_core::WireStatus::Error 
                             });
+                            // Stream is broken, don't reuse
+                        }
+                        Err(_) => {
+                            error!("[stream_mgr] Timeout reading batch response from {} on persistent stream", peer);
+                            let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
+                                status: craftobj_core::WireStatus::Error 
+                            });
+                            // Stream might be broken, don't reuse
                         }
                     }
                 }
-                Err(e) => {
-                    error!("[stream_mgr] Failed to write batch to {}: {}", peer, e);
+                Ok(Err(e)) => {
+                    error!("[stream_mgr] Failed to write batch to {} on persistent stream: {}", peer, e);
                     let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
                         status: craftobj_core::WireStatus::Error 
                     });
+                    // Stream is broken, don't reuse
+                }
+                Err(_) => {
+                    error!("[stream_mgr] Timeout writing batch to {} on persistent stream", peer);
+                    let _ = pending.reply_tx.send(CraftObjResponse::Ack { 
+                        status: craftobj_core::WireStatus::Error 
+                    });
+                    // Stream might be broken, don't reuse
                 }
             }
         }
