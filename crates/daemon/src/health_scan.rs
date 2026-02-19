@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::CraftObjCommand;
 use crate::piece_map::PieceMap;
-use crate::scaling::DemandSignalTracker;
+use crate::scaling::DemandTracker;
 
 /// Minimum pieces a node must keep per segment.
 const MIN_PIECES_PER_SEGMENT: usize = 2;
@@ -74,7 +74,7 @@ struct MerkleCacheKey {
 pub struct HealthScan {
     piece_map: Arc<Mutex<PieceMap>>,
     store: Arc<Mutex<FsStore>>,
-    demand_tracker: Arc<Mutex<DemandSignalTracker>>,
+    demand_tracker: Arc<Mutex<DemandTracker>>,
     local_peer_id: PeerId,
     tier_target: f64,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
@@ -89,7 +89,7 @@ impl HealthScan {
     pub fn new(
         piece_map: Arc<Mutex<PieceMap>>,
         store: Arc<Mutex<FsStore>>,
-        demand_tracker: Arc<Mutex<DemandSignalTracker>>,
+        demand_tracker: Arc<Mutex<DemandTracker>>,
         local_peer_id: PeerId,
         command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Self {
@@ -615,7 +615,7 @@ impl HealthScan {
         if total_network_pieces > target_pieces && local_count > MIN_PIECES_PER_SEGMENT {
             let has_demand = {
                 let dt = self.demand_tracker.lock().await;
-                dt.has_recent_signal(&cid)
+                dt.has_demand(&cid)
             };
             if !has_demand {
                 debug!(
@@ -854,7 +854,7 @@ mod tests {
     fn setup_test() -> (
         Arc<Mutex<PieceMap>>,
         Arc<Mutex<FsStore>>,
-        Arc<Mutex<DemandSignalTracker>>,
+        Arc<Mutex<DemandTracker>>,
         PeerId,
         std::path::PathBuf,
     ) {
@@ -869,7 +869,7 @@ mod tests {
         (
             Arc::new(Mutex::new(piece_map)),
             Arc::new(Mutex::new(store)),
-            Arc::new(Mutex::new(DemandSignalTracker::new())),
+            Arc::new(Mutex::new(DemandTracker::new())),
             local,
             dir,
         )
@@ -1045,7 +1045,7 @@ mod tests {
         // Add demand signal — should prevent degradation even though over-replicated
         {
             let mut tracker = dt.lock().await;
-            tracker.record_signal(cid);
+            tracker.record_fetch(cid);
         }
 
         scan.run_scan().await;

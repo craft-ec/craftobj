@@ -216,7 +216,7 @@ pub struct CraftObjHandler {
     /// Challenger manager for PDP — register CIDs after publish/store.
     challenger: Option<Arc<Mutex<crate::challenger::ChallengerManager>>>,
     /// Demand signal tracker for content demand status.
-    demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
+    demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
     /// PieceMap for event-sourced piece tracking.
     piece_map: Option<Arc<Mutex<crate::piece_map::PieceMap>>>,
     /// Start time for uptime calculation.
@@ -249,7 +249,7 @@ impl CraftObjHandler {
             eviction_manager: None,
             merkle_tree: None,
             challenger: None,
-            demand_signal_tracker: None,
+            demand_tracker: None,
             piece_map: None,
             local_peer_id: None,
             start_time: Instant::now(),
@@ -260,8 +260,8 @@ impl CraftObjHandler {
         self.piece_map = Some(pm);
     }
 
-    pub fn set_demand_signal_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>) {
-        self.demand_signal_tracker = Some(tracker);
+    pub fn set_demand_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandTracker>>) {
+        self.demand_tracker = Some(tracker);
     }
 
     pub fn set_local_peer_id(&mut self, peer_id: libp2p::PeerId) {
@@ -329,7 +329,7 @@ impl CraftObjHandler {
             eviction_manager: None,
             merkle_tree: None,
             challenger: None,
-            demand_signal_tracker: None,
+            demand_tracker: None,
             piece_map: None,
             local_peer_id: None,
             start_time: Instant::now(),
@@ -1874,8 +1874,8 @@ impl CraftObjHandler {
         let health = self.compute_network_health(&cid_hex, &local_seg_pieces, &manifest, true).await;
 
         // Demand signal status
-        let has_demand = if let Some(ref dst) = self.demand_signal_tracker {
-            dst.lock().await.has_recent_signal(&cid)
+        let has_demand = if let Some(ref dst) = self.demand_tracker {
+            dst.lock().await.has_demand(&cid)
         } else {
             false
         };
@@ -2008,8 +2008,8 @@ impl CraftObjHandler {
             };
 
             // Demand signal status
-            let has_demand = if let Some(ref dst) = self.demand_signal_tracker {
-                dst.lock().await.has_recent_signal(&item.content_id)
+            let has_demand = if let Some(ref dst) = self.demand_tracker {
+                dst.lock().await.has_demand(&item.content_id)
             } else {
                 false
             };

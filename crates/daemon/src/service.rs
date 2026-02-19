@@ -360,15 +360,14 @@ pub async fn run_daemon_with_config(
     let pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>> = Arc::new(Mutex::new(HashMap::new()));
     challenger_mgr.set_pdp_ranks(pdp_ranks.clone());
     challenger_mgr.set_merkle_tree(merkle_tree.clone());
-    let demand_signal_tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>> = Arc::new(Mutex::new(crate::scaling::DemandSignalTracker::new()));
-    challenger_mgr.set_demand_signal_tracker(demand_signal_tracker.clone());
+    challenger_mgr.set_demand_tracker(demand_tracker.clone());
 
     let challenger_mgr = Arc::new(Mutex::new(challenger_mgr));
 
     // Wire challenger into handler for CID registration on publish/store
     handler.set_challenger(challenger_mgr.clone());
     handler.set_local_peer_id(local_peer_id);
-    handler.set_demand_signal_tracker(demand_signal_tracker.clone());
+    handler.set_demand_tracker(demand_tracker.clone());
 
     // PieceMap — event-sourced materialized view of piece locations
     let piece_map = {
@@ -461,7 +460,7 @@ pub async fn run_daemon_with_config(
     let mut health_scan = crate::health_scan::HealthScan::new(
         piece_map.clone(),
         store.clone(),
-        demand_signal_tracker.clone(),
+        demand_tracker.clone(),
         local_peer_id,
         health_scan_command_tx,
     );

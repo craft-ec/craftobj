@@ -61,7 +61,7 @@ pub struct ChallengerManager {
     /// Storage Merkle tree for updating after healing.
     merkle_tree: Option<Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>>,
     /// Demand signal tracker for checking if content has network-wide demand (skip degradation if so).
-    demand_signal_tracker: Option<Arc<Mutex<crate::scaling::DemandSignalTracker>>>,
+    demand_tracker: Option<Arc<Mutex<crate::scaling::DemandTracker>>>,
     /// PieceMap for reading coefficient vectors (replaces inventory requests).
     piece_map: Option<Arc<Mutex<crate::piece_map::PieceMap>>>,
 }
@@ -87,13 +87,13 @@ impl ChallengerManager {
             peer_scorer: None,
             pdp_ranks: None,
             merkle_tree: None,
-            demand_signal_tracker: None,
+            demand_tracker: None,
             piece_map: None,
         }
     }
 
-    pub fn set_demand_signal_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandSignalTracker>>) {
-        self.demand_signal_tracker = Some(tracker);
+    pub fn set_demand_tracker(&mut self, tracker: Arc<Mutex<crate::scaling::DemandTracker>>) {
+        self.demand_tracker = Some(tracker);
     }
 
     pub fn set_piece_map(&mut self, pm: Arc<Mutex<crate::piece_map::PieceMap>>) {

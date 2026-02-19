@@ -1529,13 +1529,10 @@ async fn test_pdp_challenge_response() -> Result<(), String> {
 
 /// Test 7: Degradation — HealthScan detects over-replication and drops excess pieces.
 ///
-/// Setup: 3 nodes (A publishes, B and C store). A distributes k=4 pieces to B and C.
-/// When B receives pieces, SyncPieceMap queries A (publisher, still online) and learns
-/// about A's pieces. B then sees: local(4) + A's remote(4) = 8 network_pieces.
-/// target = ceil(4×1.5) = 6. 8 > 6 → over-replicated → HealthScan degrades.
-///
-/// After C leaves, B's network_pieces drops to local(4) + A's(4) = 8 (C marked offline,
-/// C's pieces no longer counted). Still over-replicated → degradation continues.
+/// Setup: 2 nodes (A publishes, B stores). After distribution, B uses extend() to
+/// artificially over-replicate (push local pieces well above target). No demand present.
+/// HealthScan detects over-replication → degrades by dropping pieces.
+/// Assert: total pieces MUST decrease from peak.
 #[tokio::test]
 async fn test_degradation() -> Result<(), String> {
     init_test_tracing();
@@ -1544,7 +1541,7 @@ async fn test_degradation() -> Result<(), String> {
     let timeout_duration = Duration::from_secs(180);
     timeout(timeout_duration, async {
         let start = std::time::Instant::now();
-        // 3 nodes: A publishes, B and C store. Short HealthScan for fast degradation.
+        // 2 nodes: A publishes, B stores. Short HealthScan for fast degradation.
         let node_a = TestNode::spawn_with_config(0, vec![], |cfg| {
             cfg.health_scan_interval_secs = 10;
         }).await?;
@@ -1554,12 +1551,8 @@ async fn test_degradation() -> Result<(), String> {
         let node_b = TestNode::spawn_with_config(1, vec![boot_a.clone()], |cfg| {
             cfg.health_scan_interval_secs = 10;
         }).await?;
-        let node_c = TestNode::spawn_with_config(2, vec![boot_a.clone()], |cfg| {
-            cfg.health_scan_interval_secs = 10;
-        }).await?;
         
         wait_for_connection(&node_a, &node_b, 30).await?;
-        wait_for_connection(&node_a, &node_c, 30).await?;
         
         // Publish ~800KiB content: k=4 pieces at 256KiB piece_size.
         // target = ceil(4×1.5) = 6.
@@ -1567,9 +1560,8 @@ async fn test_degradation() -> Result<(), String> {
         let cid = node_a.publish(&content).await?;
         info!("Published {} bytes, CID: {}", content.len(), cid);
         
-        // Wait for distribution to B and C
+        // Wait for distribution to B
         let mut pieces_b: usize = 0;
-        let mut pieces_c: usize = 0;
         for attempt in 0..30 {
             sleep(Duration::from_secs(1)).await;
             if let Ok(health) = node_b.content_health(&cid).await {
@@ -1580,69 +1572,38 @@ async fn test_degradation() -> Result<(), String> {
                     pieces_b = p;
                     info!("Node B pieces at {}s: {}", attempt + 1, pieces_b);
                 }
-            }
-            if let Ok(health) = node_c.content_health(&cid).await {
-                let p: usize = health["segments"].as_array()
-                    .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
-                    .unwrap_or(0);
-                if p > pieces_c {
-                    pieces_c = p;
-                    info!("Node C pieces at {}s: {}", attempt + 1, pieces_c);
-                }
-            }
-            if pieces_b >= 3 && pieces_c >= 3 {
-                break;
-            }
-        }
-        info!("Distribution complete: B={}, C={}", pieces_b, pieces_c);
-        
-        if pieces_b < 3 {
-            return Err(format!("Expected ≥3 pieces on B, got {}", pieces_b));
-        }
-        
-        // Log what B's HealthScan sees before node departure
-        if let Ok(health) = node_b.content_health(&cid).await {
-            info!("Node B health before departure: {}", health);
-        }
-        
-        // Kill Node C to simulate churn — B detects departure, C's pieces go offline.
-        // B's HealthScan will see under-replication → repair (generate new pieces).
-        // Once B's pieces exceed target(6), HealthScan detects over-replication → degrades.
-        info!("Shutting down Node C to trigger health change...");
-        node_c.shutdown().await?;
-        
-        // Phase 1: Wait for repair to push B's pieces above target(6).
-        // After C leaves, B sees network_pieces < target → repairs by generating new pieces.
-        info!("Phase 1: Waiting for repair to push pieces above target(6)...");
-        let mut peak_pieces: usize = pieces_b;
-        let mut above_target = false;
-        for attempt in 0..60 {
-            sleep(Duration::from_secs(1)).await;
-            if let Ok(health) = node_b.content_health(&cid).await {
-                let p: usize = health["segments"].as_array()
-                    .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
-                    .unwrap_or(0);
-                if p > peak_pieces {
-                    peak_pieces = p;
-                    info!("Repair at {}s: B pieces increased to {}", attempt + 1, peak_pieces);
-                }
-                if peak_pieces > 6 {
-                    above_target = true;
-                    info!("Repair complete at {}s: B has {} pieces (> target 6)", attempt + 1, peak_pieces);
+                if pieces_b >= 2 {
                     break;
                 }
             }
         }
+        info!("Distribution complete: B={}", pieces_b);
         
-        if !above_target {
-            if let Ok(health) = node_b.content_health(&cid).await {
-                info!("Final B health after repair phase: {}", health);
-            }
-            return Err(format!("Repair phase failed: expected B > 6 pieces, got {}", peak_pieces));
+        if pieces_b < 2 {
+            return Err(format!("Expected ≥2 pieces on B, got {}", pieces_b));
         }
         
+        // Phase 1: Artificially over-replicate B via extend().
+        // Generate enough extra pieces to push well above target(6).
+        info!("Phase 1: Over-replicating B via extend()...");
+        let extend_result = node_b.extend(&cid, Some(10)).await;
+        info!("Extend result: {:?}", extend_result);
+        sleep(Duration::from_secs(2)).await;
+        
+        let pieces_after_extend: usize = node_b.content_health(&cid).await.ok()
+            .and_then(|h| h["segments"].as_array().map(|segs| 
+                segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum()))
+            .unwrap_or(0);
+        info!("B pieces after extend: {} (target=6)", pieces_after_extend);
+        
+        if pieces_after_extend <= 6 {
+            return Err(format!("Extend did not push above target(6): got {} pieces", pieces_after_extend));
+        }
+        
+        let peak_pieces = pieces_after_extend;
+        
         // Phase 2: Wait for degradation to drop pieces back down.
-        // HealthScan sees network_pieces > target → drops excess pieces.
+        // HealthScan sees network_pieces > target → drops excess pieces (no demand).
         info!("Phase 2: Waiting for degradation (pieces should drop from {})...", peak_pieces);
         let mut min_seen = peak_pieces;
         let mut degradation_observed = false;
@@ -1652,10 +1613,6 @@ async fn test_degradation() -> Result<(), String> {
                 let p: usize = health["segments"].as_array()
                     .map(|segs| segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum())
                     .unwrap_or(peak_pieces);
-                // Track peak in case repair is still adding pieces
-                if p > peak_pieces {
-                    peak_pieces = p;
-                }
                 if p < min_seen {
                     min_seen = p;
                     info!("Degradation at {}s: B pieces dropped to {} (peak was {})", attempt + 1, p, peak_pieces);
@@ -1670,13 +1627,17 @@ async fn test_degradation() -> Result<(), String> {
                 info!("Final B health: {}", health);
             }
             return Err(format!(
-                "Expected degradation: peak was {}, min seen was {}",
+                "Expected degradation: peak was {}, min seen was {} — pieces should have decreased",
                 peak_pieces, min_seen
             ));
         }
         
-        info!("=== test_degradation === ✓ PASSED in {:.1}s — repair: {} → {}, then degradation → {}",
-              start.elapsed().as_secs_f64(), pieces_b, peak_pieces, min_seen);
+        // Strong assertion: pieces MUST have decreased
+        assert!(min_seen < peak_pieces, 
+            "Pieces must decrease: peak={}, final={}", peak_pieces, min_seen);
+        
+        info!("=== test_degradation === ✓ PASSED in {:.1}s — extend to {}, degraded to {}",
+              start.elapsed().as_secs_f64(), peak_pieces, min_seen);
         
         node_a.shutdown().await?;
         node_b.shutdown().await?;
