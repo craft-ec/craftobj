@@ -221,6 +221,8 @@ pub struct CraftObjHandler {
     piece_map: Option<Arc<Mutex<crate::piece_map::PieceMap>>>,
     /// Start time for uptime calculation.
     start_time: Instant,
+    /// Shutdown signal — notified when RPC shutdown is requested.
+    pub shutdown_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CraftObjHandler {
@@ -253,7 +255,12 @@ impl CraftObjHandler {
             piece_map: None,
             local_peer_id: None,
             start_time: Instant::now(),
+            shutdown_notify: None,
         }
+    }
+
+    pub fn set_shutdown_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.shutdown_notify = Some(notify);
     }
 
     pub fn set_piece_map(&mut self, pm: Arc<Mutex<crate::piece_map::PieceMap>>) {
@@ -333,6 +340,7 @@ impl CraftObjHandler {
             piece_map: None,
             local_peer_id: None,
             start_time: Instant::now(),
+            shutdown_notify: None,
         }
     }
 
@@ -2398,12 +2406,21 @@ impl IpcHandler for CraftObjHandler {
                             peer_id: "self".to_string(),
                         });
                     }
-                    // Respond first, then exit
+                    // Respond first, then signal shutdown
                     let result = Ok(serde_json::json!({"status": "shutting_down"}));
-                    tokio::spawn(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        std::process::exit(0);
-                    });
+                    if let Some(ref notify) = self.shutdown_notify {
+                        let notify = notify.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            notify.notify_one();
+                        });
+                    } else {
+                        // Fallback for non-test (CLI) usage
+                        tokio::spawn(async {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            std::process::exit(0);
+                        });
+                    }
                     result
                 },
                 _ => Err(format!("unknown method: {}", method)),

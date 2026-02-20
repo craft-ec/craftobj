@@ -325,7 +325,9 @@ pub async fn run_daemon_with_config(
     info!("[service.rs] Capabilities: {:?}", own_capabilities);
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let mut handler = CraftObjHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone(), channel_store);
+    handler.set_shutdown_notify(shutdown_notify.clone());
     handler.set_settlement_client(settlement_client);
     handler.set_content_tracker(content_tracker.clone());
     handler.set_own_capabilities(own_capabilities.clone());
@@ -538,6 +540,9 @@ pub async fn run_daemon_with_config(
         }
         _ = data_retention_loop(receipt_store.clone()) => {
             info!("[service.rs] Data retention loop ended");
+        }
+        _ = shutdown_notify.notified() => {
+            info!("[service.rs] Shutdown requested via RPC notify");
         }
     }
 
