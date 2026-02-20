@@ -48,6 +48,13 @@ pub struct DaemonConfig {
     /// PEX (Peer Exchange) interval in seconds (default: 60).
     /// Lower values speed up peer discovery at the cost of more traffic.
     pub pex_interval_secs: u64,
+    /// How often to refresh peer capabilities in seconds (default: 600).
+    /// Keeps last_announcement fresh so stale eviction doesn't drop live peers.
+    pub capability_refresh_interval_secs: u64,
+    /// How often to run evict_stale on the peer scorer in seconds (default: 300).
+    pub evict_stale_interval_secs: u64,
+    /// How long a peer can be silent before triggering a capability re-request in seconds (default: 300).
+    pub peer_heartbeat_timeout_secs: u64,
 
     // ── Storage ─────────────────────────────────────────────
     /// Maximum storage in bytes (0 = unlimited).
@@ -112,6 +119,9 @@ impl Default for DaemonConfig {
             challenger_interval_secs: None,
             aggregation_epoch_secs: None,
             pex_interval_secs: 60,
+            capability_refresh_interval_secs: 600,
+            evict_stale_interval_secs: 300,
+            peer_heartbeat_timeout_secs: 300,
             max_concurrent_transfers: 64,
             piece_timeout_secs: 30,
             stream_open_timeout_secs: 10,
@@ -344,6 +354,8 @@ mod tests {
 
     #[test]
     fn test_unknown_fields_preserved() {
+        // Includes deprecated `capability_announce_interval_secs` (eliminated per PIECE_TRACKING_DESIGN.md).
+        // It is silently stored in `extra` and round-tripped — we test that unknown fields survive.
         let json = r#"{
             "schema_version": 2,
             "capabilities": ["client"],
@@ -377,7 +389,9 @@ mod tests {
 
     #[test]
     fn test_v1_migration() {
-        // Simulate a v1 config (no capabilities, no schema_version)
+        // Simulate a v1 config: no capabilities, no schema_version.
+        // `capability_announce_interval_secs` was a v1 field (eliminated in current design);
+        // it should be silently absorbed into `extra` without breaking load.
         let json = r#"{
             "capability_announce_interval_secs": 300,
             "reannounce_interval_secs": 600,

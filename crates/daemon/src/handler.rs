@@ -1960,11 +1960,26 @@ impl CraftObjHandler {
             }));
         }
 
-        // Check if a health scan has ever completed for this CID
-        let health_scanned = if let Some(ref data_dir) = self.data_dir {
-            data_dir.join("health_history").join(format!("{}.jsonl", cid)).exists()
+        // Check if a health scan has ever completed for this CID and get last scan time
+        let (health_scanned, last_scan_time) = if let Some(ref data_dir) = self.data_dir {
+            let path = data_dir.join("health_history").join(format!("{}.jsonl", cid));
+            if path.exists() {
+                // Read last line to get the most recent scan timestamp
+                let last_ts = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|contents| {
+                        contents.lines().rev().find(|l| !l.is_empty()).and_then(|line| {
+                            serde_json::from_str::<serde_json::Value>(line)
+                                .ok()
+                                .and_then(|v| v.get("timestamp").and_then(|t| t.as_u64()))
+                        })
+                    });
+                (true, last_ts)
+            } else {
+                (false, None)
+            }
         } else {
-            false
+            (false, None)
         };
 
         Ok(serde_json::json!({
@@ -1987,6 +2002,8 @@ impl CraftObjHandler {
             "has_demand": has_demand,
             "tier_min_ratio": tier_min_ratio,
             "health_scanned": health_scanned,
+            "last_scan_time": last_scan_time,
+            "health_scan_interval_secs": crate::health_scan::DEFAULT_SCAN_INTERVAL_SECS,
         }))
     }
 

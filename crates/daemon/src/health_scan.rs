@@ -530,9 +530,11 @@ impl HealthScan {
                     .map(|(node, _, _)| (*node).clone())
                     .collect::<std::collections::HashSet<_>>()
                     .len();
-                // Use total_pieces/k for health ratio — rank maxes at k so rank/k
-                // can never exceed 1.0, but piece count reflects actual redundancy.
-                let ratio = if k > 0 { total_pieces as f64 / k as f64 } else { 0.0 };
+                // Per design: health_ratio = rank / k, where rank is an independence check
+                // on online nodes' coefficients only. total_pieces can exceed k even with
+                // offline nodes, giving a misleadingly high ratio. rank correctly reflects
+                // reconstructability from currently-reachable nodes.
+                let ratio = if k > 0 { rank as f64 / k as f64 } else { 0.0 };
                 if ratio < min_ratio {
                     min_ratio = ratio;
                 }

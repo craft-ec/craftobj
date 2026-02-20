@@ -103,6 +103,33 @@ pub async fn run_daemon(
 }
 
 /// Run the CraftObj daemon with an optional config file path override.
+/// Run the daemon with a pre-built `DaemonConfig`.
+///
+/// This is the preferred entry point for in-process callers (DaemonManager,
+/// integration tests). No file I/O required — config is passed directly.
+pub async fn run_daemon_with_config_struct(
+    keypair: Keypair,
+    data_dir: std::path::PathBuf,
+    socket_path: String,
+    network_config: NetworkConfig,
+    ws_port: u16,
+    daemon_config: crate::config::DaemonConfig,
+    node_signing_key: Option<ed25519_dalek::SigningKey>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("[service.rs] Daemon config: reannounce={}s threshold={}s cap_refresh={}s evict={}s hb_timeout={}s",
+        daemon_config.reannounce_interval_secs,
+        daemon_config.reannounce_threshold_secs,
+        daemon_config.capability_refresh_interval_secs,
+        daemon_config.evict_stale_interval_secs,
+        daemon_config.peer_heartbeat_timeout_secs,
+    );
+    run_daemon_inner(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key).await
+}
+
+/// Run the daemon, loading config from a file path (or defaults).
+///
+/// Prefer `run_daemon_with_config_struct` for in-process callers.
+/// This variant is for the headless CLI path where config lives on disk.
 pub async fn run_daemon_with_config(
     keypair: Keypair,
     data_dir: std::path::PathBuf,
@@ -112,7 +139,6 @@ pub async fn run_daemon_with_config(
     config_path: Option<std::path::PathBuf>,
     node_signing_key: Option<ed25519_dalek::SigningKey>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Load daemon config (writes defaults if no config file exists yet)
     let daemon_config = match config_path {
         Some(ref path) => {
             let cfg = crate::config::DaemonConfig::load_from(path);
@@ -134,10 +160,19 @@ pub async fn run_daemon_with_config(
             cfg
         }
     };
-    info!("[service.rs] Daemon config: reannounce_interval={}s, reannounce_threshold={}s",
-        daemon_config.reannounce_interval_secs,
-        daemon_config.reannounce_threshold_secs,
-    );
+    run_daemon_with_config_struct(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key).await
+}
+
+async fn run_daemon_inner(
+    keypair: Keypair,
+    data_dir: std::path::PathBuf,
+    socket_path: String,
+    network_config: NetworkConfig,
+    ws_port: u16,
+    daemon_config: crate::config::DaemonConfig,
+    node_signing_key: Option<ed25519_dalek::SigningKey>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
 
     // Create broadcast channel for daemon events (WS push)
     let (event_tx, _) = events::event_channel(256);
@@ -234,7 +269,7 @@ pub async fn run_daemon_with_config(
     ));
 
     // Create demand tracker
-    let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::with_threshold(daemon_config.demand_threshold)));
+    let demand_tracker: Arc<Mutex<crate::scaling::DemandTracker>> = Arc::new(Mutex::new(crate::scaling::DemandTracker::new()));
 
     // Eviction manager
     let eviction_config = crate::eviction::EvictionConfig {
@@ -242,6 +277,8 @@ pub async fn run_daemon_with_config(
         enable_eviction: true,
     };
     let eviction_manager = Arc::new(Mutex::new(crate::eviction::EvictionManager::new(&eviction_config)));
+    // Clone for use in the event handler loop (the original is moved into eviction_maintenance_loop).
+    let eviction_manager_for_events = eviction_manager.clone();
 
     let protocol = Arc::new(protocol);
 
@@ -507,7 +544,7 @@ pub async fn run_daemon_with_config(
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
             info!("[service.rs] HealthScan loop ended");
         }
-        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone()) => {
+        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone(), eviction_manager_for_events.clone()) => {
             info!("[service.rs] Protocol events handler ended");
         }
         _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone(), daemon_config.challenger_interval_secs) => {
@@ -523,7 +560,7 @@ pub async fn run_daemon_with_config(
         ) => {
             info!("[service.rs] Content maintenance loop ended");
         }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), piece_map.clone(), command_tx.clone()) => {
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), piece_map.clone(), command_tx.clone(), content_tracker.clone()) => {
             info!("[service.rs] Eviction maintenance loop ended");
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
@@ -541,6 +578,16 @@ pub async fn run_daemon_with_config(
         _ = data_retention_loop(receipt_store.clone()) => {
             info!("[service.rs] Data retention loop ended");
         }
+        _ = crate::scaling::run_local_scaling_loop(
+            demand_tracker.clone(),
+            store.clone(),
+            piece_map.clone(),
+            Some(peer_scorer.clone()),
+            command_tx.clone(),
+            local_peer_id,
+        ) => {
+            info!("[service.rs] Local scaling loop ended");
+        }
         _ = shutdown_notify.notified() => {
             info!("[service.rs] Shutdown requested via RPC notify");
         }
@@ -550,6 +597,9 @@ pub async fn run_daemon_with_config(
 }
 
 /// Periodically check storage pressure and evict free content.
+///
+/// StorageProvider content (pieces we're holding for the network) is always
+/// marked as funded before each eviction cycle, protecting it from LRU eviction.
 async fn eviction_maintenance_loop(
     eviction_manager: Arc<Mutex<crate::eviction::EvictionManager>>,
     store: Arc<Mutex<craftobj_store::FsStore>>,
@@ -558,6 +608,7 @@ async fn eviction_maintenance_loop(
     merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
     piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
+    content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
     use std::time::Duration;
     const DISK_SPACE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
@@ -595,6 +646,41 @@ async fn eviction_maintenance_loop(
 
         let store_guard = store.lock().await;
         let mut mgr = eviction_manager.lock().await;
+
+        // Sync funded status from content_tracker before each cycle.
+        // This protects StorageProvider content (pieces held for the network)
+        // and handles the restart case where the in-memory eviction map starts empty.
+        {
+            let tracker = content_tracker.lock().await;
+            let tracked_cids: std::collections::HashSet<craftobj_core::ContentId> =
+                tracker.list().into_iter().map(|s| s.content_id).collect();
+
+            for state in tracker.list() {
+                match state.role {
+                    crate::content_tracker::ContentRole::StorageProvider => {
+                        // Storage provider content must never be LRU-evicted.
+                        mgr.mark_funded(state.content_id);
+                    }
+                    crate::content_tracker::ContentRole::Publisher => {
+                        // Publisher owns the content and decides its lifecycle;
+                        // protect it too so the eviction loop doesn't interfere.
+                        mgr.mark_funded(state.content_id);
+                    }
+                }
+            }
+
+            // Also protect any on-disk CIDs not yet in ContentTracker.
+            // This happens when tracker.json is missing/corrupted and import_from_store
+            // skips CIDs without a manifest (pure StorageProvider pieces).
+            // Conservative: protect unknown content rather than silently evict it.
+            if let Ok(disk_cids) = store_guard.list_content() {
+                for cid in disk_cids {
+                    if !tracked_cids.contains(&cid) {
+                        mgr.mark_funded(cid);
+                    }
+                }
+            }
+        }
 
         // Build retirement data from latest PDP rank snapshots
         let ranks_snapshot = pdp_ranks.lock().await;
@@ -846,6 +932,22 @@ async fn drive_swarm(
     // Track last activity time per peer for heartbeat timeout detection
     let mut peer_last_seen: HashMap<libp2p::PeerId, std::time::Instant> = HashMap::new();
 
+    // Read timing config once — all three new fields sourced from DaemonConfig.
+    let (capability_refresh_secs, evict_stale_secs, peer_heartbeat_timeout_secs) = {
+        let cfg = daemon_config.lock().await;
+        (cfg.capability_refresh_interval_secs, cfg.evict_stale_interval_secs, cfg.peer_heartbeat_timeout_secs)
+    };
+
+    // Periodic capability refresh — re-polls all connected storage peers.
+    // Keeps last_announcement fresh so evict_stale doesn't drop live peers.
+    let mut capability_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(capability_refresh_secs));
+    capability_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Periodic evict_stale — runs every evict_stale_secs with a 2-hour TTL.
+    // Previously fired on every behaviour event which was far too aggressive.
+    let mut evict_stale_interval = tokio::time::interval(std::time::Duration::from_secs(evict_stale_secs));
+    evict_stale_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             // Handle swarm events
@@ -970,8 +1072,8 @@ async fn drive_swarm(
                                 // Handle mDNS discovery
                                 handle_mdns_event(swarm, craft_event, &event_tx);
                                 {
-                                    let mut scorer = peer_scorer.lock().await;
-                                    scorer.evict_stale(std::time::Duration::from_secs(900));
+                                    // evict_stale is now handled on a dedicated timer below,
+                                    // not on every behaviour event.
                                 }
                                 // Handle Identify: add peer's listen addresses to Kademlia routing table.
                                 // libp2p 0.54+ no longer does this automatically.
@@ -1242,27 +1344,94 @@ async fn drive_swarm(
             // Peer heartbeat — check for unresponsive peers
             _ = heartbeat_interval.tick() => {
                 let now = std::time::Instant::now();
-                let timeout = std::time::Duration::from_secs(30);
+                // peer_heartbeat_timeout_secs is read from config above.
+                let timeout = std::time::Duration::from_secs(peer_heartbeat_timeout_secs);
                 let connected: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
                 for peer_id in connected {
-                    // Mark first-seen for peers we haven't tracked yet
                     peer_last_seen.entry(peer_id).or_insert(now);
                     if let Some(last) = peer_last_seen.get(&peer_id) {
                         if now.duration_since(*last) > timeout {
-                            warn!("[service.rs] Peer {} heartbeat timeout (no activity for >30s)", peer_id);
-                            peer_scorer.lock().await.record_timeout(&peer_id);
-                            // Mark node offline in PieceMap
-                            {
-                                let node_bytes = peer_id.to_bytes();
-                                let mut map = piece_map.lock().await;
-                                map.set_node_online(&node_bytes, false);
-                            }
+                            warn!("[service.rs] Peer {} heartbeat timeout (no activity for >5min) — re-requesting capabilities", peer_id);
+                            // Re-request capabilities to refresh last_announcement timestamp.
+                            // This prevents evict_stale from dropping a live but quiet peer.
+                            let tx = outbound_tx.clone();
+                            let ps = peer_scorer.clone();
+                            tokio::spawn(async move {
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                let msg = OutboundMessage {
+                                    peer: peer_id,
+                                    request: CraftObjRequest::CapabilityRequest,
+                                    reply_tx: Some(reply_tx),
+                                };
+                                if tx.send(msg).await.is_err() { return; }
+                                match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                                    Ok(Ok(CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region })) => {
+                                        let mut scorer = ps.lock().await;
+                                        let caps: Vec<craftobj_core::CraftObjCapability> = capabilities.iter().filter_map(|c| match c.as_str() {
+                                            "client" => Some(craftobj_core::CraftObjCapability::Client),
+                                            "storage" => Some(craftobj_core::CraftObjCapability::Storage),
+                                            "aggregator" => Some(craftobj_core::CraftObjCapability::Aggregator),
+                                            _ => None,
+                                        }).collect();
+                                        scorer.update_capabilities_with_storage(&peer_id, caps, 0, storage_committed_bytes, storage_used_bytes, region);
+                                        debug!("[service.rs] Heartbeat capability refresh ok for {}", peer_id);
+                                    }
+                                    _ => {
+                                        // Peer unresponsive — penalise but don't evict; let evict_stale handle it
+                                        let mut scorer = ps.lock().await;
+                                        scorer.record_timeout(&peer_id);
+                                        warn!("[service.rs] Heartbeat capability refresh failed for {} — peer may be gone", peer_id);
+                                    }
+                                }
+                            });
                             let _ = event_tx.send(DaemonEvent::PeerHeartbeatTimeout {
                                 peer_id: peer_id.to_string(),
                             });
                         }
                     }
                 }
+            }
+            // Periodic capability refresh — re-poll all connected peers every 10 min.
+            // Ensures last_announcement stays fresh for long-lived connections.
+            _ = capability_refresh_interval.tick() => {
+                let connected: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
+                debug!("[service.rs] Capability refresh tick — refreshing {} peers", connected.len());
+                for peer_id in connected {
+                    let tx = outbound_tx.clone();
+                    let ps = peer_scorer.clone();
+                    tokio::spawn(async move {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let msg = OutboundMessage {
+                            peer: peer_id,
+                            request: CraftObjRequest::CapabilityRequest,
+                            reply_tx: Some(reply_tx),
+                        };
+                        if tx.send(msg).await.is_err() { return; }
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                            Ok(Ok(CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region })) => {
+                                let mut scorer = ps.lock().await;
+                                let caps: Vec<craftobj_core::CraftObjCapability> = capabilities.iter().filter_map(|c| match c.as_str() {
+                                    "client" => Some(craftobj_core::CraftObjCapability::Client),
+                                    "storage" => Some(craftobj_core::CraftObjCapability::Storage),
+                                    "aggregator" => Some(craftobj_core::CraftObjCapability::Aggregator),
+                                    _ => None,
+                                }).collect();
+                                scorer.update_capabilities_with_storage(&peer_id, caps, 0, storage_committed_bytes, storage_used_bytes, region);
+                                debug!("[service.rs] Capability refresh ok for {}: {:?}", peer_id, capabilities);
+                            }
+                            _ => {
+                                debug!("[service.rs] Capability refresh failed for {} (peer may be slow — ok)", peer_id);
+                            }
+                        }
+                    });
+                }
+            }
+            // Periodic evict_stale — runs every 5 min with a 2-hour TTL.
+            // Previously ran on every behaviour event, causing live peers to be evicted
+            // when they haven't been heard from recently but are still connected.
+            _ = evict_stale_interval.tick() => {
+                let mut scorer = peer_scorer.lock().await;
+                scorer.evict_stale(std::time::Duration::from_secs(7200)); // 2-hour TTL
             }
             // PEX — share known peers with connected peers
             _ = pex_interval.tick() => {
@@ -2156,6 +2325,7 @@ async fn handle_protocol_events(
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     challenger: Arc<Mutex<crate::challenger::ChallengerManager>>,
+    eviction_manager: Arc<Mutex<crate::eviction::EvictionManager>>,
 ) {
     info!("[service.rs] Starting protocol events handler");
     
@@ -2217,6 +2387,14 @@ async fn handle_protocol_events(
                 let mut t = content_tracker.lock().await;
                 t.track_stored(content_id, &manifest);
                 drop(t);
+
+                // Immediately protect this CID from eviction.
+                // Without this, the eviction loop could remove it before the next
+                // content_tracker sync in eviction_maintenance_loop.
+                {
+                    let mut mgr = eviction_manager.lock().await;
+                    mgr.mark_funded(content_id);
+                }
 
                 // Register CID with challenger for PDP tracking
                 {

@@ -21,7 +21,7 @@ use std::time::Duration;
 use craftec_ipc::IpcClient;
 use craftec_network::NetworkConfig;
 use craftobj_daemon::config::DaemonConfig;
-use craftobj_daemon::service::run_daemon_with_config;
+use craftobj_daemon::service::run_daemon_with_config_struct;
 use libp2p::identity::Keypair;
 use libp2p::PeerId;
 use serde_json::{json, Value};
@@ -117,6 +117,10 @@ impl TestNode {
         daemon_config.health_check_interval_secs = 30; // Health checks for tests
         daemon_config.demand_threshold = 3; // Low threshold for test demand detection
         daemon_config.max_peer_connections = 10; // Limit connections for test resource usage
+        // Peer lifecycle timing — fast so tests don't wait minutes for stale eviction
+        daemon_config.capability_refresh_interval_secs = 5;  // vs 600s in production
+        daemon_config.evict_stale_interval_secs = 10;        // vs 300s in production
+        daemon_config.peer_heartbeat_timeout_secs = 15;      // vs 300s in production
         
         // Apply per-test config overrides
         config_fn(&mut daemon_config);
@@ -149,14 +153,14 @@ impl TestNode {
                     info!("Test node {} daemon shutdown requested", index);
                 }
                 result = async {
-                    run_daemon_with_config(
+                    run_daemon_with_config_struct(
                         daemon_keypair,
                         daemon_data_dir,
                         daemon_socket_path,
                         network_config,
                         daemon_ws_port,
+                        daemon_config,
                         None,
-                        None
                     ).await.map_err(|e| e.to_string())
                 } => {
                     match result {

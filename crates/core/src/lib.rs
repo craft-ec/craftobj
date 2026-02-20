@@ -464,20 +464,7 @@ impl PieceDropped {
     }
 }
 
-/// Demand signal: a serving node detected high demand for content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DemandSignal {
-    /// Content being requested at high rate.
-    pub content_id: ContentId,
-    /// Demand level (e.g., number of fetches in the window).
-    pub demand_level: u32,
-    /// Current number of known providers for this content.
-    pub current_providers: u32,
-    /// Peer ID bytes of the node reporting demand.
-    pub reporter: Vec<u8>,
-    /// Unix timestamp (seconds) when signal was created.
-    pub timestamp: u64,
-}
+
 
 /// Capabilities a CraftObj node can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
