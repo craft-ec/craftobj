@@ -270,7 +270,14 @@ impl HealthScan {
         None
     }
 
-    /// Send a Merkle pull request for a specific segment.
+    /// Send a Merkle pull request for a specific segment and apply the results
+    /// directly to PieceMap.
+    ///
+    /// For incremental diffs (known_root supplied): replaces all of this peer's entries
+    /// for the segment with the updated set from the diff response (idempotent).
+    ///
+    /// For first-time sync (no known_root): queries the peer's PieceMap entries via
+    /// PieceMapQuery and applies all returned entries.
     async fn send_merkle_pull_for_segment(
         &self,
         peer_id: PeerId,
@@ -278,9 +285,10 @@ impl HealthScan {
         segment_index: u32,
         known_root: Option<[u8; 32]>,
     ) -> Option<MerklePullResponse> {
-        
+        let peer_node = peer_id.to_bytes();
+
         if let Some(root) = known_root {
-            // Pull diff since known root
+            // Incremental diff since last known root.
             let (tx, rx) = tokio::sync::oneshot::channel();
             if self.command_tx.send(CraftObjCommand::MerkleDiff {
                 peer_id,
@@ -292,23 +300,18 @@ impl HealthScan {
                 debug!("HealthScan: failed to send MerkleDiff command");
                 return None;
             }
-            
+
             match rx.await {
                 Ok(Some(diff_result)) => {
+                    // Replace the peer's entries for this segment with the fresh set.
+                    // Using clear-then-apply rather than partial removes because
+                    // MerkleDiffResult.removed contains local indices, not piece_ids.
+                    let mut map = self.piece_map.lock().await;
+                    map.clear_remote_entries(content_id, segment_index, &peer_node);
+                    map.apply_remote_entries(content_id, segment_index, &peer_node, &diff_result.added);
                     Some(MerklePullResponse {
                         root: diff_result.current_root,
-                        diff: Some(MerkleDiff {
-                            added: diff_result.added.iter().map(|entry| {
-                                // Convert PieceMapEntry to leaf hash
-                                craftobj_store::merkle::compute_leaf(&content_id, segment_index, &entry.piece_id)
-                            }).collect(),
-                            removed: diff_result.removed.iter().map(|&_piece_id_prefix| {
-                                // This is a limitation: we can't reconstruct the full piece_id from just the prefix.
-                                // In practice, the diff protocol would need to include full piece IDs.
-                                // For now, we'll use a placeholder approach.
-                                [0u8; 32] // Placeholder
-                            }).collect(),
-                        }),
+                        diff: None,
                         full_leaves: None,
                     })
                 }
@@ -322,32 +325,37 @@ impl HealthScan {
                 }
             }
         } else {
-            // Pull full root for first-time sync
+            // First-time sync: query the peer's PieceMap entries directly.
+            // PieceMapQuery returns PieceMapEntry with full metadata (piece_id + coefficients).
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if self.command_tx.send(CraftObjCommand::MerkleRoot {
+            if self.command_tx.send(CraftObjCommand::PieceMapQuery {
                 peer_id,
                 content_id,
                 segment_index,
                 reply_tx: tx,
             }).is_err() {
-                debug!("HealthScan: failed to send MerkleRoot command");
+                debug!("HealthScan: failed to send PieceMapQuery command");
                 return None;
             }
-            
+
             match rx.await {
-                Ok(Some((root, _leaf_count))) => {
+                Ok(Ok(craftobj_transfer::CraftObjResponse::PieceMapEntries { entries })) => {
+                    let mut map = self.piece_map.lock().await;
+                    map.clear_remote_entries(content_id, segment_index, &peer_node);
+                    map.apply_remote_entries(content_id, segment_index, &peer_node, &entries);
+                    // Use an all-zeros sentinel root; real root will be populated on next diff cycle.
                     Some(MerklePullResponse {
-                        root,
+                        root: [0u8; 32],
                         diff: None,
-                        full_leaves: None, // We don't get the actual leaves from MerkleRoot, just the count
+                        full_leaves: None,
                     })
                 }
-                Ok(None) => {
-                    debug!("HealthScan: MerkleRoot returned None for {} from {}", content_id, peer_id);
+                Ok(_) => {
+                    debug!("HealthScan: PieceMapQuery returned unexpected response for {} from {}", content_id, peer_id);
                     None
                 }
                 Err(_) => {
-                    debug!("HealthScan: MerkleRoot channel error for {} from {}", content_id, peer_id);
+                    debug!("HealthScan: PieceMapQuery channel error for {} from {}", content_id, peer_id);
                     None
                 }
             }
@@ -1322,31 +1330,42 @@ mod tests {
     async fn test_health_scan_merkle_root_success() {
         let (pm, store, dt, local, dir) = setup_test();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        
-        // Spawn a task to handle commands and provide successful responses
+
+        // First-time sync now uses PieceMapQuery (not MerkleRoot).
+        // Track the segment in pm before the call so apply_remote_entries doesn't skip.
+        {
+            let mut map = pm.lock().await;
+            map.track_segment(ContentId([3u8; 32]), 0);
+        }
+
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    CraftObjCommand::MerkleRoot { reply_tx, .. } => {
-                        let _ = reply_tx.send(Some(([0xBB; 32], 10)));
+                    CraftObjCommand::PieceMapQuery { reply_tx, .. } => {
+                        use craftobj_transfer::{CraftObjResponse, PieceMapEntry};
+                        let _ = reply_tx.send(Ok(CraftObjResponse::PieceMapEntries {
+                            entries: vec![PieceMapEntry {
+                                node: vec![0xBB; 4],
+                                piece_id: [0x11; 32],
+                                coefficients: vec![1, 0],
+                            }],
+                        }));
                     }
                     _ => {}
                 }
             }
         });
-        
-        let scan = HealthScan::new(pm, store, dt, local, tx);
+
+        let scan = HealthScan::new(pm.clone(), store, dt, local, tx);
         let peer = PeerId::random();
         let cid = ContentId([3u8; 32]);
-        
+
         let result = scan.send_merkle_pull(peer, cid, None).await;
         assert!(result.is_some(), "Should return Some when successful");
-        
-        let response = result.unwrap();
-        assert_eq!(response.root, [0xBB; 32]);
-        assert!(response.diff.is_none());
-        assert!(response.full_leaves.is_none());
-        
+        // PieceMap should now have the entry applied.
+        let map = pm.lock().await;
+        assert_eq!(map.segment_pieces(&cid, 0), 1, "PieceMap should have the remote entry");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1354,8 +1373,13 @@ mod tests {
     async fn test_health_scan_merkle_diff_success() {
         let (pm, store, dt, local, dir) = setup_test();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        
-        // Spawn a task to handle commands and provide successful diff response
+
+        // Track segment so apply_remote_entries doesn't skip the entry.
+        {
+            let mut map = pm.lock().await;
+            map.track_segment(ContentId([4u8; 32]), 0);
+        }
+
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
@@ -1376,22 +1400,23 @@ mod tests {
                 }
             }
         });
-        
-        let scan = HealthScan::new(pm, store, dt, local, tx);
+
+        let scan = HealthScan::new(pm.clone(), store, dt, local, tx);
         let peer = PeerId::random();
         let cid = ContentId([4u8; 32]);
-        
+
         let result = scan.send_merkle_pull(peer, cid, Some([0xAA; 32])).await;
         assert!(result.is_some(), "Should return Some when successful");
-        
+
         let response = result.unwrap();
         assert_eq!(response.root, [0xCC; 32]);
-        assert!(response.diff.is_some());
-        
-        let diff = response.diff.unwrap();
-        assert_eq!(diff.added.len(), 1);
-        assert_eq!(diff.removed.len(), 1);
-        
+        // Entries go directly to PieceMap now, not into response.diff.
+        assert!(response.diff.is_none());
+
+        // Verify PieceMap was updated with the added entry.
+        let map = pm.lock().await;
+        assert_eq!(map.segment_pieces(&cid, 0), 1, "PieceMap should have the remote diff entry");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

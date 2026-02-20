@@ -107,7 +107,7 @@ The existing codebase is built on Reed-Solomon erasure coding. The design has mo
 
 ## Reference Implementation
 
-TunnelCraft (`../tunnelcraft/`) solved many of the same patterns first. Study it for:
+CraftNet (`../craftnet/`) solved many of the same patterns first. Study it for:
 - Protocol handlers (`crates/network/src/`)
 - Swarm event loop (`crates/daemon/src/`)
 - Receipt generation and exchange

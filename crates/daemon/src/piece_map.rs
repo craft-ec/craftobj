@@ -268,6 +268,42 @@ impl PieceMap {
         self.node_online.get(node).copied().unwrap_or(false)
     }
 
+    /// Apply piece entries received from a remote peer during Merkle sync.
+    ///
+    /// For each entry, inserts `(node, cid, segment, piece_id) → coefficients` into the
+    /// map so that `compute_rank`, `pieces_for_segment`, and `provider_count` incorporate
+    /// the remote peer's contribution. Skips entries for untracked segments.
+    ///
+    /// This is the write path triggered by HealthScan's Merkle diff/full-sync responses.
+    /// It replaces the no-op `apply_diff_to_piece_map` / `apply_full_leaves_to_piece_map`.
+    pub fn apply_remote_entries(
+        &mut self,
+        cid: ContentId,
+        segment: u32,
+        peer_node: &[u8],
+        entries: &[craftobj_transfer::PieceMapEntry],
+    ) {
+        if !self.tracked_segments.contains(&(cid, segment)) {
+            return;
+        }
+        self.update_last_seen(peer_node);
+        for entry in entries {
+            let key = (peer_node.to_vec(), cid, segment, entry.piece_id);
+            self.pieces.insert(key, entry.coefficients.clone());
+        }
+    }
+
+    /// Remove all piece entries for a given peer + CID + segment.
+    ///
+    /// Called before applying a fresh Merkle sync result so stale entries
+    /// (pieces the peer has since dropped) are evicted.
+    pub fn clear_remote_entries(&mut self, cid: ContentId, segment: u32, peer_node: &[u8]) {
+        let peer = peer_node.to_vec();
+        self.pieces.retain(|(node, c, s, _), _| {
+            !(node == &peer && *c == cid && *s == segment)
+        });
+    }
+
     fn is_node_online(&self, node: &[u8]) -> bool {
         self.is_node_online_pub(node)
     }
