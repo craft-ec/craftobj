@@ -1077,6 +1077,8 @@ async fn drive_swarm(
 
             // Process inbound messages from peer streams
             Some(msg) = inbound_rx.recv() => {
+                // Update heartbeat tracker — any inbound activity means the peer is alive
+                peer_last_seen.insert(msg.peer, std::time::Instant::now());
                 info!("[service.rs] Processing inbound from {} seq={}: {:?}", msg.peer, msg.seq_id, std::mem::discriminant(&msg.request));
 
                 // Handle PEX inline (needs pex_manager from main loop)
