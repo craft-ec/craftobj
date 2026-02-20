@@ -1960,6 +1960,13 @@ impl CraftObjHandler {
             }));
         }
 
+        // Check if a health scan has ever completed for this CID
+        let health_scanned = if let Some(ref data_dir) = self.data_dir {
+            data_dir.join("health_history").join(format!("{}.jsonl", cid)).exists()
+        } else {
+            false
+        };
+
         Ok(serde_json::json!({
             "content_id": cid_hex,
             "name": name,
@@ -1979,6 +1986,7 @@ impl CraftObjHandler {
             "local_disk_usage": disk_usage,
             "has_demand": has_demand,
             "tier_min_ratio": tier_min_ratio,
+            "health_scanned": health_scanned,
         }))
     }
 
@@ -2071,6 +2079,13 @@ impl CraftObjHandler {
             };
             let tier_min_ratio: f64 = 1.5;
 
+            // Check if a health scan has ever completed for this CID
+            let health_scanned = if let Some(ref data_dir) = self.data_dir {
+                data_dir.join("health_history").join(format!("{}.jsonl", cid_hex)).exists()
+            } else {
+                false
+            };
+
             let mut obj = serde_json::json!({
                 "content_id": cid_hex,
                 "total_size": item.total_size,
@@ -2083,6 +2098,7 @@ impl CraftObjHandler {
                 "local_disk_usage": disk_usage,
                 "has_demand": has_demand,
                 "tier_min_ratio": tier_min_ratio,
+                "health_scanned": health_scanned,
             });
 
             if let Some(ref td) = tracker_data {
