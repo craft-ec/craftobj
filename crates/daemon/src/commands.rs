@@ -5,17 +5,10 @@
 
 use craftec_erasure::ContentVerificationRecord;
 use craftobj_core::{ContentId, ContentManifest};
-use craftobj_transfer::{CraftObjResponse, PieceMapEntry};
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
-/// Result from a Merkle diff operation.
-#[derive(Debug, Clone)]
-pub struct MerkleDiffResult {
-    pub current_root: [u8; 32],
-    pub added: Vec<PieceMapEntry>,
-    pub removed: Vec<u32>,
-}
+use craftobj_transfer::{CraftObjResponse, PiecePayload};
 
 /// Commands that can be sent to the swarm event loop.
 #[derive(Debug)]
@@ -45,13 +38,6 @@ pub enum CraftObjCommand {
         merkle_root: [u8; 32],
         have_pieces: Vec<[u8; 32]>,
         max_pieces: u16,
-        reply_tx: oneshot::Sender<Result<CraftObjResponse, String>>,
-    },
-    /// Query a peer's PieceMap entries for a specific segment (lightweight sync).
-    PieceMapQuery {
-        peer_id: PeerId,
-        content_id: ContentId,
-        segment_index: u32,
         reply_tx: oneshot::Sender<Result<CraftObjResponse, String>>,
     },
     /// Store a re-encryption key in the DHT for access grant.
@@ -101,12 +87,10 @@ pub enum CraftObjCommand {
     DistributePieces {
         peer_id: PeerId,
         content_id: ContentId,
-        pieces: Vec<craftobj_transfer::PiecePayload>,
+        pieces: Vec<PiecePayload>,
         reply_tx: oneshot::Sender<Result<crate::piece_transfer::TransferResult, String>>,
     },
     /// Fetch pieces from a peer using unified piece_transfer protocol.
-    /// Opens stream, sends PieceSync, then receives batched PieceBatchPush frames.
-    /// Returns (confirmed_count, piece_ids) when transfer completes.
     FetchPieces {
         peer_id: PeerId,
         content_id: ContentId,
@@ -115,30 +99,18 @@ pub enum CraftObjCommand {
         max_pieces: u16,
         reply_tx: oneshot::Sender<Result<Vec<[u8; 32]>, String>>,
     },
-    /// Sync PieceMap entries for a newly tracked segment from connected peers.
-    SyncPieceMap {
+    /// Query a peer's piece count for a specific segment (lightweight health check).
+    /// Returns the number of pieces the peer holds for the segment.
+    HealthQuery {
+        peer_id: PeerId,
         content_id: ContentId,
         segment_index: u32,
+        reply_tx: oneshot::Sender<Result<u32, String>>,
     },
     /// Publish a DHT provider record for a CID+segment (called after storing a piece).
     StartProviding { key: Vec<u8> },
     /// Remove a DHT provider record for a CID+segment (called after dropping all pieces for a segment).
     StopProviding { key: Vec<u8> },
-    /// Request Merkle root for a content ID from a peer.
-    MerkleRoot {
-        peer_id: PeerId,
-        content_id: ContentId,
-        segment_index: u32,
-        reply_tx: oneshot::Sender<Option<([u8; 32], u32)>>,
-    },
-    /// Request Merkle diff since a given root from a peer.
-    MerkleDiff {
-        peer_id: PeerId,
-        content_id: ContentId,
-        segment_index: u32,
-        since_root: [u8; 32],
-        reply_tx: oneshot::Sender<Option<MerkleDiffResult>>,
-    },
     /// Return list of currently connected peer IDs (swarm-level).
     ConnectedPeers {
         reply_tx: oneshot::Sender<Vec<String>>,

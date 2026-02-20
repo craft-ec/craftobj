@@ -19,7 +19,6 @@ pub mod disk_monitor;
 pub mod commands;
 pub mod errors;
 pub mod health_scan;
-pub mod piece_map;
 pub mod handler;
 pub mod health;
 pub mod pdp;

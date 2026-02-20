@@ -408,56 +408,6 @@ async fn run_daemon_inner(
     handler.set_local_peer_id(local_peer_id);
     handler.set_demand_tracker(demand_tracker.clone());
 
-    // PieceMap — event-sourced materialized view of piece locations
-    let piece_map = {
-        let mut pm = crate::piece_map::PieceMap::new(local_peer_id);
-        // Initialize from local store: scan all local pieces and record them
-        let local_node_bytes = local_peer_id.to_bytes().to_vec();
-        if let Ok(store_guard) = client.try_lock() {
-            if let Ok(cids) = store_guard.store().list_content_with_pieces() {
-                for cid in cids {
-                    if let Ok(segments) = store_guard.store().list_segments(&cid) {
-                        for seg in segments {
-                            if let Ok(pieces) = store_guard.store().list_pieces(&cid, seg) {
-                                if !pieces.is_empty() {
-                                    pm.track_segment(cid, seg);
-                                }
-                                for pid in pieces {
-                                    if let Ok((_data, coefficients)) = store_guard.store().get_piece(&cid, seg, &pid) {
-                                        let seq = pm.next_seq();
-                                        let event = craftobj_core::PieceEvent::Stored(craftobj_core::PieceStored {
-                                            node: local_node_bytes.clone(),
-                                            cid,
-                                            segment: seg,
-                                            piece_id: pid,
-                                            coefficients,
-                                            seq,
-                                            timestamp: std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs(),
-                                            signature: vec![], // Local init, no need to sign
-                                        });
-                                        pm.apply_event(&event);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            info!("[service.rs] PieceMap initialized with {} CIDs from local store", pm.all_cids().len());
-        } else {
-            warn!("[service.rs] Could not lock client for PieceMap initialization");
-        }
-        // Mark the local node as online so HealthScan rank computation includes local pieces
-        pm.set_node_online(&local_peer_id.to_bytes(), true);
-        Arc::new(Mutex::new(pm))
-    };
-
-    handler.set_piece_map(piece_map.clone());
-    // Wire PieceMap into challenger for coefficient vector reads (replaces inventory requests)
-    challenger_mgr.lock().await.set_piece_map(piece_map.clone());
     let handler = Arc::new(handler);
 
     // Load or generate API key for WebSocket authentication
@@ -497,7 +447,6 @@ async fn run_daemon_inner(
     // HealthScan — periodic scan of owned segments for repair/degradation
     let health_scan_command_tx = command_tx.clone();
     let mut health_scan = crate::health_scan::HealthScan::new(
-        piece_map.clone(),
         store.clone(),
         demand_tracker.clone(),
         local_peer_id,
@@ -538,7 +487,7 @@ async fn run_daemon_inner(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, piece_map.clone(), daemon_config_for_swarm.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, daemon_config_for_swarm.clone()) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
@@ -560,13 +509,13 @@ async fn run_daemon_inner(
         ) => {
             info!("[service.rs] Content maintenance loop ended");
         }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), piece_map.clone(), command_tx.clone(), content_tracker.clone()) => {
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), command_tx.clone(), content_tracker.clone()) => {
             info!("[service.rs] Eviction maintenance loop ended");
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
             info!("[service.rs] Aggregation loop ended");
         }
-        _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes, piece_map.clone(), command_tx.clone()) => {
+        _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes, command_tx.clone()) => {
             info!("[service.rs] GC loop ended");
         }
         _ = content_health_loop(content_tracker.clone(), store.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
@@ -581,7 +530,6 @@ async fn run_daemon_inner(
         _ = crate::scaling::run_local_scaling_loop(
             demand_tracker.clone(),
             store.clone(),
-            piece_map.clone(),
             Some(peer_scorer.clone()),
             command_tx.clone(),
             local_peer_id,
@@ -606,7 +554,6 @@ async fn eviction_maintenance_loop(
     event_tx: EventSender,
     pdp_ranks: Arc<Mutex<crate::challenger::PdpRankData>>,
     merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
-    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
 ) {
@@ -759,8 +706,6 @@ async fn eviction_maintenance_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Periodic garbage collection: delete unpinned content, enforce storage limits.
 async fn gc_loop(
     store: Arc<Mutex<craftobj_store::FsStore>>,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
@@ -769,7 +714,6 @@ async fn gc_loop(
     event_tx: EventSender,
     gc_interval_secs: u64,
     _max_storage_bytes: u64,
-    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
 ) {
     use std::time::Duration;
@@ -829,34 +773,12 @@ async fn gc_loop(
                 continue; // Keep pinned, published, and storage provider content
             }
 
-            // Emit PieceDropped events before deletion and untrack segments
+            // Remove DHT provider record
             {
                 let segments = s.list_segments(cid).unwrap_or_default();
-                let mut map = piece_map.lock().await;
-                let local_node = map.local_node().to_vec();
                 for seg in segments {
-                    let pieces = s.list_pieces(cid, seg).unwrap_or_default();
-                    for pid in pieces {
-                        let seq = map.next_seq();
-                        let dropped = craftobj_core::PieceDropped {
-                            node: local_node.clone(),
-                            cid: *cid,
-                            segment: seg,
-                            piece_id: pid,
-                            seq,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            signature: vec![],
-                        };
-                        let event = craftobj_core::PieceEvent::Dropped(dropped);
-                        map.apply_event(&event);
-                    }
-                    // Remove DHT provider record and untrack segment after dropping all pieces
                     let pkey = craftobj_routing::providers_dht_key(cid);
                     let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
-                    map.untrack_segment(cid, seg);
                 }
             }
 
@@ -900,8 +822,6 @@ async fn drive_swarm(
     region: Option<String>,
     signing_key: Option<ed25519_dalek::SigningKey>,
     _receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
-    max_peer_connections: usize,
-    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
     daemon_config: Arc<Mutex<crate::config::DaemonConfig>>,
 ) {
     use libp2p::swarm::SwarmEvent;
@@ -1102,45 +1022,28 @@ async fn drive_swarm(
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
                     match cmd {
-                        CraftObjCommand::SyncPieceMap { content_id, segment_index } => {
-                            // Query all connected peers for their PieceMap entries for this segment
-                            let peers: Vec<libp2p::PeerId> = swarm.connected_peers().cloned().collect();
-                            debug!("[service.rs] SyncPieceMap for {}/seg{}: querying {} peers", content_id, segment_index, peers.len());
-                            for peer_id in peers {
-                                let request = CraftObjRequest::PieceMapQuery { content_id, segment_index };
-                                let (ack_tx, ack_rx) = oneshot::channel();
-                                let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
-                                let tx = outbound_tx.clone();
-                                let pm = piece_map.clone();
-                                tokio::spawn(async move {
-                                    if tx.send(msg).await.is_err() {
-                                        return;
+                        CraftObjCommand::HealthQuery { peer_id, content_id, segment_index, reply_tx } => {
+                            debug!("[service.rs] Handling HealthQuery command: {}/seg{} to peer {}", content_id, segment_index, peer_id);
+                            let request = CraftObjRequest::HealthQuery { content_id, segment_index };
+                            let (ack_tx, ack_rx) = oneshot::channel();
+                            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
+                            let tx = outbound_tx.clone();
+                            tokio::spawn(async move {
+                                if tx.send(msg).await.is_err() {
+                                    let _ = reply_tx.send(Err("outbound channel closed".into()));
+                                    return;
+                                }
+                                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+                                    Ok(Ok(CraftObjResponse::HealthResponse { piece_count })) => {
+                                        let _ = reply_tx.send(Ok(piece_count));
                                     }
-                                    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                                        Ok(Ok(CraftObjResponse::PieceMapEntries { entries })) => {
-                                            let mut map = pm.lock().await;
-                                            for entry in entries {
-                                                let stored = craftobj_core::PieceStored {
-                                                    node: entry.node,
-                                                    cid: content_id,
-                                                    segment: segment_index,
-                                                    piece_id: entry.piece_id,
-                                                    coefficients: entry.coefficients,
-                                                    seq: 0,
-                                                    timestamp: 0,
-                                                    signature: vec![],
-                                                };
-                                                let event = craftobj_core::PieceEvent::Stored(stored);
-                                                map.apply_event(&event);
-                                            }
-                                            debug!("[service.rs] SyncPieceMap: populated entries from {}", peer_id);
-                                        }
-                                        _ => {
-                                            debug!("[service.rs] SyncPieceMap: no response from {}", peer_id);
-                                        }
+                                    Ok(Ok(_)) => {
+                                        let _ = reply_tx.send(Err("unexpected response type".into()));
                                     }
-                                });
-                            }
+                                    Ok(Err(_)) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
+                                    Err(_) => { let _ = reply_tx.send(Err("health query timed out".into())); }
+                                }
+                            });
                         }
                         CraftObjCommand::ConnectedPeers { reply_tx } => {
                             let peers: Vec<String> = swarm.connected_peers().map(|p| p.to_string()).collect();
@@ -1298,7 +1201,6 @@ async fn drive_swarm(
                 let ct_clone = content_tracker.clone();
                 let proto_clone = protocol.clone();
                 let dt_clone = demand_tracker.clone();
-                let pm_clone = piece_map.clone();
                 let sk_clone = signing_key.clone();
                 let cmd_tx_clone = command_tx.clone();
                 let peer = msg.peer;
@@ -1311,7 +1213,7 @@ async fn drive_swarm(
                     info!("[handler] START peer={} seq={} type={}", &peer.to_string()[..8], seq_id, req_type);
                     let response = handle_incoming_transfer_request(
                         &peer, msg.request, &store_clone, &ct_clone, &proto_clone, &dt_clone,
-                        &pm_clone, sk_clone.as_ref(), &cmd_tx_clone,
+                        sk_clone.as_ref(), &cmd_tx_clone,
                     ).await;
                     let handle_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
                     info!("[handler] DONE peer={} seq={} handle_ms={:.1} resp={:?}", &peer.to_string()[..8], seq_id, handle_ms, std::mem::discriminant(&response));
@@ -1465,7 +1367,6 @@ async fn drive_swarm(
 }
 
 /// Handle an incoming transfer request from a peer via persistent stream.
-#[allow(clippy::too_many_arguments)]
 async fn handle_incoming_transfer_request(
     peer: &libp2p::PeerId,
     request: CraftObjRequest,
@@ -1473,7 +1374,6 @@ async fn handle_incoming_transfer_request(
     _content_tracker: &Arc<Mutex<crate::content_tracker::ContentTracker>>,
     protocol: &Arc<CraftObjProtocol>,
     demand_tracker: &Arc<Mutex<crate::scaling::DemandTracker>>,
-    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
     signing_key: Option<&ed25519_dalek::SigningKey>,
     command_tx: &mpsc::UnboundedSender<CraftObjCommand>,
 ) -> CraftObjResponse {
@@ -1614,89 +1514,14 @@ async fn handle_incoming_transfer_request(
                 }
             }
         }
-        CraftObjRequest::PieceMapQuery { content_id, segment_index } => {
-            debug!("[service.rs] Handling PieceMapQuery from {} for {}/seg{}", peer, content_id, segment_index);
-            let map = piece_map.lock().await;
-            let pieces = map.pieces_for_segment(&content_id, segment_index);
-            let entries: Vec<craftobj_transfer::PieceMapEntry> = pieces.into_iter()
-                .map(|(node, pid, coeff)| craftobj_transfer::PieceMapEntry {
-                    node: node.clone(),
-                    piece_id: *pid,
-                    coefficients: coeff.clone(),
-                })
-                .collect();
-            debug!("[service.rs] Returning {} PieceMap entries for {}/seg{}", entries.len(), content_id, segment_index);
-            CraftObjResponse::PieceMapEntries { entries }
-        }
-        CraftObjRequest::MerkleRoot { content_id, segment_index } => {
-            info!("[service.rs] Handling MerkleRoot from {} for {}/seg{}", peer, content_id, segment_index);
-            
-            // Get pieces for this segment from local store and build response
+        CraftObjRequest::HealthQuery { content_id, segment_index } => {
+            debug!("[service.rs] Handling HealthQuery from {} for {}/seg{}", peer, content_id, segment_index);
             let store_guard = store.lock().await;
-            let pieces = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
-            
-            if pieces.is_empty() {
-                // No pieces for this segment, return empty root
-                let empty_root = craftobj_store::merkle::StorageMerkleTree::new().root();
-                CraftObjResponse::MerkleRootResponse { 
-                    root: empty_root, 
-                    leaf_count: 0 
-                }
-            } else {
-                // Build merkle tree from our pieces for this segment
-                let mut tree = craftobj_store::merkle::StorageMerkleTree::new();
-                for piece_id in &pieces {
-                    tree.insert(&content_id, segment_index, piece_id);
-                }
-                CraftObjResponse::MerkleRootResponse { 
-                    root: tree.root(), 
-                    leaf_count: pieces.len() as u32 
-                }
-            }
-        }
-        CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
-            info!("[service.rs] Handling MerkleDiff from {} for {}/seg{} since {}", peer, content_id, segment_index, hex::encode(&since_root[..8]));
-            
-            // Get current pieces for this segment
-            let store_guard = store.lock().await;
-            let pieces = store_guard.list_pieces(&content_id, segment_index).unwrap_or_default();
-            
-            // Build current merkle tree
-            let mut current_tree = craftobj_store::merkle::StorageMerkleTree::new();
-            for piece_id in &pieces {
-                current_tree.insert(&content_id, segment_index, piece_id);
-            }
-            let current_root = current_tree.root();
-            
-            // If roots are the same, no changes
-            if current_root == since_root {
-                CraftObjResponse::MerkleDiffResponse {
-                    current_root,
-                    added: vec![],
-                    removed: vec![],
-                }
-            } else {
-                // For now, we don't have a way to reconstruct the old tree state from just the root.
-                // This would require either maintaining historical tree states or a more sophisticated diff protocol.
-                // As a simplified implementation, we'll return all current pieces as "added".
-                // A proper implementation would need to maintain tree history or use a different diff approach.
-                let mut added = Vec::new();
-                let peer_bytes = peer.to_bytes();
-                for piece_id in pieces {
-                    if let Ok((_, coefficients)) = store_guard.get_piece(&content_id, segment_index, &piece_id) {
-                        added.push(craftobj_transfer::PieceMapEntry {
-                            node: peer_bytes.to_vec(),
-                            piece_id,
-                            coefficients,
-                        });
-                    }
-                }
-                CraftObjResponse::MerkleDiffResponse {
-                    current_root,
-                    added,
-                    removed: vec![], // Can't compute removals without old state
-                }
-            }
+            let piece_count = store_guard.list_pieces(&content_id, segment_index)
+                .unwrap_or_default()
+                .len() as u32;
+            debug!("[service.rs] Returning piece_count={} for {}/seg{}", piece_count, content_id, segment_index);
+            CraftObjResponse::HealthResponse { piece_count }
         }
         CraftObjRequest::PdpChallenge { content_id, segment_index, piece_id, nonce, byte_positions } => {
             info!("[service.rs] Handling PdpChallenge from {} for {}/seg{} piece {}", peer, content_id, segment_index, hex::encode(&piece_id[..8]));
@@ -1998,23 +1823,9 @@ async fn handle_command(
             });
         }
 
-        CraftObjCommand::PieceMapQuery { peer_id, content_id, segment_index, reply_tx } => {
-            debug!("[service.rs] Handling PieceMapQuery command: {}/seg{} to peer {}", content_id, segment_index, peer_id);
-            let request = CraftObjRequest::PieceMapQuery { content_id, segment_index };
-            let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
-            let tx = outbound_tx.clone();
-            tokio::spawn(async move {
-                if tx.send(msg).await.is_err() {
-                    let _ = reply_tx.send(Err("outbound channel closed".into()));
-                    return;
-                }
-                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                    Ok(Ok(response)) => { let _ = reply_tx.send(Ok(response)); }
-                    Ok(Err(_)) => { let _ = reply_tx.send(Err("ack channel closed".into())); }
-                    Err(_) => { let _ = reply_tx.send(Err("piece map query timed out".into())); }
-                }
-            });
+        CraftObjCommand::HealthQuery { .. } => {
+            // Handled inline in the command match above (drive_swarm).
+            // This arm should never be reached.
         }
 
         CraftObjCommand::PutReKey { content_id, entry, reply_tx } => {

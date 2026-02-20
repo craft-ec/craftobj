@@ -9,25 +9,21 @@ use std::io;
 
 use futures::prelude::*;
 
-use crate::{CraftObjRequest, CraftObjResponse, PieceMapEntry, PiecePayload};
+use crate::{CraftObjRequest, CraftObjResponse, PiecePayload};
 use craftobj_core::{ContentId, WireStatus};
 use craftec_network::wire::{read_raw_frame, write_raw_frame};
 
-// Type discriminants (matching existing codec)
+// Type discriminants
 const TYPE_PIECE_SYNC: u8 = 0x01;
 const TYPE_PIECE_PUSH: u8 = 0x02;
 const TYPE_MANIFEST_PUSH: u8 = 0x03;
-const TYPE_PIECE_MAP_QUERY: u8 = 0x04;
-const TYPE_MERKLE_ROOT: u8 = 0x05;
-const TYPE_MERKLE_DIFF: u8 = 0x06;
+const TYPE_HEALTH_QUERY: u8 = 0x04;
 const TYPE_PDP_CHALLENGE: u8 = 0x07;
 const TYPE_PEX_EXCHANGE: u8 = 0x08;
 const TYPE_PIECE_BATCH_PUSH: u8 = 0x09;
 const TYPE_PIECE_BATCH: u8 = 0x81;
 const TYPE_ACK: u8 = 0x82;
-const TYPE_PIECE_MAP_ENTRIES: u8 = 0x83;
-const TYPE_MERKLE_ROOT_RESPONSE: u8 = 0x84;
-const TYPE_MERKLE_DIFF_RESPONSE: u8 = 0x85;
+const TYPE_HEALTH_RESPONSE: u8 = 0x84;
 const TYPE_PDP_PROOF: u8 = 0x86;
 const TYPE_PEX_EXCHANGE_RESPONSE: u8 = 0x87;
 const TYPE_BATCH_ACK: u8 = 0x89;
@@ -68,11 +64,14 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
     let raw = read_raw_frame(io).await?;
 
     match raw.msg_type {
-        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_PIECE_MAP_QUERY | TYPE_MERKLE_ROOT | TYPE_MERKLE_DIFF | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE | TYPE_PIECE_BATCH_PUSH | TYPE_CAPABILITY_REQUEST => {
+        TYPE_PIECE_SYNC | TYPE_PIECE_PUSH | TYPE_MANIFEST_PUSH | TYPE_HEALTH_QUERY
+        | TYPE_PDP_CHALLENGE | TYPE_PEX_EXCHANGE | TYPE_PIECE_BATCH_PUSH
+        | TYPE_CAPABILITY_REQUEST => {
             let request = deserialize_request(raw.msg_type, &raw.payload)?;
             Ok(StreamFrame::Request { seq_id: raw.seq_id, request })
         }
-        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_PIECE_MAP_ENTRIES | TYPE_MERKLE_ROOT_RESPONSE | TYPE_MERKLE_DIFF_RESPONSE | TYPE_PDP_PROOF | TYPE_PEX_EXCHANGE_RESPONSE | TYPE_BATCH_ACK | TYPE_CAPABILITY_RESPONSE => {
+        TYPE_PIECE_BATCH | TYPE_ACK | TYPE_HEALTH_RESPONSE | TYPE_PDP_PROOF
+        | TYPE_PEX_EXCHANGE_RESPONSE | TYPE_BATCH_ACK | TYPE_CAPABILITY_RESPONSE => {
             let response = deserialize_response(raw.msg_type, &raw.payload)?;
             Ok(StreamFrame::Response { seq_id: raw.seq_id, response })
         }
@@ -97,8 +96,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 have_pieces: have_pieces.clone(),
                 max_pieces: *max_pieces,
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_PIECE_SYNC, payload))
         }
         CraftObjRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
@@ -109,8 +107,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 coefficients: coefficients.clone(),
                 data: data.clone(),
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_PIECE_PUSH, payload))
         }
         CraftObjRequest::ManifestPush { content_id, record_json } => {
@@ -118,37 +115,16 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 content_id: *content_id,
                 record_json: record_json.clone(),
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_MANIFEST_PUSH, payload))
         }
-        CraftObjRequest::PieceMapQuery { content_id, segment_index } => {
-            let inner = PieceMapQueryWire {
+        CraftObjRequest::HealthQuery { content_id, segment_index } => {
+            let inner = HealthQueryWire {
                 content_id: *content_id,
                 segment_index: *segment_index,
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
-            Ok((TYPE_PIECE_MAP_QUERY, payload))
-        }
-        CraftObjRequest::MerkleRoot { content_id, segment_index } => {
-            let inner = MerkleRootWire {
-                content_id: *content_id,
-                segment_index: *segment_index,
-            };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
-            Ok((TYPE_MERKLE_ROOT, payload))
-        }
-        CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
-            let inner = MerkleDiffWire {
-                content_id: *content_id,
-                segment_index: *segment_index,
-                since_root: *since_root,
-            };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
-            Ok((TYPE_MERKLE_DIFF, payload))
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
+            Ok((TYPE_HEALTH_QUERY, payload))
         }
         CraftObjRequest::PdpChallenge { content_id, segment_index, piece_id, nonce, byte_positions } => {
             let inner = PdpChallengeWire {
@@ -158,8 +134,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 nonce: *nonce,
                 byte_positions: byte_positions.clone(),
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_PDP_CHALLENGE, payload))
         }
         CraftObjRequest::PexExchange { payload } => {
@@ -170,8 +145,7 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
                 content_id: *content_id,
                 pieces: pieces.clone(),
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_PIECE_BATCH_PUSH, payload))
         }
         CraftObjRequest::CapabilityRequest => {
@@ -212,29 +186,12 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
                 record_json: inner.record_json,
             })
         }
-        TYPE_PIECE_MAP_QUERY => {
-            let inner: PieceMapQueryWire = bincode::deserialize(payload)
+        TYPE_HEALTH_QUERY => {
+            let inner: HealthQueryWire = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjRequest::PieceMapQuery {
+            Ok(CraftObjRequest::HealthQuery {
                 content_id: inner.content_id,
                 segment_index: inner.segment_index,
-            })
-        }
-        TYPE_MERKLE_ROOT => {
-            let inner: MerkleRootWire = bincode::deserialize(payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjRequest::MerkleRoot {
-                content_id: inner.content_id,
-                segment_index: inner.segment_index,
-            })
-        }
-        TYPE_MERKLE_DIFF => {
-            let inner: MerkleDiffWire = bincode::deserialize(payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjRequest::MerkleDiff {
-                content_id: inner.content_id,
-                segment_index: inner.segment_index,
-                since_root: inner.since_root,
             })
         }
         TYPE_PDP_CHALLENGE => {
@@ -272,38 +229,16 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
 fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> {
     match response {
         CraftObjResponse::PieceBatch { pieces } => {
-            let payload = bincode::serialize(pieces)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(pieces).map_err(io::Error::other)?;
             Ok((TYPE_PIECE_BATCH, payload))
         }
         CraftObjResponse::Ack { status } => {
-            let payload = bincode::serialize(status)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(status).map_err(io::Error::other)?;
             Ok((TYPE_ACK, payload))
         }
-        CraftObjResponse::PieceMapEntries { entries } => {
-            let payload = bincode::serialize(entries)
-                .map_err(io::Error::other)?;
-            Ok((TYPE_PIECE_MAP_ENTRIES, payload))
-        }
-        CraftObjResponse::MerkleRootResponse { root, leaf_count } => {
-            let inner = MerkleRootResponseWire {
-                root: *root,
-                leaf_count: *leaf_count,
-            };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
-            Ok((TYPE_MERKLE_ROOT_RESPONSE, payload))
-        }
-        CraftObjResponse::MerkleDiffResponse { current_root, added, removed } => {
-            let inner = MerkleDiffResponseWire {
-                current_root: *current_root,
-                added: added.clone(),
-                removed: removed.clone(),
-            };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
-            Ok((TYPE_MERKLE_DIFF_RESPONSE, payload))
+        CraftObjResponse::HealthResponse { piece_count } => {
+            let payload = bincode::serialize(piece_count).map_err(io::Error::other)?;
+            Ok((TYPE_HEALTH_RESPONSE, payload))
         }
         CraftObjResponse::PdpProof { piece_id, coefficients, challenged_bytes, proof_hash } => {
             let inner = PdpProofWire {
@@ -312,8 +247,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 challenged_bytes: challenged_bytes.clone(),
                 proof_hash: *proof_hash,
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_PDP_PROOF, payload))
         }
         CraftObjResponse::PexExchangeResponse { payload } => {
@@ -324,8 +258,7 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
                 confirmed_pieces: confirmed_pieces.clone(),
                 failed_pieces: failed_pieces.clone(),
             };
-            let payload = bincode::serialize(&inner)
-                .map_err(io::Error::other)?;
+            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_BATCH_ACK, payload))
         }
         CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region } => {
@@ -352,27 +285,10 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResp
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(CraftObjResponse::Ack { status })
         }
-        TYPE_PIECE_MAP_ENTRIES => {
-            let entries: Vec<PieceMapEntry> = bincode::deserialize(payload)
+        TYPE_HEALTH_RESPONSE => {
+            let piece_count: u32 = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjResponse::PieceMapEntries { entries })
-        }
-        TYPE_MERKLE_ROOT_RESPONSE => {
-            let inner: MerkleRootResponseWire = bincode::deserialize(payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjResponse::MerkleRootResponse {
-                root: inner.root,
-                leaf_count: inner.leaf_count,
-            })
-        }
-        TYPE_MERKLE_DIFF_RESPONSE => {
-            let inner: MerkleDiffResponseWire = bincode::deserialize(payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjResponse::MerkleDiffResponse {
-                current_root: inner.current_root,
-                added: inner.added,
-                removed: inner.removed,
-            })
+            Ok(CraftObjResponse::HealthResponse { piece_count })
         }
         TYPE_PDP_PROOF => {
             let inner: PdpProofWire = bincode::deserialize(payload)
@@ -442,35 +358,9 @@ struct RecordPushWire {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PieceMapQueryWire {
+struct HealthQueryWire {
     content_id: ContentId,
     segment_index: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MerkleRootWire {
-    content_id: ContentId,
-    segment_index: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MerkleDiffWire {
-    content_id: ContentId,
-    segment_index: u32,
-    since_root: [u8; 32],
-}
-
-#[derive(Serialize, Deserialize)]
-struct MerkleRootResponseWire {
-    root: [u8; 32],
-    leaf_count: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MerkleDiffResponseWire {
-    current_root: [u8; 32],
-    added: Vec<PieceMapEntry>,
-    removed: Vec<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -562,25 +452,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merkle_root_request_wire_roundtrip() {
-        let req = CraftObjRequest::MerkleRoot {
-            content_id: ContentId::from_bytes(b"wire-test"),
-            segment_index: 7,
+    async fn test_health_query_roundtrip() {
+        let req = CraftObjRequest::HealthQuery {
+            content_id: ContentId::from_bytes(b"health-test"),
+            segment_index: 2,
         };
 
         let mut buf = Vec::new();
-        write_request_frame(&mut futures::io::Cursor::new(&mut buf), 123, &req)
+        write_request_frame(&mut futures::io::Cursor::new(&mut buf), 77, &req)
             .await
             .unwrap();
 
         let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
         match frame {
             StreamFrame::Request { seq_id, request } => {
-                assert_eq!(seq_id, 123);
+                assert_eq!(seq_id, 77);
                 match request {
-                    CraftObjRequest::MerkleRoot { content_id, segment_index } => {
-                        assert_eq!(content_id, ContentId::from_bytes(b"wire-test"));
-                        assert_eq!(segment_index, 7);
+                    CraftObjRequest::HealthQuery { content_id: _, segment_index } => {
+                        assert_eq!(segment_index, 2);
                     }
                     _ => panic!("wrong variant"),
                 }
@@ -590,96 +479,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merkle_diff_request_wire_roundtrip() {
-        let req = CraftObjRequest::MerkleDiff {
-            content_id: ContentId::from_bytes(b"wire-test"),
-            segment_index: 8,
-            since_root: [0xAB; 32],
-        };
+    async fn test_health_response_roundtrip() {
+        let resp = CraftObjResponse::HealthResponse { piece_count: 17 };
 
         let mut buf = Vec::new();
-        write_request_frame(&mut futures::io::Cursor::new(&mut buf), 456, &req)
-            .await
-            .unwrap();
-
-        let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
-        match frame {
-            StreamFrame::Request { seq_id, request } => {
-                assert_eq!(seq_id, 456);
-                match request {
-                    CraftObjRequest::MerkleDiff { content_id, segment_index, since_root } => {
-                        assert_eq!(content_id, ContentId::from_bytes(b"wire-test"));
-                        assert_eq!(segment_index, 8);
-                        assert_eq!(since_root, [0xAB; 32]);
-                    }
-                    _ => panic!("wrong variant"),
-                }
-            }
-            _ => panic!("expected request frame"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_merkle_root_response_wire_roundtrip() {
-        let resp = CraftObjResponse::MerkleRootResponse {
-            root: [0xCD; 32],
-            leaf_count: 500,
-        };
-
-        let mut buf = Vec::new();
-        write_response_frame(&mut futures::io::Cursor::new(&mut buf), 789, &resp)
+        write_response_frame(&mut futures::io::Cursor::new(&mut buf), 88, &resp)
             .await
             .unwrap();
 
         let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
         match frame {
             StreamFrame::Response { seq_id, response } => {
-                assert_eq!(seq_id, 789);
+                assert_eq!(seq_id, 88);
                 match response {
-                    CraftObjResponse::MerkleRootResponse { root, leaf_count } => {
-                        assert_eq!(root, [0xCD; 32]);
-                        assert_eq!(leaf_count, 500);
-                    }
-                    _ => panic!("wrong variant"),
-                }
-            }
-            _ => panic!("expected response frame"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_merkle_diff_response_wire_roundtrip() {
-        use crate::PieceMapEntry;
-        
-        let piece_entry = PieceMapEntry {
-            node: vec![5, 6, 7, 8],
-            piece_id: [0x12; 32],
-            coefficients: vec![1, 0, 0, 1],
-        };
-        
-        let resp = CraftObjResponse::MerkleDiffResponse {
-            current_root: [0xEF; 32],
-            added: vec![piece_entry.clone()],
-            removed: vec![10, 20, 30],
-        };
-
-        let mut buf = Vec::new();
-        write_response_frame(&mut futures::io::Cursor::new(&mut buf), 321, &resp)
-            .await
-            .unwrap();
-
-        let frame = read_frame(&mut futures::io::Cursor::new(&buf)).await.unwrap();
-        match frame {
-            StreamFrame::Response { seq_id, response } => {
-                assert_eq!(seq_id, 321);
-                match response {
-                    CraftObjResponse::MerkleDiffResponse { current_root, added, removed } => {
-                        assert_eq!(current_root, [0xEF; 32]);
-                        assert_eq!(added.len(), 1);
-                        assert_eq!(added[0].node, piece_entry.node);
-                        assert_eq!(added[0].piece_id, piece_entry.piece_id);
-                        assert_eq!(added[0].coefficients, piece_entry.coefficients);
-                        assert_eq!(removed, vec![10, 20, 30]);
+                    CraftObjResponse::HealthResponse { piece_count } => {
+                        assert_eq!(piece_count, 17);
                     }
                     _ => panic!("wrong variant"),
                 }
