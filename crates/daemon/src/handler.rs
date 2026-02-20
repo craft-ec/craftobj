@@ -2415,11 +2415,9 @@ impl IpcHandler for CraftObjHandler {
                             notify.notify_one();
                         });
                     } else {
-                        // Fallback for non-test (CLI) usage
-                        tokio::spawn(async {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            std::process::exit(0);
-                        });
+                        // No shutdown_notify set — log warning but don't kill the process.
+                        // The caller (CraftStudio/CLI) should abort the daemon task directly.
+                        warn!("[handler.rs] Shutdown requested but no shutdown_notify set — ignoring");
                     }
                     result
                 },
