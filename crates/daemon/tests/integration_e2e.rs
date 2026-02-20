@@ -2093,7 +2093,7 @@ async fn test_large_file_transfer() -> Result<(), String> {
         let dist_start = Instant::now();
         let mut b_pieces = 0usize;
         let mut min_seg_pieces = 0usize;
-        for _ in 0..120 {  // up to 60s
+        for _ in 0..240 {  // up to 120s (100MB distribution takes ~68s + 5s initial delay)
             sleep(Duration::from_millis(500)).await;
             if let Ok(health_b) = node_b.content_health(&cid).await {
                 let seg_counts: Vec<usize> = health_b["segments"].as_array()
