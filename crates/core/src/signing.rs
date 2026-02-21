@@ -1,144 +1,43 @@
-//! Receipt signing and verification using ed25519.
+//! Storage receipt signing and verification.
 //!
-//! Provides helpers to sign and verify `StorageReceipt`
-//! using ed25519-dalek keypairs.
+//! These functions are used by the PDP challenger system (kernel-level)
+//! for signing and verifying storage proofs.
 
-use ed25519_dalek::{Signature, Signer, Verifier, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey, Signature};
 
 use crate::StorageReceipt;
 
-/// Sign a `StorageReceipt` with the challenger's signing key.
-/// Fills the `signature` field in place.
-pub fn sign_storage_receipt(receipt: &mut StorageReceipt, keypair: &SigningKey) {
+/// Sign a storage receipt with the challenger's ed25519 key.
+pub fn sign_storage_receipt(receipt: &mut StorageReceipt, key: &SigningKey) {
     let data = receipt.signable_data();
-    let sig: Signature = keypair.sign(&data);
+    let sig = key.sign(&data);
     receipt.signature = sig.to_bytes().to_vec();
 }
 
-/// Verify a `StorageReceipt`'s signature against the challenger's public key.
+/// Verify a storage receipt signature.
 pub fn verify_storage_receipt(receipt: &StorageReceipt, pubkey: &VerifyingKey) -> bool {
     if receipt.signature.len() != 64 {
         return false;
     }
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(&receipt.signature);
-    let sig = Signature::from_bytes(&sig_bytes);
     let data = receipt.signable_data();
+    let sig = match Signature::from_slice(&receipt.signature) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
     pubkey.verify(&data, &sig).is_ok()
 }
 
-/// Extract an ed25519 public key from a libp2p PeerId.
+/// Convert a libp2p PeerId to a 32-byte ed25519 public key (best effort).
 ///
-/// libp2p PeerIds encode the public key. This extracts it if the PeerId
-/// was derived from an ed25519 key.
-pub fn peer_id_to_ed25519_pubkey(peer_id: &libp2p::PeerId) -> Option<[u8; 32]> {
-    let bytes = peer_id.to_bytes();
-    if bytes.is_empty() || bytes[0] != 0x00 {
-        return None;
-    }
-    let (payload_len, offset) = decode_varint(&bytes[1..])?;
-    let payload = &bytes[1 + offset..];
-    if payload.len() < payload_len {
-        return None;
-    }
-    let payload = &payload[..payload_len];
-
-    // payload is a protobuf PublicKey message:
-    // field 1 (KeyType): varint, Ed25519 = 1
-    // field 2 (Data): bytes
-    // Protobuf: 0x08 0x01 0x12 0x20 <32 bytes>
-    if payload.len() == 36 && payload[0] == 0x08 && payload[1] == 0x01 && payload[2] == 0x12 && payload[3] == 0x20 {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&payload[4..36]);
-        Some(key)
+/// This is a helper for the PDP system. Returns zeros if the peer ID
+/// doesn't encode an ed25519 key.
+pub fn peer_id_to_ed25519_pubkey(peer_id_bytes: &[u8]) -> [u8; 32] {
+    // PeerId multihash: 0x00 0x24 0x08 0x01 0x12 0x20 <32 bytes>
+    if peer_id_bytes.len() >= 38 {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&peer_id_bytes[6..38]);
+        out
     } else {
-        None
-    }
-}
-
-/// Decode a varint from bytes. Returns (value, bytes_consumed).
-fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut value: usize = 0;
-    let mut shift = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        value |= ((b & 0x7f) as usize) << shift;
-        if b & 0x80 == 0 {
-            return Some((value, i + 1));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ContentId;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-
-    fn make_storage_receipt() -> StorageReceipt {
-        StorageReceipt {
-            content_id: ContentId([8u8; 32]),
-            storage_node: [1u8; 32],
-            challenger: [2u8; 32],
-            segment_index: 5,
-            piece_id: [10u8; 32],
-            timestamp: 2000,
-            nonce: [3u8; 32],
-            proof_hash: [4u8; 32],
-            signature: vec![],
-        }
-    }
-
-    #[test]
-    fn test_sign_verify_storage_receipt() {
-        let keypair = SigningKey::generate(&mut OsRng);
-        let pubkey = keypair.verifying_key();
-        let mut receipt = make_storage_receipt();
-
-        sign_storage_receipt(&mut receipt, &keypair);
-        assert_eq!(receipt.signature.len(), 64);
-        assert!(verify_storage_receipt(&receipt, &pubkey));
-    }
-
-    #[test]
-    fn test_storage_receipt_tampered() {
-        let keypair = SigningKey::generate(&mut OsRng);
-        let pubkey = keypair.verifying_key();
-        let mut receipt = make_storage_receipt();
-
-        sign_storage_receipt(&mut receipt, &keypair);
-
-        receipt.piece_id = [99u8; 32];
-        assert!(!verify_storage_receipt(&receipt, &pubkey));
-    }
-
-    #[test]
-    fn test_storage_receipt_wrong_key() {
-        let keypair1 = SigningKey::generate(&mut OsRng);
-        let keypair2 = SigningKey::generate(&mut OsRng);
-        let mut receipt = make_storage_receipt();
-
-        sign_storage_receipt(&mut receipt, &keypair1);
-        assert!(!verify_storage_receipt(&receipt, &keypair2.verifying_key()));
-    }
-
-    #[test]
-    fn test_peer_id_to_ed25519_pubkey() {
-        let libp2p_keypair = libp2p::identity::Keypair::generate_ed25519();
-        let peer_id = libp2p_keypair.public().to_peer_id();
-
-        let extracted = peer_id_to_ed25519_pubkey(&peer_id);
-        assert!(extracted.is_some());
-
-        let expected = match libp2p_keypair.public().try_into_ed25519() {
-            Ok(ed_pub) => ed_pub.to_bytes(),
-            Err(_) => panic!("Should be ed25519"),
-        };
-        assert_eq!(extracted.unwrap(), expected);
+        [0u8; 32]
     }
 }

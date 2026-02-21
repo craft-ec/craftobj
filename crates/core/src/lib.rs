@@ -3,11 +3,10 @@
 //! Content types and protocol primitives for CraftObj:
 //! content-addressed distributed storage with RLNC erasure coding.
 
-pub mod access;
-pub mod economics;
-pub mod payment_channel;
-pub mod pre;
+// NOTE: access, economics, payment_channel, pre modules
+// removed from kernel — these are COM/SQL layer concerns.
 pub mod signing;
+
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,16 +54,92 @@ pub const SEGMENT_SIZE: usize = 10_485_760;
 /// Fixed piece size for RLNC erasure coding (256 KB).
 pub const PIECE_SIZE: usize = 262_144;
 
-/// Lightweight content record replacing the old manifest.
+// ---------------------------------------------------------------------------
+// Redundancy formula: derived from binomial analysis at 30% churn
+// ---------------------------------------------------------------------------
+
+/// Base redundancy multiplier for a given k.
+/// `redundancy(k) = 2.0 + 16.0 / k` — provides ~8-9 nines of durability at 30% churn.
+/// k=1 → 18×, k=40 → 2.4×.
+pub fn redundancy(k: u32) -> f64 {
+    2.0 + 16.0 / k as f64
+}
+
+/// Base target piece count for a segment: `ceil(k × redundancy(k))`.
+///
+/// This is the kernel-level target. Economic tiers (multipliers) are
+/// applied by the COM layer on top — not part of the kernel.
+pub fn target_piece_count(k: u32) -> u32 {
+    (k as f64 * redundancy(k)).ceil() as u32
+}
+
+// ---------------------------------------------------------------------------
+// Self-describing piece header
+// ---------------------------------------------------------------------------
+
+/// Self-describing piece header — every piece carries its own metadata.
+///
+/// Two orthogonal axes:
+/// - `k` → redundancy target via `redundancy(k) = 2.0 + 16/k`
+/// - `vtags_cid` → strategy discriminator:
+///   - `Some(cid)` → erasure extension + vtag verification
+///   - `None` → replication + hash verification
+///
+/// With `total_size` included, pieces are fully self-describing —
+/// no manifest needed for reconstruction or health scanning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PieceHeader {
+    pub content_id: ContentId,
+    pub total_size: u64,
+    pub segment_idx: u32,
+    pub segment_count: u32,
+    pub k: u32,
+    /// `Some` = erasure-coded content (verify via vtags), `None` = replicated raw object (verify via hash).
+    pub vtags_cid: Option<[u8; 32]>,
+    pub coefficients: Vec<u8>,
+}
+
+impl PieceHeader {
+    /// Compute piece_id: SHA-256 of the coefficient vector.
+    pub fn piece_id(&self) -> [u8; 32] {
+        let hash = Sha256::digest(&self.coefficients);
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&hash);
+        id
+    }
+
+    /// Whether this piece uses erasure extension (vtag-verified) or replication (hash-verified).
+    pub fn is_erasure(&self) -> bool {
+        self.vtags_cid.is_some()
+    }
+
+    /// Size of a full segment (all segments except possibly the last).
+    pub fn full_segment_size(&self) -> usize {
+        SEGMENT_SIZE
+    }
+
+    /// Size of the last segment (may be smaller than SEGMENT_SIZE).
+    pub fn last_segment_size(&self) -> usize {
+        let full_segs = if self.segment_count > 1 { self.segment_count - 1 } else { 0 };
+        self.total_size as usize - full_segs as usize * SEGMENT_SIZE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content record — optional cached summary (same data lives in piece headers)
+// ---------------------------------------------------------------------------
+
+/// Cached content summary. Not required for reconstruction or health scanning —
+/// piece headers are authoritative. This is kept for convenience (e.g. listing
+/// content without scanning all pieces).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentRecord {
     pub content_id: ContentId,
     pub total_size: u64,
+    /// CID of the vtags object for homomorphic piece verification.
+    /// `None` for non-content objects (vtag blobs, manifests, SQL pages).
     #[serde(default)]
-    pub creator: String,
-    #[serde(default)]
-    pub signature: Vec<u8>,
-    pub verification: craftec_erasure::ContentVerificationRecord,
+    pub vtags_cid: Option<[u8; 32]>,
 }
 
 /// Backwards-compat alias.
@@ -92,41 +167,6 @@ impl ContentRecord {
     }
     pub fn segment_size(&self) -> usize { SEGMENT_SIZE }
     pub fn piece_size(&self) -> usize { PIECE_SIZE }
-    pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.content_id.0);
-        data.extend_from_slice(&self.total_size.to_le_bytes());
-        data.extend_from_slice(self.creator.as_bytes());
-        let vr_bytes = bincode::serialize(&self.verification).unwrap_or_default();
-        let vr_hash = sha2::Sha256::digest(&vr_bytes);
-        data.extend_from_slice(&vr_hash);
-        data
-    }
-    pub fn sign(&mut self, keypair: &ed25519_dalek::SigningKey) {
-        use ed25519_dalek::Signer;
-        let pubkey = keypair.verifying_key();
-        self.creator = format!("did:craftec:{}", hex::encode(pubkey.to_bytes()));
-        let data = self.signable_data();
-        let sig = keypair.sign(&data);
-        self.signature = sig.to_bytes().to_vec();
-    }
-    pub fn verify_creator(&self) -> bool {
-        if self.creator.is_empty() || self.signature.len() != 64 { return false; }
-        let pubkey_bytes = match extract_pubkey_from_did(&self.creator) {
-            Some(b) => b, None => return false,
-        };
-        let pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
-            Ok(k) => k, Err(_) => return false,
-        };
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&self.signature);
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        let data = self.signable_data();
-        pubkey.verify_strict(&data, &sig).is_ok()
-    }
-    pub fn creator_pubkey(&self) -> Option<[u8; 32]> {
-        extract_pubkey_from_did(&self.creator)
-    }
 }
 
 /// Extract ed25519 public key bytes from a `did:craftec:<hex>` string.
@@ -146,78 +186,9 @@ pub fn did_from_pubkey(pubkey: &ed25519_dalek::VerifyingKey) -> String {
     format!("did:craftec:{}", hex::encode(pubkey.to_bytes()))
 }
 
-/// Content removal notice — signed by the creator to request removal of content.
-///
-/// Stored in the DHT so storage nodes can check before serving.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemovalNotice {
-    /// Content ID to remove.
-    pub cid: ContentId,
-    /// Creator's DID string (must match the manifest's creator).
-    pub creator: String,
-    /// Unix timestamp (seconds) when the removal was requested.
-    pub timestamp: u64,
-    /// Optional reason for removal.
-    pub reason: Option<String>,
-    /// Creator's ed25519 signature over the notice (excluding this field).
-    pub signature: Vec<u8>,
-}
+// NOTE: RemovalNotice removed from kernel — content removal is an economic
+// concern (COM layer). Storage naturally degrades via HealthScan when unfunded.
 
-impl RemovalNotice {
-    /// Data to sign: all fields except signature.
-    pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.cid.0);
-        data.extend_from_slice(self.creator.as_bytes());
-        data.extend_from_slice(&self.timestamp.to_le_bytes());
-        if let Some(ref reason) = self.reason {
-            data.extend_from_slice(reason.as_bytes());
-        }
-        data
-    }
-
-    /// Create and sign a removal notice.
-    pub fn sign(keypair: &ed25519_dalek::SigningKey, cid: ContentId, reason: Option<String>) -> Self {
-        use ed25519_dalek::Signer;
-        let pubkey = keypair.verifying_key();
-        let creator = format!("did:craftec:{}", hex::encode(pubkey.to_bytes()));
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut notice = Self {
-            cid,
-            creator,
-            timestamp,
-            reason,
-            signature: vec![],
-        };
-        let data = notice.signable_data();
-        let sig = keypair.sign(&data);
-        notice.signature = sig.to_bytes().to_vec();
-        notice
-    }
-
-    /// Verify the signature on this removal notice.
-    pub fn verify(&self) -> bool {
-        if self.signature.len() != 64 {
-            return false;
-        }
-        let pubkey_bytes = match extract_pubkey_from_did(&self.creator) {
-            Some(b) => b,
-            None => return false,
-        };
-        let pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
-            Ok(k) => k,
-            Err(_) => return false,
-        };
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&self.signature);
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        let data = self.signable_data();
-        pubkey.verify_strict(&data, &sig).is_ok()
-    }
-}
 
 /// Options for publishing content.
 #[derive(Debug, Clone, Default)]
@@ -319,14 +290,9 @@ pub const RECORD_DHT_PREFIX: &str = "/craftobj/manifest/";
 /// DHT key prefix for peer pubkey → PeerId records.
 pub const PEERS_DHT_PREFIX: &str = "/craftobj/peers/";
 
-/// DHT key prefix for access lists (per CID).
-pub const ACCESS_DHT_PREFIX: &str = "/craftobj/access/";
+// NOTE: ACCESS_DHT_PREFIX, REKEY_DHT_PREFIX, REMOVAL_DHT_PREFIX removed
+// — access control, PRE, and content removal are COM layer concerns.
 
-/// DHT key prefix for re-encryption keys (per CID + recipient DID).
-pub const REKEY_DHT_PREFIX: &str = "/craftobj/rekey/";
-
-/// DHT key prefix for content removal notices.
-pub const REMOVAL_DHT_PREFIX: &str = "/craftobj/removal/";
 
 /// Event-sourced piece tracking event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,11 +804,11 @@ mod tests {
             peer_id: vec![1, 2],
             capabilities: vec![CraftObjCapability::Storage, CraftObjCapability::Client],
             timestamp: 100,
-            signature: vec![],
             storage_committed_bytes: 0,
             storage_used_bytes: 0,
             region: None,
             storage_root: [0u8; 32],
+            signature: vec![],
         };
         let data = ann.signable_data();
         assert_eq!(data.len(), 60); // 2 (peer_id) + 2 (caps) + 8 (ts) + 8 + 8 + 32 (storage_root)
@@ -861,12 +827,7 @@ mod tests {
         let manifest = ContentRecord {
             content_id: cid,
             total_size: 1024,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1024,
-                segment_hashes: vec![],
-            },
+            vtags_cid: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: ContentManifest = serde_json::from_str(&json).unwrap();
@@ -879,142 +840,15 @@ mod tests {
         let manifest = ContentRecord {
             content_id: ContentId([0u8; 32]),
             total_size: 10_485_760,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 10_485_760,
-                segment_hashes: vec![],
-            },
+            vtags_cid: None,
         };
         assert_eq!(manifest.k(), SEGMENT_SIZE / PIECE_SIZE);
     }
 
-    #[test]
-    fn test_content_manifest_sign_verify() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
+    // NOTE: test_content_manifest_sign_verify, test_content_manifest_wrong_key_fails,
+    // test_content_manifest_unsigned_verify_false removed — signing moved to COM layer.
 
-        let keypair = SigningKey::generate(&mut OsRng);
-        let cid = ContentId::from_bytes(b"signed manifest test");
-        let mut manifest = ContentRecord {
-            content_id: cid,
-            total_size: 2048,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 2048,
-                segment_hashes: vec![],
-            },
-        };
-
-        manifest.sign(&keypair);
-        assert!(!manifest.creator.is_empty());
-        assert_eq!(manifest.signature.len(), 64);
-        assert!(manifest.verify_creator());
-
-        // Tamper → invalid
-        manifest.total_size = 9999;
-        assert!(!manifest.verify_creator());
-    }
-
-    #[test]
-    fn test_content_manifest_wrong_key_fails() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let keypair1 = SigningKey::generate(&mut OsRng);
-        let keypair2 = SigningKey::generate(&mut OsRng);
-        let cid = ContentId::from_bytes(b"wrong key test");
-        let mut manifest = ContentRecord {
-            content_id: cid,
-            total_size: 1024,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1024,
-                segment_hashes: vec![],
-            },
-        };
-
-        manifest.sign(&keypair1);
-        manifest.creator = did_from_pubkey(&keypair2.verifying_key());
-        assert!(!manifest.verify_creator());
-    }
-
-    #[test]
-    fn test_content_manifest_unsigned_verify_false() {
-        let cid = ContentId::from_bytes(b"unsigned");
-        let manifest = ContentRecord {
-            content_id: cid,
-            total_size: 1024,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1024,
-                segment_hashes: vec![],
-            },
-        };
-        assert!(!manifest.verify_creator());
-    }
-
-    #[test]
-    fn test_removal_notice_sign_verify() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let keypair = SigningKey::generate(&mut OsRng);
-        let cid = ContentId::from_bytes(b"remove me");
-
-        let notice = RemovalNotice::sign(&keypair, cid, Some("test removal".into()));
-        assert!(notice.verify());
-        assert_eq!(notice.cid, cid);
-        assert!(notice.reason.as_deref() == Some("test removal"));
-    }
-
-    #[test]
-    fn test_removal_notice_tampered() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let keypair = SigningKey::generate(&mut OsRng);
-        let cid = ContentId::from_bytes(b"tamper test");
-
-        let mut notice = RemovalNotice::sign(&keypair, cid, None);
-        assert!(notice.verify());
-
-        notice.timestamp += 1;
-        assert!(!notice.verify());
-    }
-
-    #[test]
-    fn test_removal_notice_wrong_creator() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let keypair1 = SigningKey::generate(&mut OsRng);
-        let keypair2 = SigningKey::generate(&mut OsRng);
-        let cid = ContentId::from_bytes(b"wrong creator");
-
-        let mut notice = RemovalNotice::sign(&keypair1, cid, None);
-        notice.creator = did_from_pubkey(&keypair2.verifying_key());
-        assert!(!notice.verify());
-    }
-
-    #[test]
-    fn test_removal_notice_bincode_roundtrip() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let keypair = SigningKey::generate(&mut OsRng);
-        let cid = ContentId::from_bytes(b"bincode test");
-        let notice = RemovalNotice::sign(&keypair, cid, Some("reason".into()));
-
-        let bytes = bincode::serialize(&notice).unwrap();
-        let parsed: RemovalNotice = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(parsed.cid, notice.cid);
-        assert_eq!(parsed.creator, notice.creator);
-        assert!(parsed.verify());
-    }
+    // NOTE: RemovalNotice tests removed — removal is COM layer concern.
 
     #[test]
     fn test_health_snapshot_serde() {
