@@ -37,18 +37,12 @@ const SCALING_CHECK_INTERVAL_SECS: u64 = 30;
 const SCALING_COOLDOWN_SECS: u64 = 300; // 5 minutes
 
 /// Tracks fetch request rates per CID to detect demand.
+#[derive(Default)]
 pub struct DemandTracker {
     /// Fetch timestamps per content ID.
     fetches: HashMap<ContentId, Vec<Instant>>,
 }
 
-impl Default for DemandTracker {
-    fn default() -> Self {
-        Self {
-            fetches: HashMap::new(),
-        }
-    }
-}
 
 impl DemandTracker {
     pub fn new() -> Self {
@@ -206,7 +200,7 @@ pub async fn run_local_scaling_loop(
             };
 
             // ── 2. Find a segment with enough local pieces for recombination ─
-            let (best_segment, existing_pieces) = {
+            let (best_segment, existing_pieces, seg_count_val, total_size_val, k_val, vtags_val) = {
                 let store_guard = store.lock().await;
                 let manifest = match store_guard.get_record(cid) {
                     Ok(m) => m,
@@ -215,6 +209,9 @@ pub async fn run_local_scaling_loop(
                         continue;
                     }
                 };
+                let seg_count_val = manifest.segment_count() as u32;
+                let total_size_val = manifest.total_size;
+                let vtags_val = manifest.vtags_cid;
 
                 let mut best: Option<(u32, Vec<craftec_erasure::CodedPiece>)> = None;
                 for seg in 0..manifest.segment_count() as u32 {
@@ -222,7 +219,7 @@ pub async fn run_local_scaling_loop(
                     if piece_ids.len() < 2 {
                         continue;
                     }
-                    if best.as_ref().map_or(true, |(_, p)| piece_ids.len() > p.len()) {
+                    if best.as_ref().is_none_or(|(_, p)| piece_ids.len() > p.len()) {
                         let mut coded = Vec::new();
                         for pid in &piece_ids {
                             if let Ok((data, coeff)) = store_guard.get_piece(cid, seg, pid) {
@@ -235,7 +232,10 @@ pub async fn run_local_scaling_loop(
                     }
                 }
                 match best {
-                    Some(b) => b,
+                    Some((seg, pieces)) => {
+                        let k_val = manifest.k_for_segment(seg as usize) as u32;
+                        (seg, pieces, seg_count_val, total_size_val, k_val, vtags_val)
+                    }
                     None => {
                         debug!("[scaling] {} has no segments with ≥2 local pieces", cid);
                         continue;
@@ -262,9 +262,14 @@ pub async fn run_local_scaling_loop(
 
             let payload = craftobj_transfer::PiecePayload {
                 segment_index: best_segment,
+                segment_count: seg_count_val,
+                total_size: total_size_val,
+                k: k_val,
+                vtags_cid: vtags_val,
                 piece_id: new_pid,
                 coefficients: new_piece.coefficients,
                 data: new_piece.data,
+                vtag_blob: None,
             };
 
             let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();

@@ -298,6 +298,36 @@ impl ChallengerManager {
                             continue;
                         }
 
+                        // Coefficient commitment cross-check: piece_id == SHA-256(coefficients).
+                        // This is the GF(2^8) identity that binds the coefficient vector to its
+                        // piece identity — a peer cannot substitute or tamper with coefficients
+                        // without breaking this check.
+                        let coeff_valid = {
+                            use sha2::{Digest, Sha256};
+                            let computed: [u8; 32] = Sha256::digest(&coefficients).into();
+                            computed == returned_piece_id
+                        };
+
+                        if !coeff_valid {
+                            warn!(
+                                "PDP challenge to {} for segment {} failed: coefficient commitment mismatch \
+                                 (SHA-256(coeff) != piece_id) — possible data tampering",
+                                peer, segment_index
+                            );
+                            pdp_results.push(ProviderPdpResult {
+                                peer_id: peer,
+                                segment_index,
+                                piece_id: returned_piece_id,
+                                coefficients,
+                                passed: false,
+                                receipt: None,
+                            });
+                            if let Some(ref scorer) = self.peer_scorer {
+                                scorer.lock().await.record_pdp_failure(&peer);
+                            }
+                            continue;
+                        }
+
                         // Verify the PDP proof using cross-verification with our own pieces
                         // For now, we'll just verify that we received a valid response with correct hash
                         // Full cross-verification would require reconstructing the piece data from challenged bytes,
@@ -355,6 +385,26 @@ impl ChallengerManager {
                     }
                 }
             }
+        }
+
+        // PDP failure → immediate repair trigger.
+        // For each segment where any provider failed the challenge, send TriggerRepair
+        // so the daemon runs scan_segment immediately without waiting for the next
+        // scheduled HealthScan cycle.
+        let failed_segments: std::collections::HashSet<u32> = pdp_results
+            .iter()
+            .filter(|r| !r.passed)
+            .map(|r| r.segment_index)
+            .collect();
+        for seg in &failed_segments {
+            warn!(
+                "PDP failure for {}/seg{} — triggering immediate repair scan",
+                cid, seg
+            );
+            let _ = self.command_tx.send(CraftObjCommand::TriggerRepair {
+                content_id: cid,
+                failed_segment: Some(*seg),
+            });
         }
 
         let round_result = PdpRoundResult {

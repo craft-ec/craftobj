@@ -8,7 +8,7 @@
 pub mod aggregator;
 pub mod api_key;
 pub mod challenger;
-pub mod channel_store;
+
 pub mod config;
 pub mod content_tracker;
 pub mod events;
@@ -32,7 +32,7 @@ pub mod reannounce;
 pub mod push_target;
 pub mod receipt_store;
 pub mod scaling;
-pub mod removal_cache;
+pub mod piece_map;
 pub mod service;
 pub mod settlement;
 pub mod stream_manager;

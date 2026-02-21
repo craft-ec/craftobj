@@ -65,6 +65,7 @@ pub async fn build_craftobj_swarm(
     info!("Local peer ID: {}", local_peer_id);
 
     let protocol_prefix = config.protocol_prefix.clone();
+    let secondary_prefix = config.secondary_protocol_prefix.clone();
     let enable_mdns = config.enable_mdns;
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -77,7 +78,11 @@ pub async fn build_craftobj_swarm(
         .with_relay_client(noise::Config::new, yamux_config)?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = PeerId::from(key.public());
-            let craft = CraftBehaviour::build_with_options(&protocol_prefix, peer_id, key, relay_behaviour, enable_mdns)?;
+            let craft = if let Some(ref sec) = secondary_prefix {
+                CraftBehaviour::build_dual_kad(&protocol_prefix, sec, peer_id, key, relay_behaviour, enable_mdns)?
+            } else {
+                CraftBehaviour::build_with_options(&protocol_prefix, peer_id, key, relay_behaviour, enable_mdns)?
+            };
             let stream = libp2p_stream::Behaviour::new();
 
             Ok(CraftObjBehaviour { craft, stream })

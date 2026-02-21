@@ -481,13 +481,7 @@ pub fn create_signed_storage_receipt(
 /// Extract a 32-byte public key from a PeerId (best-effort, zero-padded).
 pub fn peer_id_to_local_pubkey(peer_id: &PeerId) -> [u8; 32] {
     use craftobj_core::signing::peer_id_to_ed25519_pubkey;
-    peer_id_to_ed25519_pubkey(peer_id).unwrap_or_else(|| {
-        let bytes = peer_id.to_bytes();
-        let mut key = [0u8; 32];
-        let len = bytes.len().min(32);
-        key[..len].copy_from_slice(&bytes[..len]);
-        key
-    })
+    peer_id_to_ed25519_pubkey(&peer_id.to_bytes())
 }
 
 // ---------------------------------------------------------------------------

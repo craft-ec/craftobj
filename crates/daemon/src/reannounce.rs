@@ -14,6 +14,7 @@ use crate::commands::CraftObjCommand;
 use crate::content_tracker::ContentTracker;
 use crate::events::{DaemonEvent, EventSender};
 use crate::peer_scorer::PeerScorer;
+use crate::scaling::DemandTracker;
 
 pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
@@ -24,6 +25,7 @@ pub async fn content_maintenance_loop(
     interval_secs: u64,
     event_tx: EventSender,
     peer_scorer: Arc<Mutex<PeerScorer>>,
+    demand_tracker: Arc<Mutex<DemandTracker>>,
 ) {
     use std::time::Duration;
     tokio::time::sleep(Duration::from_secs(15)).await;
@@ -31,7 +33,7 @@ pub async fn content_maintenance_loop(
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
-        run_maintenance_cycle(&tracker, &command_tx, &client, &event_tx, &peer_scorer).await;
+        run_maintenance_cycle(&tracker, &command_tx, &client, &event_tx, &peer_scorer, &demand_tracker).await;
     }
 }
 
@@ -41,6 +43,7 @@ pub async fn run_maintenance_cycle(
     client: &Arc<Mutex<CraftObjClient>>,
     event_tx: &EventSender,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
+    demand_tracker: &Arc<Mutex<DemandTracker>>,
 ) {
     info!("[reannounce.rs] Content maintenance cycle starting");
 
@@ -76,8 +79,8 @@ pub async fn run_maintenance_cycle(
         run_initial_push(cid, tracker, command_tx, client, peer_scorer, event_tx).await;
     }
 
-    // Equalization (Function 2) — for content that has completed initial push
-    equalize_pressure(tracker, command_tx, client, peer_scorer, event_tx).await;
+    // Equalization (Function 2) — demand-gated push to new providers
+    equalize_pressure(tracker, command_tx, client, peer_scorer, event_tx, demand_tracker).await;
 
     // Check providers for announced content
     for content_id in &needs_announce {
@@ -113,7 +116,7 @@ async fn reannounce_content(
     let cmd = CraftObjCommand::AnnounceProvider {
         content_id: *content_id,
         manifest,
-        verification_record: None,
+        
         reply_tx,
     };
 
@@ -294,6 +297,7 @@ pub async fn run_initial_push(
     for (peer, piece_refs) in peer_piece_indices {
         let command_tx_clone = command_tx.clone();
         let client_clone = client.clone();
+        let manifest_clone = manifest.clone();
 
         peer_futures.push(tokio::spawn(async move {
             // Read all pieces from store
@@ -314,9 +318,14 @@ pub async fn run_initial_push(
                 };
                 payloads.push(craftobj_transfer::PiecePayload {
                     segment_index: *seg_idx,
+                    segment_count: manifest_clone.segment_count() as u32,
+                    total_size: manifest_clone.total_size,
+                    k: manifest_clone.k_for_segment(*seg_idx as usize) as u32,
+                    vtags_cid: manifest_clone.vtags_cid,
                     piece_id: *piece_id,
                     coefficients,
                     data: piece_data,
+                    vtag_blob: None,
                 });
             }
 
@@ -403,6 +412,8 @@ pub async fn run_initial_push(
         for (retry_peer, piece_refs) in retry_peer_pieces {
             let command_tx_clone = command_tx.clone();
             let client_clone = client.clone();
+            let seg_count = manifest.segment_count() as u32;
+            let manifest_for_retry = manifest.clone();
             retry_futures.push(tokio::spawn(async move {
                 let mut payloads = Vec::new();
                 for (seg_idx, piece_id) in &piece_refs {
@@ -415,9 +426,14 @@ pub async fn run_initial_push(
                     };
                     payloads.push(craftobj_transfer::PiecePayload {
                         segment_index: *seg_idx,
+                        segment_count: seg_count,
+                        total_size: manifest_for_retry.total_size,
+                        k: manifest_for_retry.k_for_segment(*seg_idx as usize) as u32,
+                        vtags_cid: manifest_for_retry.vtags_cid,
                         piece_id: *piece_id,
                         coefficients,
                         data,
+                        vtag_blob: None,
                     });
                 }
                 if payloads.is_empty() { return 0usize; }
@@ -456,21 +472,13 @@ pub async fn run_initial_push(
         });
     }
 
-    // Only mark initial push done and delete local pieces if ALL pieces were pushed successfully.
-    // If partial, keep retrying next cycle.
+    // Mark initial push done once ALL pieces are distributed.
+    // Publisher retains local pieces — it is a storage node too.
+    // Equalization is the path that moves pieces; we do not delete here.
     if total_pushed == total_pieces {
-        {
-            let mut t = tracker.lock().await;
-            t.mark_initial_push_done(content_id);
-        }
-
-        // Publisher is a client, not a storage node. Delete local pieces after full distribution.
-        let c = client.lock().await;
-        if let Err(e) = c.store().delete_content(content_id) {
-            warn!("[reannounce.rs] Failed to clean up publisher pieces for {}: {}", content_id, e);
-        } else {
-            info!("[reannounce.rs] Publisher cleanup: deleted local pieces for {} after distributing all {} pieces", content_id, total_pushed);
-        }
+        let mut t = tracker.lock().await;
+        t.mark_initial_push_done(content_id);
+        info!("[reannounce.rs] Initial push complete for {}: distributed {}/{} pieces", content_id, total_pushed, total_pieces);
     } else {
         info!("[reannounce.rs] Initial push for {}: partial ({}/{}), will retry next cycle", content_id, total_pushed, total_pieces);
     }
@@ -485,6 +493,7 @@ async fn equalize_pressure(
     client: &Arc<Mutex<CraftObjClient>>,
     peer_scorer: &Arc<Mutex<PeerScorer>>,
     event_tx: &EventSender,
+    demand_tracker: &Arc<Mutex<DemandTracker>>,
 ) {
     let storage_peers: Vec<libp2p::PeerId> = {
         let scorer = peer_scorer.lock().await;
@@ -505,6 +514,17 @@ async fn equalize_pressure(
     };
 
     for content_id in needs_equalize {
+        // Demand gate: only push to new providers when there is active local demand.
+        // No demand → no scaling. Demand + new provider available → push.
+        let has_demand = {
+            let dt = demand_tracker.lock().await;
+            dt.has_demand(&content_id)
+        };
+        if !has_demand {
+            debug!("Equalization for {}: no local demand — skipping push", content_id);
+            continue;
+        }
+
         // Find peers that do NOT already have this CID
         let existing_providers: std::collections::HashSet<libp2p::PeerId> = {
             let t = tracker.lock().await;
@@ -582,9 +602,14 @@ async fn equalize_pressure(
             };
             peer_payloads.entry(peer).or_default().push(craftobj_transfer::PiecePayload {
                 segment_index: *seg,
+                segment_count: manifest.segment_count() as u32,
+                total_size: manifest.total_size,
+                k: manifest.k_for_segment(*seg as usize) as u32,
+                vtags_cid: manifest.vtags_cid,
                 piece_id: *pid,
                 coefficients,
                 data: piece_data,
+                vtag_blob: None,
             });
         }
 
@@ -617,12 +642,17 @@ async fn equalize_pressure(
 
         if total_pushed > 0 {
             debug!("Equalization: pushed {} pieces for {} to {} peers", total_pushed, content_id, candidates.len());
-            let _ = event_tx.send(DaemonEvent::ContentDistributed {
+            let _ = event_tx.send(DaemonEvent::ScalingPush {
                 content_id: content_id.to_hex(),
                 pieces_pushed: total_pushed,
-                total_pieces: total_pushed,
-                target_peers: candidates.len(),
+                new_providers: candidates.len(),
             });
+            // Mark equalized so we don't re-push this CID for another cooldown period.
+            {
+                let mut t = tracker.lock().await;
+                t.mark_equalized(&content_id);
+                t.save();
+            }
         }
     }
 }

@@ -112,6 +112,21 @@ where
                 let mut failed = Vec::new();
 
                 let store_guard = store.lock().await;
+                // Auto-create manifest from first piece header if we don't have one
+                if store_guard.get_record(&content_id).is_err() {
+                    if let Some(first) = pieces.first() {
+                        let manifest = craftobj_core::ContentManifest {
+                            content_id,
+                            total_size: first.total_size,
+                            vtags_cid: first.vtags_cid,
+                        };
+                        if let Err(e) = store_guard.store_record(&manifest) {
+                            warn!("[{}] failed to auto-create manifest: {}", label, e);
+                        } else {
+                            info!("[{}] auto-created manifest for {} from piece header", label, content_id);
+                        }
+                    }
+                }
                 for piece in &pieces {
                     match store_guard.store_piece(
                         &content_id,
@@ -188,9 +203,14 @@ pub async fn read_pieces_from_store(
             Ok((data, coefficients)) => {
                 pieces.push(PiecePayload {
                     segment_index,
+                    segment_count: store_guard.get_record(content_id).map(|m| m.segment_count() as u32).unwrap_or(0),
+                    total_size: store_guard.get_record(content_id).map(|m| m.total_size).unwrap_or(0),
+                    k: store_guard.get_record(content_id).map(|m| m.k_for_segment(segment_index as usize) as u32).unwrap_or(0),
+                    vtags_cid: store_guard.get_record(content_id).ok().and_then(|m| m.vtags_cid),
                     piece_id: pid,
                     coefficients,
                     data,
+                    vtag_blob: None,
                 });
             }
             Err(e) => debug!("Failed to read piece {}: {}", hex::encode(&pid[..4]), e),

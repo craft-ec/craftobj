@@ -63,6 +63,10 @@ pub enum DaemonEvent {
     MaintenanceCycleStarted { content_count: usize, needs_announce: usize, needs_distribute: usize },
     MaintenanceCycleCompleted { announced: usize, distributed: usize, next_run_secs: u64 },
 
+    // -- Scaling / equalization --
+    /// Emitted when demand-gated equalization pushes pieces to a new provider.
+    ScalingPush { content_id: String, pieces_pushed: usize, new_providers: usize },
+
     // -- PDP --
     ChallengerRoundCompleted { rounds: u32 },
 
@@ -87,6 +91,12 @@ pub enum DaemonEvent {
 
     // -- Aggregation --
     AggregationComplete { receipt_count: usize, merkle_root: String },
+
+    // -- Repair --
+    /// Emitted when HealthScan starts a repair for a segment (erasure or replication).
+    RepairStarted { content_id: String, segment: u32, strategy: String },
+    /// Emitted when a repair attempt finishes.
+    RepairCompleted { content_id: String, segment: u32, pieces_generated: usize, success: bool },
 }
 
 pub type EventSender = broadcast::Sender<DaemonEvent>;

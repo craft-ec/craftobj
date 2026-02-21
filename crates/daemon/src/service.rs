@@ -9,6 +9,9 @@ use craftec_ipc::IpcServer;
 use craftec_network::NetworkConfig;
 use craftobj_client::CraftObjClient;
 use craftobj_core::{ContentId, ContentManifest, CraftObjCapability, WireStatus};
+
+/// Default max peer connections.
+const MAX_PEER_CONNECTIONS: usize = 50;
 use craftobj_transfer::{CraftObjRequest, CraftObjResponse};
 use libp2p::identity::Keypair;
 use tokio::sync::{mpsc, Mutex, oneshot};
@@ -81,9 +84,6 @@ enum PendingRequest {
     GetRecord {
         reply_tx: oneshot::Sender<Result<ContentManifest, String>>,
     },
-    GetAccessList {
-        reply_tx: oneshot::Sender<Result<craftobj_core::access::AccessList, String>>,
-    },
 }
 
 /// Global pending requests tracker.
@@ -98,8 +98,10 @@ pub async fn run_daemon(
     socket_path: String,
     network_config: NetworkConfig,
     ws_port: u16,
+    craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None, None).await
+    run_daemon_with_config(keypair, data_dir, socket_path, network_config, ws_port, None, None, craftnet_cmd_rx, craftnet_evt_tx, None).await
 }
 
 /// Run the CraftObj daemon with an optional config file path override.
@@ -115,6 +117,9 @@ pub async fn run_daemon_with_config_struct(
     ws_port: u16,
     daemon_config: crate::config::DaemonConfig,
     node_signing_key: Option<ed25519_dalek::SigningKey>,
+    craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
+    craftnet_stream_tx: Option<tokio::sync::oneshot::Sender<(libp2p_stream::Control, tokio::sync::mpsc::Receiver<(libp2p::PeerId, libp2p::Stream)>)>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("[service.rs] Daemon config: reannounce={}s threshold={}s cap_refresh={}s evict={}s hb_timeout={}s",
         daemon_config.reannounce_interval_secs,
@@ -123,7 +128,7 @@ pub async fn run_daemon_with_config_struct(
         daemon_config.evict_stale_interval_secs,
         daemon_config.peer_heartbeat_timeout_secs,
     );
-    run_daemon_inner(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key).await
+    run_daemon_inner(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key, craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx).await
 }
 
 /// Run the daemon, loading config from a file path (or defaults).
@@ -138,6 +143,9 @@ pub async fn run_daemon_with_config(
     ws_port: u16,
     config_path: Option<std::path::PathBuf>,
     node_signing_key: Option<ed25519_dalek::SigningKey>,
+    craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
+    craftnet_stream_tx: Option<tokio::sync::oneshot::Sender<(libp2p_stream::Control, tokio::sync::mpsc::Receiver<(libp2p::PeerId, libp2p::Stream)>)>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let daemon_config = match config_path {
         Some(ref path) => {
@@ -160,7 +168,7 @@ pub async fn run_daemon_with_config(
             cfg
         }
     };
-    run_daemon_with_config_struct(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key).await
+    run_daemon_with_config_struct(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key, craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx).await
 }
 
 async fn run_daemon_inner(
@@ -171,11 +179,14 @@ async fn run_daemon_inner(
     ws_port: u16,
     daemon_config: crate::config::DaemonConfig,
     node_signing_key: Option<ed25519_dalek::SigningKey>,
+    mut craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
+    craftnet_stream_tx: Option<tokio::sync::oneshot::Sender<(libp2p_stream::Control, tokio::sync::mpsc::Receiver<(libp2p::PeerId, libp2p::Stream)>)>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 
     // Create broadcast channel for daemon events (WS push)
-    let (event_tx, _) = events::event_channel(256);
+    let (event_tx, _): (tokio::sync::broadcast::Sender<DaemonEvent>, _) = events::event_channel(256);
 
     // Build client and shared store
     let client = CraftObjClient::new(&data_dir)?;
@@ -282,16 +293,7 @@ async fn run_daemon_inner(
 
     let protocol = Arc::new(protocol);
 
-    // Payment channel store
-    let channels_path = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".craftobj")
-        .join("channels");
-    let channel_store = Arc::new(Mutex::new(
-        crate::channel_store::ChannelStore::new(channels_path)
-            .expect("failed to open channel store"),
-    ));
+
 
     // Initialize settlement client (env-driven: set CRAFTEC_SOLANA_RPC_URL for real RPC)
     let settlement_config = crate::settlement::SettlementConfig::from_env();
@@ -363,7 +365,7 @@ async fn run_daemon_inner(
 
     let daemon_config_shared = Arc::new(Mutex::new(daemon_config.clone()));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let mut handler = CraftObjHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone(), channel_store);
+    let mut handler = CraftObjHandler::new(client.clone(), protocol.clone(), command_tx.clone(), peer_scorer.clone(), receipt_store.clone());
     handler.set_shutdown_notify(shutdown_notify.clone());
     handler.set_settlement_client(settlement_client);
     handler.set_content_tracker(content_tracker.clone());
@@ -453,10 +455,13 @@ async fn run_daemon_inner(
         health_scan_command_tx,
     );
     health_scan.set_scan_interval(std::time::Duration::from_secs(daemon_config.health_scan_interval_secs));
-    if let Some(tier_target) = daemon_config.health_scan_tier_target {
-        health_scan.set_tier_target(tier_target);
-    }
+    health_scan.set_event_tx(event_tx.clone());
+    // set_tier_target removed — tier multipliers are COM layer concern
     let health_scan: Arc<Mutex<crate::health_scan::HealthScan>> = Arc::new(Mutex::new(health_scan));
+
+    // Repair queue: TriggerRepair commands from PDP failures bypass the scheduled
+    // HealthScan cycle and call scan_segment immediately for the affected CID.
+    let (repair_queue_tx, mut repair_queue_rx) = tokio::sync::mpsc::unbounded_channel::<(craftobj_core::ContentId, Option<u32>)>();
 
     // Derive ed25519 signing key for capability announcement signing
     let swarm_signing_key = keypair.clone().try_into_ed25519().ok().map(|ed25519_kp| {
@@ -477,6 +482,14 @@ async fn run_daemon_inner(
             .unwrap_or([0u8; 32]),
     };
 
+
+    // PieceMap for event-sourced piece location tracking
+    let piece_map = {
+        let mut pm = crate::piece_map::PieceMap::new();
+        pm.set_local_node(local_peer_id.to_bytes());
+        Arc::new(Mutex::new(pm))
+    };
+
     // Run all components concurrently
     tokio::select! {
         result = ipc_server.run(handler) => {
@@ -487,11 +500,21 @@ async fn run_daemon_inner(
         _ = ws_future => {
             info!("[service.rs] WebSocket server ended");
         }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config.max_peer_connections, daemon_config_for_swarm.clone()) => {
+        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config_for_swarm.clone(), piece_map.clone(), &mut craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx, repair_queue_tx) => {
             info!("[service.rs] Swarm event loop ended");
         }
         _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
             info!("[service.rs] HealthScan loop ended");
+        }
+        _ = async {
+            // Repair queue drain: immediately scan CIDs flagged by PDP failures.
+            while let Some((cid, seg_hint)) = repair_queue_rx.recv().await {
+                info!("[service.rs] TriggerRepair: immediate scan for {} (seg={:?})", cid, seg_hint);
+                let mut hs = health_scan.lock().await;
+                hs.run_scan_for_cid(&cid).await;
+            }
+        } => {
+            info!("[service.rs] Repair queue loop ended");
         }
         _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone(), eviction_manager_for_events.clone()) => {
             info!("[service.rs] Protocol events handler ended");
@@ -506,10 +529,11 @@ async fn run_daemon_inner(
             daemon_config.reannounce_interval_secs,
             event_tx.clone(),
             peer_scorer.clone(),
+            demand_tracker.clone(),
         ) => {
             info!("[service.rs] Content maintenance loop ended");
         }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), command_tx.clone(), content_tracker.clone()) => {
+        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), command_tx.clone(), content_tracker.clone(), piece_map.clone()) => {
             info!("[service.rs] Eviction maintenance loop ended");
         }
         _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
@@ -530,6 +554,7 @@ async fn run_daemon_inner(
         _ = crate::scaling::run_local_scaling_loop(
             demand_tracker.clone(),
             store.clone(),
+            piece_map.clone(),
             Some(peer_scorer.clone()),
             command_tx.clone(),
             local_peer_id,
@@ -556,6 +581,7 @@ async fn eviction_maintenance_loop(
     merkle_tree: Arc<Mutex<craftobj_store::merkle::StorageMerkleTree>>,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
     content_tracker: Arc<Mutex<crate::content_tracker::ContentTracker>>,
+    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
 ) {
     use std::time::Duration;
     const DISK_SPACE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
@@ -674,9 +700,9 @@ async fn eviction_maintenance_loop(
                     let event = craftobj_core::PieceEvent::Dropped(dropped);
                     map.apply_event(&event);
                 }
-                // Remove DHT provider records and untrack all segments for this removed CID
+                // Remove DHT provider records — one per segment
                 for seg in segments_seen {
-                    let pkey = craftobj_routing::providers_dht_key(cid);
+                    let pkey = craftobj_routing::provider_key(cid, seg);
                     let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
                     map.untrack_segment(cid, seg);
                 }
@@ -773,11 +799,11 @@ async fn gc_loop(
                 continue; // Keep pinned, published, and storage provider content
             }
 
-            // Remove DHT provider record
+            // Remove DHT provider records — one per segment
             {
                 let segments = s.list_segments(cid).unwrap_or_default();
                 for seg in segments {
-                    let pkey = craftobj_routing::providers_dht_key(cid);
+                    let pkey = craftobj_routing::provider_key(cid, seg);
                     let _ = command_tx.send(CraftObjCommand::StopProviding { key: pkey });
                 }
             }
@@ -823,12 +849,38 @@ async fn drive_swarm(
     signing_key: Option<ed25519_dalek::SigningKey>,
     _receipt_store: Arc<Mutex<crate::receipt_store::PersistentReceiptStore>>,
     daemon_config: Arc<Mutex<crate::config::DaemonConfig>>,
+    piece_map: Arc<Mutex<crate::piece_map::PieceMap>>,
+    craftnet_cmd_rx: &mut Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
+    craftnet_stream_tx: Option<tokio::sync::oneshot::Sender<(libp2p_stream::Control, tokio::sync::mpsc::Receiver<(libp2p::PeerId, libp2p::Stream)>)>>,
+    repair_queue_tx: tokio::sync::mpsc::UnboundedSender<(craftobj_core::ContentId, Option<u32>)>,
 ) {
     use libp2p::swarm::SwarmEvent;
     use libp2p::futures::StreamExt;
 
+    let mut cnet_cmd_rx = craftnet_cmd_rx.take();
+
     // Stream manager for persistent piece transfer
     let stream_control = swarm.behaviour().stream.new_control();
+    
+    if let Some(tx) = craftnet_stream_tx {
+        let (craftnet_incoming_tx, craftnet_incoming_rx) = tokio::sync::mpsc::channel(1024);
+        let mut ctrl = swarm.behaviour().stream.new_control();
+        tokio::spawn(async move {
+            let protocol = libp2p::StreamProtocol::new("/craftnet/stream/1.0.0");
+            if let Ok(mut incoming) = ctrl.accept(protocol) {
+                use libp2p::futures::StreamExt;
+                while let Some((peer, stream)) = incoming.next().await {
+                    if craftnet_incoming_tx.send((peer, stream)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let craft_control = swarm.behaviour().stream.new_control();
+        let _ = tx.send((craft_control, craftnet_incoming_rx));
+    }
+
     let (mut stream_manager, mut inbound_rx, outbound_tx, distribution_tx, fetch_control) = StreamManager::new(stream_control);
 
     // Peer reconnector for exponential backoff reconnection
@@ -872,6 +924,69 @@ async fn drive_swarm(
         tokio::select! {
             // Handle swarm events
             event = swarm.select_next_some() => {
+                let shared_evt = match &event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        Some(craftec_network::SharedSwarmEvent::ConnectionEstablished(*peer_id))
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        if *num_established == 0 {
+                            Some(craftec_network::SharedSwarmEvent::ConnectionClosed(*peer_id))
+                        } else { None }
+                    }
+                    SwarmEvent::Behaviour(CraftObjBehaviourEvent::Craft(craft_event)) => {
+                        match craft_event {
+                            craftec_network::behaviour::CraftBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, propagation_source, .. }) => {
+                                Some(craftec_network::SharedSwarmEvent::GossipsubMessage {
+                                    topic: message.topic.clone(),
+                                    data: message.data.clone(),
+                                    propagation_source: Some(*propagation_source),
+                                })
+                            }
+                            craftec_network::behaviour::CraftBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(peers)) => {
+                                Some(craftec_network::SharedSwarmEvent::MdnsDiscovered(peers.iter().cloned().collect()))
+                            }
+                            craftec_network::behaviour::CraftBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(peers)) => {
+                                Some(craftec_network::SharedSwarmEvent::MdnsExpired(peers.iter().cloned().collect()))
+                            }
+                            craftec_network::behaviour::CraftBehaviourEvent::AutoNat(libp2p::autonat::Event::StatusChanged { new, .. }) => {
+                                use libp2p::autonat::NatStatus as LibNatStatus;
+                                let status = match new {
+                                    LibNatStatus::Public(_) => craftec_network::AutoNatStatus::Public,
+                                    LibNatStatus::Private => craftec_network::AutoNatStatus::Private,
+                                    LibNatStatus::Unknown => craftec_network::AutoNatStatus::Unknown,
+                                };
+                                Some(craftec_network::SharedSwarmEvent::AutoNatStatusChanged(status))
+                            }
+                            craftec_network::behaviour::CraftBehaviourEvent::Kademlia(libp2p::kad::Event::OutboundQueryProgressed { result, .. }) => {
+                                use libp2p::kad::QueryResult;
+                                use libp2p::kad::{GetRecordOk, GetProvidersOk};
+                                match result {
+                                    QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(record))) => {
+                                        Some(craftec_network::SharedSwarmEvent::KademliaSecondaryRecordFound {
+                                            key: record.record.key.clone(),
+                                            value: record.record.value.clone(),
+                                        })
+                                    }
+                                    QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders { key, providers, .. })) => {
+                                        Some(craftec_network::SharedSwarmEvent::KademliaSecondaryProvidersFound {
+                                            key: key.clone(),
+                                            providers: providers.iter().cloned().collect(),
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(evt) = shared_evt {
+                    if let Some(tx) = &craftnet_evt_tx {
+                        let _ = tx.try_send(evt);
+                    }
+                }
+
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("[service.rs] Listening on {}", address);
@@ -881,8 +996,8 @@ async fn drive_swarm(
                         let total = swarm.connected_peers().count();
                         info!("[service.rs] ConnectionEstablished to {} (num_established={}, {} peers total, endpoint={:?})", peer_id, num_established, total, endpoint);
                         // Max peer connection limit check
-                        if total > max_peer_connections && num_established.get() == 1 {
-                            warn!("[service.rs] Max peer connections reached ({}/{}), rejecting {}", total, max_peer_connections, peer_id);
+                        if total > MAX_PEER_CONNECTIONS && num_established.get() == 1 {
+                            warn!("[service.rs] Max peer connections reached ({}/{}), rejecting {}", total, MAX_PEER_CONNECTIONS, peer_id);
                             // Close the connection by not opening streams and letting it timeout
                         }
                         // Clear reconnector state on successful connection
@@ -909,39 +1024,50 @@ async fn drive_swarm(
                             address: endpoint.get_remote_address().to_string(),
                             total_peers: total,
                         });
-                        // Request capabilities from newly connected peer
+                        // Request capabilities from newly connected peer, with exponential backoff retry.
                         {
                             let tx = outbound_tx.clone();
                             let ps = peer_scorer.clone();
                             tokio::spawn(async move {
-                                // Small delay to let streams initialize
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                let msg = OutboundMessage {
-                                    peer: peer_id,
-                                    request: CraftObjRequest::CapabilityRequest,
-                                    reply_tx: Some(reply_tx),
-                                };
-                                if tx.send(msg).await.is_err() { return; }
-                                match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
-                                    Ok(Ok(CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region })) => {
-                                        let mut scorer = ps.lock().await;
-                                        let caps: Vec<craftobj_core::CraftObjCapability> = capabilities.iter().filter_map(|c| match c.as_str() {
-                                            "client" => Some(craftobj_core::CraftObjCapability::Client),
-                                            "storage" => Some(craftobj_core::CraftObjCapability::Storage),
-                                            "aggregator" => Some(craftobj_core::CraftObjCapability::Aggregator),
-                                            _ => None,
-                                        }).collect();
-                                        scorer.update_capabilities_with_storage(&peer_id, caps, 0, storage_committed_bytes, storage_used_bytes, region);
-                                        info!("[service.rs] Got capabilities from {}: {:?}", peer_id, capabilities);
-                                    }
-                                    Ok(Ok(other)) => {
-                                        debug!("[service.rs] Unexpected response to CapabilityRequest from {}: {:?}", peer_id, std::mem::discriminant(&other));
-                                    }
-                                    Ok(Err(_)) | Err(_) => {
-                                        debug!("[service.rs] CapabilityRequest to {} timed out or failed", peer_id);
+                                // Delays before each attempt: 500ms, 2s, 8s
+                                let delays = [
+                                    std::time::Duration::from_millis(500),
+                                    std::time::Duration::from_secs(2),
+                                    std::time::Duration::from_secs(8),
+                                ];
+                                for (attempt, delay) in delays.iter().enumerate() {
+                                    tokio::time::sleep(*delay).await;
+                                    let (reply_tx, reply_rx) = oneshot::channel();
+                                    let msg = OutboundMessage {
+                                        peer: peer_id,
+                                        request: CraftObjRequest::CapabilityRequest,
+                                        reply_tx: Some(reply_tx),
+                                    };
+                                    if tx.send(msg).await.is_err() { return; }
+                                    match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                                        Ok(Ok(CraftObjResponse::CapabilityResponse { capabilities, storage_committed_bytes, storage_used_bytes, region })) => {
+                                            let mut scorer = ps.lock().await;
+                                            let caps: Vec<craftobj_core::CraftObjCapability> = capabilities.iter().filter_map(|c| match c.as_str() {
+                                                "client" => Some(craftobj_core::CraftObjCapability::Client),
+                                                "storage" => Some(craftobj_core::CraftObjCapability::Storage),
+                                                "aggregator" => Some(craftobj_core::CraftObjCapability::Aggregator),
+                                                _ => None,
+                                            }).collect();
+                                            scorer.update_capabilities_with_storage(&peer_id, caps, 0, storage_committed_bytes, storage_used_bytes, region);
+                                            info!("[service.rs] Got capabilities from {} (attempt {}): {:?}", peer_id, attempt + 1, capabilities);
+                                            return; // success — stop retrying
+                                        }
+                                        Ok(Ok(other)) => {
+                                            debug!("[service.rs] Unexpected response to CapabilityRequest from {}: {:?}", peer_id, std::mem::discriminant(&other));
+                                            return; // unexpected response — don't retry
+                                        }
+                                        Ok(Err(_)) | Err(_) => {
+                                            debug!("[service.rs] CapabilityRequest to {} timed out/failed (attempt {}/{})", peer_id, attempt + 1, delays.len());
+                                            // loop continues to next attempt
+                                        }
                                     }
                                 }
+                                debug!("[service.rs] Giving up on CapabilityRequest to {} after {} attempts", peer_id, delays.len());
                             });
                         }
                     }
@@ -1017,14 +1143,63 @@ async fn drive_swarm(
                     _ => {}
                 }
             }
+            // Handle CraftNet swarm commands via shared channels
+            cnet_cmd = async { if let Some(rx) = &mut cnet_cmd_rx { rx.recv().await } else { std::future::pending().await } } => {
+                let Some(cmd) = cnet_cmd else {
+                    cnet_cmd_rx = None;
+                    continue;
+                };
+                match cmd {
+                    craftec_network::SharedSwarmCommand::Dial(peer_id) => { let _ = swarm.dial(peer_id); }
+                    craftec_network::SharedSwarmCommand::Disconnect(peer_id) => { let _ = swarm.disconnect_peer_id(peer_id); }
+                    craftec_network::SharedSwarmCommand::AddAddress(peer_id, addr) => { swarm.behaviour_mut().craft.add_address(&peer_id, addr); }
+                    craftec_network::SharedSwarmCommand::PublishGossipsub { topic, data } => {
+                        let t = libp2p::gossipsub::IdentTopic::new(topic);
+                        let _ = swarm.behaviour_mut().craft.gossipsub.publish(t, data);
+                    }
+                    craftec_network::SharedSwarmCommand::SubscribeGossipsub(topic) => {
+                        let t = libp2p::gossipsub::IdentTopic::new(topic);
+                        let _ = swarm.behaviour_mut().craft.gossipsub.subscribe(&t);
+                    }
+                    craftec_network::SharedSwarmCommand::UnsubscribeGossipsub(topic) => {
+                        let t = libp2p::gossipsub::IdentTopic::new(topic);
+                        let _ = swarm.behaviour_mut().craft.gossipsub.unsubscribe(&t);
+                    }
+                    craftec_network::SharedSwarmCommand::PutRecordSecondary(record) => {
+                        swarm.behaviour_mut().craft.kademlia_secondary.as_mut().map(|k| k.put_record(record, libp2p::kad::Quorum::One));
+                    }
+                    craftec_network::SharedSwarmCommand::StartProvidingSecondary(key) => {
+                        swarm.behaviour_mut().craft.kademlia_secondary.as_mut().map(|k| k.start_providing(key));
+                    }
+                    craftec_network::SharedSwarmCommand::StopProvidingSecondary(key) => {
+                        swarm.behaviour_mut().craft.kademlia_secondary.as_mut().map(|k| k.stop_providing(&key));
+                    }
+                    craftec_network::SharedSwarmCommand::GetRecordSecondary(key) => {
+                        swarm.behaviour_mut().craft.kademlia_secondary.as_mut().map(|k| k.get_record(key));
+                    }
+                    craftec_network::SharedSwarmCommand::GetProvidersSecondary(key) => {
+                        swarm.behaviour_mut().craft.kademlia_secondary.as_mut().map(|k| k.get_providers(key));
+                    }
+                    craftec_network::SharedSwarmCommand::BootstrapSecondary => {
+                        swarm.behaviour_mut().craft.kademlia_secondary.as_mut().map(|k| k.bootstrap());
+                    }
+                    craftec_network::SharedSwarmCommand::GetConnectedPeers(tx) => {
+                        let peers: Vec<_> = swarm.connected_peers().copied().collect();
+                        let _ = tx.send(peers);
+                    }
+                    craftec_network::SharedSwarmCommand::IsConnected(peer_id, tx) => {
+                        let _ = tx.send(swarm.is_connected(&peer_id));
+                    }
+                }
+            }
             
             // Handle commands from IPC handler
             command = command_rx.recv() => {
                 if let Some(cmd) = command {
                     match cmd {
-                        CraftObjCommand::HealthQuery { peer_id, content_id, segment_index, reply_tx } => {
+                        CraftObjCommand::HealthQuery { peer_id, content_id, segment_index, nonce, reply_tx } => {
                             debug!("[service.rs] Handling HealthQuery command: {}/seg{} to peer {}", content_id, segment_index, peer_id);
-                            let request = CraftObjRequest::HealthQuery { content_id, segment_index };
+                            let request = CraftObjRequest::HealthQuery { content_id, segment_index, nonce };
                             let (ack_tx, ack_rx) = oneshot::channel();
                             let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
                             let tx = outbound_tx.clone();
@@ -1034,8 +1209,8 @@ async fn drive_swarm(
                                     return;
                                 }
                                 match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                                    Ok(Ok(CraftObjResponse::HealthResponse { piece_count })) => {
-                                        let _ = reply_tx.send(Ok(piece_count));
+                                    Ok(Ok(CraftObjResponse::HealthResponse { pieces })) => {
+                                        let _ = reply_tx.send(Ok(pieces.len() as u32));
                                     }
                                     Ok(Ok(_)) => {
                                         let _ = reply_tx.send(Err("unexpected response type".into()));
@@ -1071,6 +1246,10 @@ async fn drive_swarm(
                                     info!("[service.rs] TriggerDistribution: initial push done for {}", cid);
                                 }
                             });
+                        }
+                        CraftObjCommand::TriggerRepair { content_id, failed_segment } => {
+                            info!("[service.rs] TriggerRepair received for {} (seg={:?}) — queuing immediate scan", content_id, failed_segment);
+                            let _ = repair_queue_tx.send((content_id, failed_segment));
                         }
                         other => {
                             handle_command(swarm, &protocol, other, pending_requests.clone(), &outbound_tx, &distribution_tx, &event_tx, &region, &signing_key, &fetch_control, &store_for_repair).await;
@@ -1172,9 +1351,14 @@ async fn drive_swarm(
                                 Ok((data, coefficients)) => {
                                     pieces.push(craftobj_transfer::PiecePayload {
                                         segment_index,
+                                        segment_count: store_guard.get_record(&content_id).map(|m| m.segment_count() as u32).unwrap_or(0),
+                                        total_size: store_guard.get_record(&content_id).map(|m| m.total_size).unwrap_or(0),
+                                        k: store_guard.get_record(&content_id).map(|m| m.k_for_segment(segment_index as usize) as u32).unwrap_or(0),
+                                        vtags_cid: store_guard.get_record(&content_id).ok().and_then(|m| m.vtags_cid),
                                         piece_id: pid,
                                         coefficients,
                                         data,
+                                        vtag_blob: None,
                                     });
                                 }
                                 Err(e) => debug!("Failed to read piece {}: {}", hex::encode(&pid[..4]), e),
@@ -1203,6 +1387,7 @@ async fn drive_swarm(
                 let dt_clone = demand_tracker.clone();
                 let sk_clone = signing_key.clone();
                 let cmd_tx_clone = command_tx.clone();
+                let pm_clone = piece_map.clone();
                 let peer = msg.peer;
                 let seq_id = msg.seq_id;
                 let mut stream = msg.stream;
@@ -1213,7 +1398,7 @@ async fn drive_swarm(
                     info!("[handler] START peer={} seq={} type={}", &peer.to_string()[..8], seq_id, req_type);
                     let response = handle_incoming_transfer_request(
                         &peer, msg.request, &store_clone, &ct_clone, &proto_clone, &dt_clone,
-                        sk_clone.as_ref(), &cmd_tx_clone,
+                        sk_clone.as_ref(), &cmd_tx_clone, &pm_clone,
                     ).await;
                     let handle_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
                     info!("[handler] DONE peer={} seq={} handle_ms={:.1} resp={:?}", &peer.to_string()[..8], seq_id, handle_ms, std::mem::discriminant(&response));
@@ -1376,6 +1561,7 @@ async fn handle_incoming_transfer_request(
     demand_tracker: &Arc<Mutex<crate::scaling::DemandTracker>>,
     signing_key: Option<&ed25519_dalek::SigningKey>,
     command_tx: &mpsc::UnboundedSender<CraftObjCommand>,
+    piece_map: &Arc<Mutex<crate::piece_map::PieceMap>>,
 ) -> CraftObjResponse {
     match request {
         CraftObjRequest::PieceSync { content_id, segment_index, have_pieces, max_pieces, .. } => {
@@ -1403,9 +1589,14 @@ async fn handle_incoming_transfer_request(
                     Ok((data, coefficients)) => {
                         pieces.push(craftobj_transfer::PiecePayload {
                             segment_index,
+                            segment_count: store_guard.get_record(&content_id).map(|m| m.segment_count() as u32).unwrap_or(0),
+                            total_size: store_guard.get_record(&content_id).map(|m| m.total_size).unwrap_or(0),
+                            k: store_guard.get_record(&content_id).map(|m| m.k_for_segment(segment_index as usize) as u32).unwrap_or(0),
+                            vtags_cid: store_guard.get_record(&content_id).ok().and_then(|m| m.vtags_cid),
                             piece_id: pid,
                             coefficients,
                             data,
+                            vtag_blob: None,
                         });
                     }
                     Err(e) => {
@@ -1423,15 +1614,18 @@ async fn handle_incoming_transfer_request(
             CraftObjResponse::PieceBatch { pieces }
         }
         CraftObjRequest::PiecePush { content_id, segment_index, piece_id, coefficients, data } => {
+
             info!("[service.rs] Handling PiecePush from {} for {}/seg{}", peer, content_id, segment_index);
             info!("[service.rs] PiecePush handler: acquiring store lock...");
             let store_guard = store.lock().await;
             info!("[service.rs] PiecePush handler: store lock acquired");
 
-            // Check if we have the manifest (must receive ManifestPush first)
+            // NOTE: ManifestPush check removed — piece headers are authoritative.
+            // Auto-create manifest from piece header on first receive.
             if store_guard.get_record(&content_id).is_err() {
-                warn!("[service.rs] Received piece push for {} but no manifest — rejecting", content_id);
-                return CraftObjResponse::Ack { status: WireStatus::Error };
+                // No manifest yet — will be auto-created by PieceBatchPush handler
+                // when it sees the first piece with self-describing header.
+                warn!("[service.rs] Received piece push for {} but no manifest yet — storing anyway", content_id);
             }
 
             match store_guard.store_piece(&content_id, segment_index, &piece_id, &data, &coefficients) {
@@ -1445,14 +1639,7 @@ async fn handle_incoming_transfer_request(
                     {
                         let mut map = piece_map.lock().await;
                         // Track segment if this is the first piece for it
-                        let newly_tracked = map.track_segment(content_id, segment_index);
-                        if newly_tracked {
-                            // Trigger scoped sync from peers for this segment
-                            let _ = command_tx.send(CraftObjCommand::SyncPieceMap {
-                                content_id,
-                                segment_index,
-                            });
-                        }
+                        map.track_segment(&content_id, segment_index);
                         let seq = map.next_seq();
                         let mut stored = craftobj_core::PieceStored {
                             node: map.local_node().to_vec(),
@@ -1473,8 +1660,8 @@ async fn handle_incoming_transfer_request(
                         let event = craftobj_core::PieceEvent::Stored(stored);
                         map.apply_event(&event);
                     }
-                    // Publish DHT provider record for this CID+segment
-                    let pkey = craftobj_routing::providers_dht_key(&content_id);
+                    // Publish per-segment DHT provider record
+                    let pkey = craftobj_routing::provider_key(&content_id, segment_index);
                     let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
                     CraftObjResponse::Ack { status: WireStatus::Ok }
                 }
@@ -1484,44 +1671,20 @@ async fn handle_incoming_transfer_request(
                 }
             }
         }
-        CraftObjRequest::ManifestPush { content_id, record_json } => {
-            info!("[service.rs] Handling ManifestPush from {} for {}", peer, content_id);
-            match serde_json::from_slice::<craftobj_core::ContentManifest>(&record_json) {
-                Ok(manifest) => {
-                    info!("[service.rs] ManifestPush handler: acquiring store lock...");
-                    let store_guard = store.lock().await;
-                    info!("[service.rs] ManifestPush handler: store lock acquired");
-                    match store_guard.store_record(&manifest) {
-                        Ok(()) => {
-                            info!("[service.rs] Stored manifest for {}", content_id);
-                            if let Err(e) = protocol.event_tx.send(CraftObjEvent::ManifestPushReceived {
-                                content_id,
-                                manifest,
-                            }) {
-                                debug!("Failed to send manifest push event: {}", e);
-                            }
-                            CraftObjResponse::Ack { status: WireStatus::Ok }
-                        }
-                        Err(e) => {
-                            warn!("[service.rs] Failed to store manifest: {}", e);
-                            CraftObjResponse::Ack { status: WireStatus::Error }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("[service.rs] Failed to parse manifest JSON: {}", e);
-                    CraftObjResponse::Ack { status: WireStatus::Error }
-                }
-            }
-        }
-        CraftObjRequest::HealthQuery { content_id, segment_index } => {
+        // NOTE: ManifestPush removed — piece headers are self-describing.
+        // If we receive this from an old peer, the wire.rs layer returns an error.
+        CraftObjRequest::HealthQuery { content_id, segment_index, .. } => {
             debug!("[service.rs] Handling HealthQuery from {} for {}/seg{}", peer, content_id, segment_index);
             let store_guard = store.lock().await;
-            let piece_count = store_guard.list_pieces(&content_id, segment_index)
-                .unwrap_or_default()
-                .len() as u32;
-            debug!("[service.rs] Returning piece_count={} for {}/seg{}", piece_count, content_id, segment_index);
-            CraftObjResponse::HealthResponse { piece_count }
+            let pieces_list = store_guard.list_pieces(&content_id, segment_index)
+                .unwrap_or_default();
+            debug!("[service.rs] Returning {} pieces for {}/seg{}", pieces_list.len(), content_id, segment_index);
+            CraftObjResponse::HealthResponse { pieces: pieces_list.into_iter().map(|pid| {
+                craftobj_transfer::HealthPiece {
+                    piece_id: pid,
+                    coefficients: vec![],
+                }
+            }).collect() }
         }
         CraftObjRequest::PdpChallenge { content_id, segment_index, piece_id, nonce, byte_positions } => {
             info!("[service.rs] Handling PdpChallenge from {} for {}/seg{} piece {}", peer, content_id, segment_index, hex::encode(&piece_id[..8]));
@@ -1578,22 +1741,39 @@ async fn handle_incoming_transfer_request(
             info!("[service.rs] Handling PieceBatchPush from {} for {} ({} pieces)", peer, content_id, pieces.len());
             let store_guard = store.lock().await;
             
-            // Check if we have the manifest
+            // Auto-create manifest from piece header if we don't have one yet.
+            // Piece headers are authoritative — no ManifestPush needed.
             if store_guard.get_record(&content_id).is_err() {
-                warn!("[service.rs] Received batch piece push for {} but no manifest — rejecting", content_id);
-                return CraftObjResponse::BatchAck { 
-                    confirmed_pieces: vec![], 
-                    failed_pieces: pieces.iter().map(|p| p.piece_id).collect() 
-                };
+                if let Some(first_piece) = pieces.first() {
+                    let manifest = craftobj_core::ContentManifest {
+                        content_id,
+                        total_size: first_piece.total_size,
+                        vtags_cid: first_piece.vtags_cid,
+                    };
+                    if let Err(e) = store_guard.store_record(&manifest) {
+                        warn!("[service.rs] Failed to auto-create manifest for {}: {}", content_id, e);
+                    } else {
+                        info!("[service.rs] Auto-created manifest for {} from piece header", content_id);
+                        // Trigger storage-node side-effects (tracker, eviction, challenger, announce)
+                        if let Err(e) = protocol.event_tx.send(CraftObjEvent::ManifestAutoCreated {
+                            content_id,
+                            manifest: manifest.clone(),
+                        }) {
+                            debug!("Failed to send ManifestAutoCreated event: {}", e);
+                        }
+                    }
+                }
             }
             
             let mut confirmed = Vec::new();
             let mut failed = Vec::new();
+            let mut segs_to_announce: std::collections::HashSet<u32> = std::collections::HashSet::new();
             
-            for piece in pieces {
+            for piece in &pieces {
                 match store_guard.store_piece(&content_id, piece.segment_index, &piece.piece_id, &piece.data, &piece.coefficients) {
                     Ok(()) => {
                         confirmed.push(piece.piece_id);
+                        segs_to_announce.insert(piece.segment_index);
                         // Notify protocol for tracker update
                         if let Err(e) = protocol.event_tx.send(CraftObjEvent::PiecePushReceived { content_id }) {
                             debug!("Failed to send piece push event: {}", e);
@@ -1601,13 +1781,7 @@ async fn handle_incoming_transfer_request(
                         // Update PieceMap
                         {
                             let mut map = piece_map.lock().await;
-                            let newly_tracked = map.track_segment(content_id, piece.segment_index);
-                            if newly_tracked {
-                                let _ = command_tx.send(CraftObjCommand::SyncPieceMap {
-                                    content_id,
-                                    segment_index: piece.segment_index,
-                                });
-                            }
+                            map.track_segment(&content_id, piece.segment_index);
                             let seq = map.next_seq();
                             let stored = craftobj_core::PieceStored {
                                 node: map.local_node().to_vec(),
@@ -1635,10 +1809,12 @@ async fn handle_incoming_transfer_request(
             
             info!("[service.rs] Batch push result: {}/{} confirmed", confirmed.len(), confirmed.len() + failed.len());
             
-            // Announce as DHT provider if we stored any pieces
-            if !confirmed.is_empty() {
-                let pkey = craftobj_routing::providers_dht_key(&content_id);
-                let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
+            // Announce as DHT provider per segment if we stored any pieces
+            if !segs_to_announce.is_empty() {
+                for seg in segs_to_announce {
+                    let pkey = craftobj_routing::provider_key(&content_id, seg);
+                    let _ = command_tx.send(CraftObjCommand::StartProviding { key: pkey });
+                }
             }
             
             CraftObjResponse::BatchAck { confirmed_pieces: confirmed, failed_pieces: failed }
@@ -1666,33 +1842,26 @@ async fn handle_command(
     store_for_repair: &Arc<Mutex<craftobj_store::FsStore>>,
 ) {
     match command {
-        CraftObjCommand::AnnounceProvider { content_id, manifest, verification_record, reply_tx } => {
+        CraftObjCommand::AnnounceProvider { content_id, manifest: _, reply_tx } => {
             debug!("Handling announce provider command for {}", content_id);
             
-            // Get the local peer ID
-            let local_peer_id = *swarm.local_peer_id();
-            
             let result = async {
-                // Publish manifest to DHT so fetchers can find it.
-                protocol.publish_manifest(&mut swarm.behaviour_mut().craft, &manifest, &local_peer_id).await
-                    .map_err(|e| format!("Failed to publish manifest: {}", e))?;
-                
-                // Also publish verification record (homomorphic hashes) if provided
-                if let Some(ref vr) = verification_record {
-                    if let Err(e) = craftobj_routing::ContentRouter::publish_verification_record(
-                        &mut swarm.behaviour_mut().craft,
-                        &content_id,
-                        vr,
-                        &local_peer_id,
-                    ) {
-                        warn!("Failed to publish verification record for {}: {}", content_id, e);
-                    } else {
-                        debug!("Published verification record for {} to DHT", content_id);
-                    }
+                // Emit CID-level key for backward compat with nodes that haven't upgraded.
+                protocol.announce_provider(&mut swarm.behaviour_mut().craft, &content_id).await
+                    .map_err(|e| format!("Failed to announce provider (CID key): {}", e))?;
+
+                // Emit individual per-segment provider keys
+                let segment_count = {
+                    store_for_repair.lock().await
+                        .list_segments(&content_id).unwrap_or_default().len()
+                };
+                for seg in 0..segment_count as u32 {
+                    let seg_key = craftobj_routing::provider_key(&content_id, seg);
+                    let _ = swarm.behaviour_mut().craft.start_providing(&seg_key);
                 }
-                
+
                 let _ = event_tx.send(DaemonEvent::ProviderAnnounced { content_id: content_id.to_hex() });
-                debug!("Successfully started DHT operations for {}", content_id);
+                debug!("Successfully announced as provider for {} ({} segments)", content_id, segment_count);
                 Ok(())
             }.await;
             
@@ -1716,17 +1885,16 @@ async fn handle_command(
         }
         
         CraftObjCommand::GetRecord { content_id, reply_tx } => {
-            debug!("Handling get manifest command for {}", content_id);
-            
-            match protocol.get_record(&mut swarm.behaviour_mut().craft, &content_id).await {
-                Ok(()) => {
-                    // Store the reply channel to respond when DHT query completes
-                    let mut pending = pending_requests.lock().await;
-                    pending.insert(content_id, PendingRequest::GetRecord { reply_tx });
-                    debug!("Started DHT manifest retrieval for {}", content_id);
+            debug!("Handling get manifest command for {} — using local store", content_id);
+            // NOTE: DHT manifest retrieval removed. Use local store.
+            // Manifest is auto-created from piece headers on first receive.
+            let store_guard = store_for_repair.lock().await;
+            match store_guard.get_record(&content_id) {
+                Ok(manifest) => {
+                    let _ = reply_tx.send(Ok(manifest));
                 }
                 Err(e) => {
-                    let _ = reply_tx.send(Err(format!("Failed to start manifest retrieval: {}", e)));
+                    let _ = reply_tx.send(Err(format!("No local manifest for {}: {}", content_id, e)));
                 }
             }
         }
@@ -1823,62 +1991,58 @@ async fn handle_command(
             });
         }
 
+        CraftObjCommand::FetchOnePieceRaw { peer_id, content_id, segment_index, reply_tx } => {
+            let mut ctrl = (*fetch_control).clone();
+            tokio::spawn(async move {
+                // Open stream to provider
+                let mut stream = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    ctrl.open_stream(peer_id, crate::stream_manager::transfer_stream_protocol()),
+                ).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => { let _ = reply_tx.send(Err(format!("open stream: {}", e))); return; }
+                    Err(_) => { let _ = reply_tx.send(Err("open stream timeout".into())); return; }
+                };
+
+                // Send PieceSync requesting 1 piece (any piece — pool handles dedup)
+                let request = CraftObjRequest::PieceSync {
+                    content_id,
+                    segment_index,
+                    merkle_root: [0u8; 32],
+                    have_pieces: vec![],
+                    max_pieces: 1,
+                };
+                if let Err(e) = craftobj_transfer::wire::write_request_frame(&mut stream, 0, &request).await {
+                    let _ = reply_tx.send(Err(format!("write PieceSync: {}", e)));
+                    return;
+                }
+
+                // Read exactly one piece frame from wire without storing
+                use craftobj_transfer::wire::{read_frame, StreamFrame};
+                use craftobj_transfer::CraftObjRequest as Req;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    read_frame(&mut stream),
+                ).await {
+                    Ok(Ok(StreamFrame::Request { request: Req::PieceBatchPush { pieces, .. }, .. })) => {
+                        if let Some(p) = pieces.into_iter().next() {
+                            let _ = reply_tx.send(Ok((p.coefficients, p.data)));
+                        } else {
+                            let _ = reply_tx.send(Err("provider sent empty batch".into()));
+                        }
+                    }
+                    Ok(Ok(_)) => { let _ = reply_tx.send(Err("unexpected frame type".into())); }
+                    Ok(Err(e)) => { let _ = reply_tx.send(Err(format!("read frame: {}", e))); }
+                    Err(_) => { let _ = reply_tx.send(Err("read frame timeout".into())); }
+                }
+            });
+        }
+
         CraftObjCommand::HealthQuery { .. } => {
             // Handled inline in the command match above (drive_swarm).
             // This arm should never be reached.
         }
 
-        CraftObjCommand::PutReKey { content_id, entry, reply_tx } => {
-            debug!("Handling put re-key command for {} → {}", content_id, hex::encode(entry.recipient_did));
-            let local_peer_id = *swarm.local_peer_id();
-            let result = craftobj_routing::ContentRouter::put_re_key(
-                &mut swarm.behaviour_mut().craft, &content_id, &entry, &local_peer_id,
-            ).map(|_| ()).map_err(|e| e.to_string());
-            let _ = reply_tx.send(result);
-        }
-
-        CraftObjCommand::RemoveReKey { content_id, recipient_did, reply_tx } => {
-            debug!("Handling remove re-key command for {} → {}", content_id, hex::encode(recipient_did));
-            let local_peer_id = *swarm.local_peer_id();
-            let result = craftobj_routing::ContentRouter::remove_re_key(
-                &mut swarm.behaviour_mut().craft, &content_id, &recipient_did, &local_peer_id,
-            ).map(|_| ()).map_err(|e| e.to_string());
-            let _ = reply_tx.send(result);
-        }
-
-        CraftObjCommand::PutAccessList { access_list, reply_tx } => {
-            debug!("Handling put access list command for {}", access_list.content_id);
-            let local_peer_id = *swarm.local_peer_id();
-            let result = craftobj_routing::ContentRouter::put_access_list(
-                &mut swarm.behaviour_mut().craft, &access_list, &local_peer_id,
-            ).map(|_| ()).map_err(|e| e.to_string());
-            let _ = reply_tx.send(result);
-        }
-
-        CraftObjCommand::GetAccessList { content_id, reply_tx } => {
-            debug!("Handling get access list command for {}", content_id);
-            match protocol.get_access_list_dht(&mut swarm.behaviour_mut().craft, &content_id).await {
-                Ok(()) => {
-                    let mut pending = pending_requests.lock().await;
-                    pending.insert(content_id, PendingRequest::GetAccessList { reply_tx });
-                }
-                Err(e) => {
-                    let _ = reply_tx.send(Err(format!("Failed to start access list retrieval: {}", e)));
-                }
-            }
-        }
-
-        CraftObjCommand::PublishRemoval { content_id, notice, reply_tx } => {
-            debug!("Handling publish removal command for {}", content_id);
-            let local_peer_id = *swarm.local_peer_id();
-
-            // Store in DHT
-            let dht_result = craftobj_routing::ContentRouter::put_removal_notice(
-                &mut swarm.behaviour_mut().craft, &content_id, &notice, &local_peer_id,
-            ).map(|_| ()).map_err(|e| e.to_string());
-
-            let _ = reply_tx.send(dht_result);
-        }
 
         CraftObjCommand::DistributePieces { peer_id, content_id, pieces, reply_tx } => {
             let piece_count = pieces.len();
@@ -1904,160 +2068,17 @@ async fn handle_command(
             });
         }
 
-        CraftObjCommand::PushRecord { peer_id, content_id, record_json, reply_tx } => {
-            debug!("Handling push manifest command for {} to {}", content_id, peer_id);
-            let request = CraftObjRequest::ManifestPush {
-                content_id,
-                record_json,
-            };
-            let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
-            let tx = outbound_tx.clone();
-            tokio::spawn(async move {
-                info!("[service.rs] PushRecord: sending to outbound queue for {}", peer_id);
-                if tx.send(msg).await.is_err() {
-                    warn!("[service.rs] PushRecord to {}: outbound channel closed", peer_id);
-                    let _ = reply_tx.send(Err("outbound channel closed".into()));
-                    return;
-                }
-                info!("[service.rs] PushRecord: waiting for ack from {} (5s timeout)", peer_id);
-                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-                    Ok(Ok(CraftObjResponse::Ack { status })) => {
-                        info!("[service.rs] PushRecord to {}: got ack status={:?}", peer_id, status);
-                        if status == craftobj_core::WireStatus::Ok {
-                            let _ = reply_tx.send(Ok(()));
-                        } else {
-                            let _ = reply_tx.send(Err(format!("ManifestPush ack: {:?}", status)));
-                        }
-                    }
-                    Ok(Ok(other)) => { 
-                        warn!("[service.rs] PushRecord to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
-                        let _ = reply_tx.send(Err("unexpected response type".into())); 
-                    }
-                    Ok(Err(_)) => { 
-                        warn!("[service.rs] PushRecord to {}: ack channel closed", peer_id);
-                        let _ = reply_tx.send(Err("ack channel closed".into())); 
-                    }
-                    Err(_) => {
-                        warn!("[service.rs] PushRecord to {}: timed out after 5s", peer_id);
-                        let _ = reply_tx.send(Err("manifest push timed out".into()));
-                    }
-                }
-            });
-        }
-
-        // RequestInventory removed — challenger now uses PieceSync
-
-        CraftObjCommand::CheckRemoval { content_id, reply_tx } => {
-            debug!("Handling check removal command for {}", content_id);
-            // For now, just start a DHT query. Full async response would need pending request tracking.
-            // This is a simplified version — the RemovalCache handles most checks locally.
-            let _ = craftobj_routing::ContentRouter::get_removal_notice(
-                &mut swarm.behaviour_mut().craft, &content_id,
-            );
-            // Reply immediately with None — the cache should be checked first by the caller.
-            let _ = reply_tx.send(Ok(None));
-        }
-        CraftObjCommand::StartProviding { key } => {
-            debug!("Handling StartProviding command (key len={})", key.len());
-            match swarm.behaviour_mut().craft.start_providing(&key) {
-                Ok(_query_id) => debug!("Started providing for key {}", hex::encode(&key[..8.min(key.len())])),
-                Err(e) => warn!("Failed to start providing: {:?}", e),
-            }
+        CraftObjCommand::PushRecord { peer_id, content_id, record_json: _, reply_tx } => {
+            // NOTE: ManifestPush deprecated. Manifest auto-created from piece headers.
+            // Just ack success for backward compat with callers.
+            debug!("PushRecord for {} to {} — no-op (manifest push deprecated)", content_id, peer_id);
+            let _ = reply_tx.send(Ok(()));
         }
 
         CraftObjCommand::StopProviding { key } => {
             debug!("Handling StopProviding command (key len={})", key.len());
             swarm.behaviour_mut().craft.stop_providing(&key);
             debug!("Stopped providing for key {}", hex::encode(&key[..8.min(key.len())]));
-        }
-
-        CraftObjCommand::SyncPieceMap { .. } => {
-            unreachable!("SyncPieceMap should be intercepted in drive_swarm");
-        }
-
-        CraftObjCommand::TriggerDistribution => {
-            unreachable!("TriggerDistribution should be intercepted in drive_swarm");
-        }
-
-        CraftObjCommand::ConnectedPeers { .. } => {
-            unreachable!("ConnectedPeers should be intercepted in drive_swarm");
-        }
-
-        CraftObjCommand::MerkleRoot { peer_id, content_id, segment_index, reply_tx } => {
-            debug!("Handling MerkleRoot command: {}/{} from {}", content_id, segment_index, peer_id);
-            let request = craftobj_transfer::CraftObjRequest::MerkleRoot {
-                content_id,
-                segment_index,
-            };
-            let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
-            let tx = outbound_tx.clone();
-            tokio::spawn(async move {
-                if tx.send(msg).await.is_err() {
-                    warn!("[service.rs] MerkleRoot to {}: outbound channel closed", peer_id);
-                    let _ = reply_tx.send(None);
-                    return;
-                }
-                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
-                    Ok(Ok(craftobj_transfer::CraftObjResponse::MerkleRootResponse { root, leaf_count })) => {
-                        let _ = reply_tx.send(Some((root, leaf_count)));
-                    }
-                    Ok(Ok(other)) => {
-                        warn!("[service.rs] MerkleRoot to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
-                        let _ = reply_tx.send(None);
-                    }
-                    Ok(Err(_)) => {
-                        warn!("[service.rs] MerkleRoot to {}: ack channel closed", peer_id);
-                        let _ = reply_tx.send(None);
-                    }
-                    Err(_) => {
-                        warn!("[service.rs] MerkleRoot to {}: timed out after 10s", peer_id);
-                        let _ = reply_tx.send(None);
-                    }
-                }
-            });
-        }
-
-        CraftObjCommand::MerkleDiff { peer_id, content_id, segment_index, since_root, reply_tx } => {
-            debug!("Handling MerkleDiff command: {}/{} from {} since {}", content_id, segment_index, peer_id, hex::encode(&since_root[..8]));
-            let request = craftobj_transfer::CraftObjRequest::MerkleDiff {
-                content_id,
-                segment_index,
-                since_root,
-            };
-            let (ack_tx, ack_rx) = oneshot::channel();
-            let msg = OutboundMessage { peer: peer_id, request, reply_tx: Some(ack_tx) };
-            let tx = outbound_tx.clone();
-            tokio::spawn(async move {
-                if tx.send(msg).await.is_err() {
-                    warn!("[service.rs] MerkleDiff to {}: outbound channel closed", peer_id);
-                    let _ = reply_tx.send(None);
-                    return;
-                }
-                match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
-                    Ok(Ok(craftobj_transfer::CraftObjResponse::MerkleDiffResponse { current_root, added, removed })) => {
-                        let result = crate::commands::MerkleDiffResult {
-                            current_root,
-                            added,
-                            removed,
-                        };
-                        let _ = reply_tx.send(Some(result));
-                    }
-                    Ok(Ok(other)) => {
-                        warn!("[service.rs] MerkleDiff to {}: unexpected response {:?}", peer_id, std::mem::discriminant(&other));
-                        let _ = reply_tx.send(None);
-                    }
-                    Ok(Err(_)) => {
-                        warn!("[service.rs] MerkleDiff to {}: ack channel closed", peer_id);
-                        let _ = reply_tx.send(None);
-                    }
-                    Err(_) => {
-                        warn!("[service.rs] MerkleDiff to {}: timed out after 10s", peer_id);
-                        let _ = reply_tx.send(None);
-                    }
-                }
-            });
         }
 
         CraftObjCommand::PdpChallenge { peer_id, content_id, segment_index, piece_id, nonce, byte_positions, reply_tx } => {
@@ -2092,6 +2113,10 @@ async fn handle_command(
                     }
                 }
             });
+        }
+        // TriggerDistribution, StartProviding, ConnectedPeers are handled in drive_swarm
+        _ => {
+            debug!("handle_command: unhandled command variant (handled elsewhere)");
         }
     }
 }
@@ -2165,43 +2190,22 @@ async fn handle_protocol_events(
                 }
             }
             
-            CraftObjEvent::ManifestRetrieved { content_id, manifest } => {
-                info!("[service.rs] Retrieved manifest for {} ({} segments)", content_id, manifest.segment_count());
-                let _ = daemon_event_tx.send(DaemonEvent::ManifestRetrieved {
-                    content_id: content_id.to_hex(),
-                    segments: manifest.segment_count(),
-                });
-                
-                // Find and respond to the waiting request
-                let mut pending = pending_requests.lock().await;
-                if let Some(PendingRequest::GetRecord { reply_tx }) = pending.remove(&content_id) {
-                    let _ = reply_tx.send(Ok(manifest));
-                    debug!("Responded to manifest retrieval request for {}", content_id);
-                }
-            }
-            
-            CraftObjEvent::AccessListRetrieved { content_id, access_list } => {
-                info!("[service.rs] Retrieved access list for {} ({} entries)", content_id, access_list.entries.len());
-                let mut pending = pending_requests.lock().await;
-                if let Some(PendingRequest::GetAccessList { reply_tx }) = pending.remove(&content_id) {
-                    let _ = reply_tx.send(Ok(access_list));
-                    debug!("Responded to access list retrieval request for {}", content_id);
-                }
-            }
+            // NOTE: ManifestRetrieved event removed — DHT manifest retrieval deprecated.
+            // GetRecord command now reads from local store directly.
 
             CraftObjEvent::PiecePushReceived { content_id } => {
                 let mut t = content_tracker.lock().await;
                 t.increment_local_pieces(&content_id);
             }
-            CraftObjEvent::ManifestPushReceived { content_id, manifest } => {
-                info!("[service.rs] Received manifest push for {} — tracking as storage provider", content_id);
+            // ManifestAutoCreated: fired when PieceBatchPush auto-creates a manifest
+            // from piece headers. Replaces the old ManifestPushReceived handler.
+            CraftObjEvent::ManifestAutoCreated { content_id, manifest } => {
+                info!("[service.rs] Auto-created manifest for {} ({} segments) — tracking as storage provider", content_id, manifest.segment_count());
                 let mut t = content_tracker.lock().await;
                 t.track_stored(content_id, &manifest);
                 drop(t);
 
                 // Immediately protect this CID from eviction.
-                // Without this, the eviction loop could remove it before the next
-                // content_tracker sync in eviction_maintenance_loop.
                 {
                     let mut mgr = eviction_manager.lock().await;
                     mgr.mark_funded(content_id);
@@ -2210,7 +2214,6 @@ async fn handle_protocol_events(
                 // Register CID with challenger for PDP tracking
                 {
                     let mut mgr = challenger.lock().await;
-                    // Default baseline: 1.5x redundancy target for all content
                     mgr.register_cid(content_id, Some(crate::health::TierInfo { min_piece_ratio: 1.5 }));
                 }
 
@@ -2219,12 +2222,11 @@ async fn handle_protocol_events(
                 let cmd = CraftObjCommand::AnnounceProvider {
                     content_id,
                     manifest: manifest.clone(),
-                    verification_record: None,
                     reply_tx,
                 };
                 if command_tx.send(cmd).is_ok() {
                     match reply_rx.await {
-                        Ok(Ok(())) => info!("[service.rs] Announced as provider for {} after receiving push", content_id),
+                        Ok(Ok(())) => info!("[service.rs] Announced as provider for {} after auto-manifest", content_id),
                         Ok(Err(e)) => warn!("[service.rs] Failed to announce as provider for {}: {}", content_id, e),
                         Err(_) => {}
                     }
@@ -2234,7 +2236,6 @@ async fn handle_protocol_events(
                 let tracker_clone = content_tracker.clone();
                 let cmd_tx = command_tx.clone();
                 tokio::spawn(async move {
-                    // Small delay to let other nodes announce first
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     let cmd = CraftObjCommand::ResolveProviders { content_id, reply_tx };
@@ -2267,9 +2268,7 @@ async fn handle_protocol_events(
                         PendingRequest::GetRecord { reply_tx } => {
                             let _ = reply_tx.send(Err(error));
                         }
-                        PendingRequest::GetAccessList { reply_tx } => {
-                            let _ = reply_tx.send(Err(error));
-                        }
+
                     }
                     debug!("Responded to DHT request with error for {}", content_id);
                 }
