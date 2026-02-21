@@ -2,8 +2,8 @@
 //!
 //! For each owned segment, polls providers via `HealthQuery` (direct stream)
 //! to get a total piece count across the network.
-//! If count < k * tier_target → repair.
-//! If count > k * tier_target AND no demand → degrade.
+//! If count < target_piece_count(k) → repair.
+//! If count > target_piece_count(k) AND no demand → degrade.
 //!
 //! No gossip. No PieceMap. No Merkle diff state machine.
 
@@ -20,7 +20,23 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::commands::CraftObjCommand;
+use crate::events::{DaemonEvent, EventSender};
 use crate::scaling::DemandTracker;
+
+// ---------------------------------------------------------------------------
+// VtagCheckResult — result of a homomorphic piece spot-check
+// ---------------------------------------------------------------------------
+
+/// Result returned by `vtag_spot_check`.
+#[derive(Debug)]
+enum VtagCheckResult {
+    /// The sampled piece passed the homomorphic hash check.
+    Pass,
+    /// The sampled piece failed — indicates silent corruption.
+    Fail { piece_id: [u8; 32] },
+    /// vtag blob not available locally — can't check, skip.
+    NoVtagBlob,
+}
 
 /// Minimum pieces a node must keep per segment.
 const MIN_PIECES_PER_SEGMENT: usize = 2;
@@ -44,8 +60,9 @@ pub struct HealthScan {
     store: Arc<Mutex<FsStore>>,
     demand_tracker: Arc<Mutex<DemandTracker>>,
     local_peer_id: PeerId,
-    tier_target: f64,
     command_tx: mpsc::UnboundedSender<CraftObjCommand>,
+    /// Optional broadcast sender for real-time repair events to the UI.
+    event_tx: Option<EventSender>,
     scan_interval: Duration,
     data_dir: Option<PathBuf>,
     /// Current position in the sorted CID list for rotational scanning.
@@ -64,17 +81,17 @@ impl HealthScan {
             store,
             demand_tracker,
             local_peer_id,
-            tier_target: 1.5,
             command_tx,
+            event_tx: None,
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
             data_dir: None,
             rotation_cursor: 0,
         }
     }
 
-    /// Set custom tier target (default 1.5).
-    pub fn set_tier_target(&mut self, target: f64) {
-        self.tier_target = target.max(1.5);
+    /// Attach an event sender so repair events are broadcast to the UI.
+    pub fn set_event_tx(&mut self, tx: EventSender) {
+        self.event_tx = Some(tx);
     }
 
     /// Set custom scan interval.
@@ -121,7 +138,10 @@ impl HealthScan {
     }
 
     /// Query a single peer for its piece count for (cid, segment).
-    async fn health_query(&self, peer_id: PeerId, cid: ContentId, segment: u32) -> u32 {
+    /// Returns 0 on timeout/error. Generates a fresh random nonce per call.
+    async fn health_query(&self, peer_id: PeerId, cid: ContentId, segment: u32) -> Option<u32> {
+        use rand::Rng;
+        let nonce: [u8; 32] = rand::thread_rng().gen();
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .command_tx
@@ -129,20 +149,22 @@ impl HealthScan {
                 peer_id,
                 content_id: cid,
                 segment_index: segment,
+                nonce,
                 reply_tx: tx,
             })
             .is_err()
         {
-            return 0;
+            return None;
         }
-        match rx.await {
-            Ok(Ok(count)) => count,
-            _ => 0,
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(Ok(count))) => Some(count),
+            Ok(Ok(Err(_))) | Ok(Err(_)) => None, // peer error
+            Err(_) => None,                        // timeout — peer is slow/dead
         }
     }
 
     /// Query all providers for (cid, segment) and return total network piece count.
-    /// Returns (total_remote_pieces, provider_count).
+    /// Peers that fail or time out are skipped for the rest of this scan call.
     async fn query_network_count(&self, cid: ContentId, segment: u32) -> (u32, usize) {
         let providers = self.resolve_providers(cid).await;
         if providers.is_empty() {
@@ -151,7 +173,11 @@ impl HealthScan {
         let provider_count = providers.len();
         let mut total: u32 = 0;
         for peer in providers {
-            total += self.health_query(peer, cid, segment).await;
+            if let Some(count) = self.health_query(peer, cid, segment).await {
+                total += count;
+            } else {
+                debug!("HealthScan: peer {} timed out / failed for {}/seg{} — skipping", peer, cid, segment);
+            }
         }
         (total, provider_count)
     }
@@ -159,6 +185,25 @@ impl HealthScan {
     // -----------------------------------------------------------------------
     // Scan loop
     // -----------------------------------------------------------------------
+
+    /// Immediately scan all segments for a specific CID, bypassing the rotation batch.
+    ///
+    /// Called by the repair queue drain loop when a `TriggerRepair` command arrives
+    /// (e.g. after a PDP challenge failure).
+    pub async fn run_scan_for_cid(&mut self, cid: &ContentId) {
+        let segments: Vec<u32> = {
+            let s = self.store.lock().await;
+            s.list_segments(cid).unwrap_or_default()
+        };
+        if segments.is_empty() {
+            debug!("HealthScan::run_scan_for_cid: no local segments for {}", cid);
+            return;
+        }
+        info!("HealthScan::run_scan_for_cid: scanning {} segments for {}", segments.len(), cid);
+        for seg in segments {
+            let _ = self.scan_segment(*cid, seg).await;
+        }
+    }
 
     /// Run a single scan over all owned segments.
     ///
@@ -238,6 +283,11 @@ impl HealthScan {
         let default_k = craftobj_core::SEGMENT_SIZE.div_ceil(craftobj_core::PIECE_SIZE);
 
         for (cid, segments) in &cid_segments {
+            // Prefer piece header for k; fall back to manifest
+            let header_k = {
+                let s = self.store.lock().await;
+                s.get_any_piece_header(cid).ok().flatten().map(|h| h.k as usize)
+            };
             let manifest = {
                 let s = self.store.lock().await;
                 s.get_record(cid).ok()
@@ -247,23 +297,35 @@ impl HealthScan {
             let mut min_ratio = f64::MAX;
 
             for &seg in segments {
-                let local_count = {
+                let (local_count, local_rank) = {
                     let s = self.store.lock().await;
-                    s.list_pieces(cid, seg).unwrap_or_default().len() as u32
+                    let piece_ids = s.list_pieces(cid, seg).unwrap_or_default();
+                    let count = piece_ids.len();
+                    // Compute true rank via GF(256) Gaussian elimination on coefficient vectors.
+                    // This detects silent linear dependence (dependent repair pieces, duplicates).
+                    let coeffs: Vec<Vec<u8>> = piece_ids.iter().filter_map(|pid| {
+                        s.get_piece(cid, seg, pid).ok().map(|(_, coeff)| coeff)
+                    }).collect();
+                    let rank = if coeffs.len() >= 2 {
+                        craftec_erasure::check_independence(&coeffs)
+                    } else {
+                        coeffs.len() // 0 or 1 piece → rank = count
+                    };
+                    (count as u32, rank)
                 };
                 let (remote_total, provider_count) = self.query_network_count(*cid, seg).await;
                 let total_pieces = local_count + remote_total;
-                let k = manifest
-                    .as_ref()
-                    .map(|m| m.k_for_segment(seg as usize))
+                let k = header_k
+                    .or_else(|| manifest.as_ref().map(|m| m.k_for_segment(seg as usize)))
                     .unwrap_or(default_k);
-                let ratio = if k > 0 { total_pieces as f64 / k as f64 } else { 0.0 };
+                // health_ratio uses TRUE local rank, not raw piece count
+                let ratio = if k > 0 { local_rank as f64 / k as f64 } else { 0.0 };
                 if ratio < min_ratio {
                     min_ratio = ratio;
                 }
                 seg_snapshots.push(SegmentSnapshot {
                     index: seg,
-                    rank: total_pieces as usize,
+                    rank: local_rank,   // GF(256) independence rank — the actual decodability metric
                     k,
                     total_pieces: total_pieces as usize,
                     provider_count: provider_count + if local_count > 0 { 1 } else { 0 },
@@ -287,36 +349,186 @@ impl HealthScan {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // vtag homomorphic spot-check
+    // -----------------------------------------------------------------------
+
+    /// Pick one random local piece per scan cycle and verify it against the
+    /// stored homomorphic segment hashes. Runs in O(piece_size * HASH_PROJECTIONS)
+    /// time — negligible compared to DHT queries.
+    async fn vtag_spot_check(
+        &self,
+        cid: &ContentId,
+        segment: u32,
+        vtag_cid: &[u8; 32],
+    ) -> VtagCheckResult {
+        // Load the vtag blob from local store
+        let vtag_bytes = {
+            let s = self.store.lock().await;
+            match s.get_vtag_blob(vtag_cid) {
+                Ok(b) => b,
+                Err(_) => return VtagCheckResult::NoVtagBlob,
+            }
+        };
+
+        // Deserialize ContentVerificationRecord (bincode)
+        let record: craftec_erasure::homomorphic::ContentVerificationRecord =
+            match bincode::deserialize(&vtag_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("HealthScan: could not deserialize vtag blob for {}: {}", cid, e);
+                    return VtagCheckResult::NoVtagBlob;
+                }
+            };
+
+        // Get the SegmentHashes for this specific segment
+        let seg_hashes = match record.segment_hashes.get(segment as usize) {
+            Some(h) => h,
+            None => {
+                debug!("HealthScan: vtag blob has no hashes for segment {} of {}", segment, cid);
+                return VtagCheckResult::NoVtagBlob;
+            }
+        };
+
+        // Load one random local piece (deterministic: unix_secs % piece_count)
+        let (piece_ids, piece_data) = {
+            let s = self.store.lock().await;
+            let mut ids = s.list_pieces(cid, segment).unwrap_or_default();
+            if ids.is_empty() {
+                return VtagCheckResult::Pass; // nothing to check
+            }
+            // Sort for determinism, rotate by time for sampling variety across cycles
+            ids.sort_unstable();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let pick = (now_secs as usize) % ids.len();
+            let chosen_id = ids[pick];
+            match s.get_piece(cid, segment, &chosen_id) {
+                Ok((data, coeff)) => (chosen_id, Some((data, coeff))),
+                Err(_) => (chosen_id, None),
+            }
+        };
+
+        let (data, coefficients) = match piece_data {
+            Some(pd) => pd,
+            None => return VtagCheckResult::Pass, // couldn't load — skip
+        };
+
+        let coded = craftec_erasure::CodedPiece { data, coefficients };
+
+        if craftec_erasure::homomorphic::verify_piece(&coded, seg_hashes) {
+            VtagCheckResult::Pass
+        } else {
+            VtagCheckResult::Fail { piece_id: piece_ids }
+        }
+    }
+
     /// Scan a single segment for repair or degradation needs.
     async fn scan_segment(&self, cid: ContentId, segment: u32) -> Option<HealthAction> {
-        let local_count = {
+        let (local_count, local_rank) = {
+            use sha2::{Digest, Sha256};
             let s = self.store.lock().await;
-            s.list_pieces(&cid, segment).unwrap_or_default().len()
+            let piece_ids = s.list_pieces(&cid, segment).unwrap_or_default();
+            let count = piece_ids.len();
+            let mut valid_coeffs: Vec<Vec<u8>> = Vec::new();
+            for pid in &piece_ids {
+                if let Ok((_, coeff)) = s.get_piece(&cid, segment, pid) {
+                    // Coefficient commitment check: SHA-256(coeff) must equal the piece_id.
+                    // Mismatch means the stored coefficient vector is corrupt/tampered.
+                    let computed: [u8; 32] = Sha256::digest(&coeff).into();
+                    if &computed != pid {
+                        warn!(
+                            "HealthScan: coeff commitment FAIL for {}/seg{} piece={} — dropping corrupt piece",
+                            cid, segment, hex::encode(&pid[..8])
+                        );
+                        // Drop the piece so it doesn't pollute rank or get served to peers
+                        if let Err(e) = s.delete_piece(&cid, segment, pid) {
+                            warn!("HealthScan: failed to delete corrupt piece: {}", e);
+                        }
+                    } else {
+                        valid_coeffs.push(coeff);
+                    }
+                }
+            }
+            let rank = if valid_coeffs.len() >= 2 {
+                craftec_erasure::check_independence(&valid_coeffs)
+            } else {
+                valid_coeffs.len()
+            };
+            (count, rank)
         };
         let local_node = self.local_peer_id.to_bytes();
 
         let (remote_total, _provider_count) = self.query_network_count(cid, segment).await;
-        let total_network_pieces = local_count + remote_total as usize;
 
-        let default_k = craftobj_core::SEGMENT_SIZE.div_ceil(craftobj_core::PIECE_SIZE);
-        let k = {
+        // Read k from piece header (self-describing) instead of manifest
+        let (k, vtags_cid) = {
             let s = self.store.lock().await;
-            s.get_record(&cid)
-                .ok()
-                .map(|m| m.k_for_segment(segment as usize))
-                .unwrap_or(default_k)
+            match s.get_any_piece_header(&cid) {
+                Ok(Some(header)) => (header.k as usize, header.vtags_cid),
+                _ => {
+                    // Fallback: try manifest, then default
+                    let k = s.get_record(&cid)
+                        .ok()
+                        .map(|m| m.k_for_segment(segment as usize))
+                        .unwrap_or(4); // default k
+                    (k, None)
+                }
+            }
         };
 
-        let k_f = k as f64;
-        let target_pieces = (k_f * self.tier_target).ceil() as usize;
+        // Network health = local RANK (not raw count) + remote reported count
+        // Using rank here surfaces silent dependence at the local node level.
+        let total_network_rank = local_rank + remote_total as usize;
+
+        // Kernel target: redundancy(k) = 2.0 + 16/k
+        // Tier multipliers are COM layer concerns, not kernel.
+        let target_pieces = craftobj_core::target_piece_count(k as u32) as usize;
 
         debug!(
-            "HealthScan: {}/seg{} k={} target={} network_pieces={} local={} tier={:.1}",
-            cid, segment, k, target_pieces, total_network_pieces, local_count, self.tier_target
+            "HealthScan: {}/seg{} k={} target={} network_rank={} local_count={} local_rank={} vtags={}",
+            cid, segment, k, target_pieces, total_network_rank, local_count, local_rank,
+            if vtags_cid.is_some() { "erasure" } else { "replicate" }
         );
 
-        // Under-replication → repair
-        if total_network_pieces < target_pieces && local_count >= MIN_PIECES_PER_SEGMENT {
+        // vtag homomorphic spot-check:
+        // If we hold vtags for this CID, verify one random local piece via the
+        // homomorphic inner-product check. A failure indicates silent corruption
+        // and triggers immediate repair even if piece counts look healthy.
+        if let Some(vtag_cid_bytes) = vtags_cid {
+            if local_count > 0 {
+                let spot_result = self.vtag_spot_check(&cid, segment, &vtag_cid_bytes).await;
+                match spot_result {
+                    VtagCheckResult::Pass => {
+                        debug!("HealthScan: vtag spot-check PASS for {}/seg{}", cid, segment);
+                    }
+                    VtagCheckResult::Fail { piece_id } => {
+                        warn!(
+                            "HealthScan: vtag spot-check FAIL for {}/seg{} piece={} — silent corruption detected, forcing repair",
+                            cid, segment, hex::encode(piece_id)
+                        );
+                        // Drop the corrupt piece so it doesn't pollute the segment
+                        {
+                            let s = self.store.lock().await;
+                            if let Err(e) = s.delete_piece(&cid, segment, &piece_id) {
+                                warn!("HealthScan: could not delete corrupt piece: {}", e);
+                            }
+                        }
+                        // Force repair regardless of network count
+                        self.attempt_repair(cid, segment, &local_node, 0).await;
+                        return Some(HealthAction::Repaired { segment, offset: 0 });
+                    }
+                    VtagCheckResult::NoVtagBlob => {
+                        debug!("HealthScan: vtag blob not available locally for {}/seg{} — skipping spot-check", cid, segment);
+                    }
+                }
+            }
+        }
+
+        // Under-replication → repair (based on true network rank)
+        if total_network_rank < target_pieces && local_count >= MIN_PIECES_PER_SEGMENT {
             // Deterministic: sort providers by piece count (piece is the same for all),
             // use local position. Since we have no per-provider counts here, use
             // a position of 0 (self is always willing to repair when under-replicated).
@@ -327,8 +539,11 @@ impl HealthScan {
             });
         }
 
-        // Over-replication → degrade if no demand
-        if total_network_pieces > target_pieces && local_count > MIN_PIECES_PER_SEGMENT {
+        // Over-replication → degrade if no demand (based on raw network count)
+        // Use raw remote + local pieces for over-replication: rank can't exceed k,
+        // but raw count above target still burns bandwidth.
+        let total_network_pieces = local_count + remote_total as usize;
+        if total_network_pieces > target_pieces && local_rank > MIN_PIECES_PER_SEGMENT {
             let has_demand = {
                 let dt = self.demand_tracker.lock().await;
                 dt.has_demand(&cid)
@@ -346,7 +561,11 @@ impl HealthScan {
         None
     }
 
-    /// Attempt to repair a segment by creating a new RLNC piece.
+    /// Attempt to repair a segment.
+    ///
+    /// Strategy depends on vtags_cid from piece header:
+    /// - `Some(vtags_cid)` → erasure extension (RLNC recombination) + distribute new piece
+    /// - `None` → replication (copy blob to more nodes)
     async fn attempt_repair(
         &self,
         cid: ContentId,
@@ -354,35 +573,306 @@ impl HealthScan {
         _local_node: &[u8],
         _offset: usize,
     ) {
-        let store_guard = self.store.lock().await;
-        let result = crate::health::heal_segment(&store_guard, &cid, segment, 1);
+        use craftobj_transfer::PiecePayload;
+        use std::collections::HashSet;
 
-        if result.pieces_generated == 0 {
-            warn!(
-                "HealthScan repair failed for {}/seg{}: {:?}",
-                cid, segment, result.errors
-            );
-            return;
+        // Determine repair strategy from piece header (also captures metadata for payload)
+        let (vtags_cid, total_size, segment_count, k) = {
+            let s = self.store.lock().await;
+            let header = s.get_any_piece_header(&cid).ok().flatten();
+            let vtags = header.as_ref().and_then(|h| h.vtags_cid);
+            let ts = header.as_ref().map(|h| h.total_size).unwrap_or(0);
+            let sc = header.as_ref().map(|h| h.segment_count).unwrap_or(1);
+            let kv = header.as_ref().map(|h| h.k).unwrap_or(0);
+            (vtags, ts, sc, kv)
+        };
+
+        let strategy = if vtags_cid.is_some() { "erasure" } else { "replication" };
+        info!("HealthScan: repair starting for {}/seg{} strategy={}", cid, segment, strategy);
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(DaemonEvent::RepairStarted {
+                content_id: cid.to_hex(),
+                segment,
+                strategy: strategy.to_string(),
+            });
         }
 
-        // Publish DHT provider record for this CID
-        let pkey = craftobj_routing::providers_dht_key(&cid);
+        if vtags_cid.is_some() {
+            // Erasure extension: capture existing piece IDs before healing to diff afterward.
+            let pieces_before: HashSet<[u8; 32]> = {
+                let s = self.store.lock().await;
+                s.list_pieces(&cid, segment).unwrap_or_default().into_iter().collect()
+            };
+
+            // Generate 1 new RLNC piece
+            let result = {
+                let store_guard = self.store.lock().await;
+                crate::health::heal_segment(&store_guard, &cid, segment, 1)
+            };
+
+            if result.pieces_generated == 0 {
+                warn!(
+                    "HealthScan erasure repair failed for {}/seg{}: {:?}",
+                    cid, segment, result.errors
+                );
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(DaemonEvent::RepairCompleted {
+                        content_id: cid.to_hex(),
+                        segment,
+                        pieces_generated: 0,
+                        success: false,
+                    });
+                }
+            } else {
+                info!(
+                    "HealthScan erasure repair for {}/seg{}: generated {} new piece(s)",
+                    cid, segment, result.pieces_generated
+                );
+
+                // ── Distribute the new piece to a non-provider peer ──────────────
+                // Diff: find piece IDs that don't exist in the pre-heal set.
+                let new_piece_ids: Vec<[u8; 32]> = {
+                    let s = self.store.lock().await;
+                    s.list_pieces(&cid, segment)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|pid| !pieces_before.contains(pid))
+                        .collect()
+                };
+
+                if !new_piece_ids.is_empty() {
+                    // Build PiecePayload for each new piece
+                    let payloads: Vec<PiecePayload> = {
+                        let s = self.store.lock().await;
+                        new_piece_ids.iter().filter_map(|pid| {
+                            s.get_piece(&cid, segment, pid).ok().map(|(data, coeff)| PiecePayload {
+                                segment_index: segment,
+                                piece_id: *pid,
+                                coefficients: coeff,
+                                data,
+                                total_size,
+                                segment_count,
+                                k,
+                                vtags_cid,
+                                vtag_blob: None,
+                            })
+                        }).collect()
+                    };
+
+                    if !payloads.is_empty() {
+                        // Get connected peers and pick one not already a provider.
+                        // (pieces_before is a reasonable proxy for "already has this CID")
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if self.command_tx.send(CraftObjCommand::ConnectedPeers { reply_tx }).is_ok() {
+                            if let Ok(peer_strings) = tokio::time::timeout(
+                                std::time::Duration::from_secs(3), reply_rx
+                            ).await.unwrap_or(Ok(vec![])) {
+                                // Pick first connected peer (already scorer-sorted in practice)
+                                let target = peer_strings.iter()
+                                    .find_map(|s| s.parse::<libp2p::PeerId>().ok());
+
+                                if let Some(target_peer) = target {
+                                    let (dist_tx, _dist_rx) = tokio::sync::oneshot::channel();
+                                    let _ = self.command_tx.send(CraftObjCommand::DistributePieces {
+                                        peer_id: target_peer,
+                                        content_id: cid,
+                                        pieces: payloads,
+                                        reply_tx: dist_tx,
+                                    });
+                                    info!(
+                                        "HealthScan: pushed repair piece for {}/seg{} to {}",
+                                        cid, segment, &target_peer.to_string()[..8]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(DaemonEvent::RepairCompleted {
+                        content_id: cid.to_hex(),
+                        segment,
+                        pieces_generated: result.pieces_generated,
+                        success: true,
+                    });
+                }
+            }
+        } else {
+            // Replication: push existing pieces to underserved peers.
+            // No RLNC generation — just redistribute what we already hold locally.
+            use craftobj_transfer::PiecePayload;
+
+            let (piece_ids, total_size, segment_count, k, vtags_cid_val) = {
+                let s = self.store.lock().await;
+                let header = s.get_any_piece_header(&cid).ok().flatten();
+                let ts = header.as_ref().map(|h| h.total_size).unwrap_or(0);
+                let sc = header.as_ref().map(|h| h.segment_count).unwrap_or(1);
+                let kv = header.as_ref().map(|h| h.k).unwrap_or(0);
+                let vtags = header.as_ref().and_then(|h| h.vtags_cid);
+                let pids = s.list_pieces(&cid, segment).unwrap_or_default();
+                (pids, ts, sc, kv, vtags)
+            };
+
+            if piece_ids.is_empty() {
+                warn!("HealthScan replication repair for {}/seg{}: no local pieces to push", cid, segment);
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(DaemonEvent::RepairCompleted {
+                        content_id: cid.to_hex(),
+                        segment,
+                        pieces_generated: 0,
+                        success: false,
+                    });
+                }
+            } else {
+                // Build payloads from all locally-held pieces for this segment
+                let payloads: Vec<PiecePayload> = {
+                    let s = self.store.lock().await;
+                    piece_ids.iter().filter_map(|pid| {
+                        s.get_piece(&cid, segment, pid).ok().map(|(data, coeff)| PiecePayload {
+                            segment_index: segment,
+                            piece_id: *pid,
+                            coefficients: coeff,
+                            data,
+                            total_size,
+                            segment_count,
+                            k,
+                            vtags_cid: vtags_cid_val,
+                            vtag_blob: None,
+                        })
+                    }).collect()
+                };
+
+                // Get known providers so we can push to a peer that isn't already one
+                let known_providers: std::collections::HashSet<String> = {
+                    let (rtx, rrx) = tokio::sync::oneshot::channel();
+                    if self.command_tx.send(CraftObjCommand::ResolveProviders {
+                        content_id: cid,
+                        reply_tx: rtx,
+                    }).is_ok() {
+                        tokio::time::timeout(std::time::Duration::from_secs(3), rrx)
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .and_then(|r| r.ok())
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect()
+                    } else {
+                        std::collections::HashSet::new()
+                    }
+                };
+
+                // Find a connected peer not already a provider
+                let (ctxr, crxr) = tokio::sync::oneshot::channel();
+                let target = if self.command_tx.send(CraftObjCommand::ConnectedPeers { reply_tx: ctxr }).is_ok() {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), crxr)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find_map(|s| {
+                            let peer = s.parse::<libp2p::PeerId>().ok()?;
+                            if !known_providers.contains(&peer.to_string()) { Some(peer) } else { None }
+                        })
+                } else {
+                    None
+                };
+
+                if let Some(target_peer) = target {
+                    let pushed = payloads.len();
+                    let (dist_tx, _dist_rx) = tokio::sync::oneshot::channel();
+                    let _ = self.command_tx.send(CraftObjCommand::DistributePieces {
+                        peer_id: target_peer,
+                        content_id: cid,
+                        pieces: payloads,
+                        reply_tx: dist_tx,
+                    });
+                    info!(
+                        "HealthScan replication repair: pushed {} piece(s) for {}/seg{} to {}",
+                        pushed, cid, segment, &target_peer.to_string()[..8]
+                    );
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(DaemonEvent::RepairCompleted {
+                            content_id: cid.to_hex(),
+                            segment,
+                            pieces_generated: pushed,
+                            success: true,
+                        });
+                    }
+                } else {
+                    warn!(
+                        "HealthScan replication repair for {}/seg{}: no non-provider peer available",
+                        cid, segment
+                    );
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(DaemonEvent::RepairCompleted {
+                            content_id: cid.to_hex(),
+                            segment,
+                            pieces_generated: 0,
+                            success: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Publish per-segment DHT provider record for the repaired segment
+        let pkey = craftobj_routing::provider_key(&cid, segment);
         let _ = self.command_tx.send(CraftObjCommand::StartProviding { key: pkey });
-        info!(
-            "HealthScan repair complete for {}/seg{}: generated {} new piece(s)",
-            cid, segment, result.pieces_generated
-        );
     }
 
     /// Attempt to degrade a segment by dropping 1 piece.
+    ///
+    /// Drops the most linearly dependent piece — one whose removal doesn't decrease
+    /// the segment rank (i.e. it contributes no unique information). Falls back to
+    /// alphabetical last if all pieces are found to be independent.
     async fn attempt_degradation(&self, cid: ContentId, segment: u32) {
         let store_guard = self.store.lock().await;
         let mut pieces = match store_guard.list_pieces(&cid, segment) {
             Ok(p) if p.len() > MIN_PIECES_PER_SEGMENT => p,
             _ => return,
         };
-        pieces.sort();
-        let piece_to_drop = *pieces.last().unwrap();
+
+        // Load all coefficient vectors for rank computation
+        let all_coeffs: Vec<(usize, Vec<u8>)> = pieces.iter().enumerate().filter_map(|(i, pid)| {
+            store_guard.get_piece(&cid, segment, pid).ok().map(|(_, coeff)| (i, coeff))
+        }).collect();
+
+        // Find the first piece whose removal leaves rank unchanged (most dependent).
+        // If all are independent, fall back to dropping alphabetically last.
+        let piece_to_drop = if all_coeffs.len() >= 2 {
+            let all_c: Vec<Vec<u8>> = all_coeffs.iter().map(|(_, c)| c.clone()).collect();
+            let full_rank = craftec_erasure::check_independence(&all_c);
+
+            all_coeffs.iter().find_map(|(idx, _)| {
+                let reduced: Vec<Vec<u8>> = all_coeffs.iter()
+                    .enumerate()
+                    .filter(|(i, _)| i != idx)
+                    .map(|(_, (_, c))| c.clone())
+                    .collect();
+                let reduced_rank = if reduced.len() >= 2 {
+                    craftec_erasure::check_independence(&reduced)
+                } else {
+                    reduced.len()
+                };
+                // If rank is unchanged after removing this piece → it's dependent → safe to drop
+                if reduced_rank >= full_rank {
+                    Some(pieces[*idx])
+                } else {
+                    None
+                }
+            }).unwrap_or_else(|| {
+                // All pieces are independent — drop alphabetically last (least valuable by key)
+                pieces.sort();
+                *pieces.last().unwrap()
+            })
+        } else {
+            pieces.sort();
+            *pieces.last().unwrap()
+        };
 
         if let Err(e) = store_guard.delete_piece(&cid, segment, &piece_to_drop) {
             warn!(
@@ -398,6 +888,14 @@ impl HealthScan {
             cid,
             segment
         );
+
+        // If no pieces remain for this segment, remove ourselves as provider from the DHT.
+        let remaining = store_guard.list_pieces(&cid, segment).unwrap_or_default().len();
+        if remaining == 0 {
+            let pkey = craftobj_routing::provider_key(&cid, segment);
+            let _ = self.command_tx.send(CraftObjCommand::StopProviding { key: pkey });
+            info!("HealthScan: no pieces remain for {}/seg{}, sent StopProviding", cid, segment);
+        }
     }
 
     /// Persist a health snapshot to JSONL file.
@@ -531,17 +1029,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn test_set_tier_target() {
-        let (store, dt, local, dir) = setup_test();
-        let tx = make_tx();
-        let mut scan = HealthScan::new(store, dt, local, tx);
-        scan.set_tier_target(2.0);
-        assert_eq!(scan.tier_target, 2.0);
-        scan.set_tier_target(1.0); // below minimum, should clamp to 1.5
-        assert_eq!(scan.tier_target, 1.5);
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // test_set_tier_target removed — tier_target is a COM-layer concern,
+    // not part of the kernel HealthScan.
 
     #[test]
     fn test_set_scan_interval() {

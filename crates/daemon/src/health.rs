@@ -166,7 +166,72 @@ pub struct HealingResult {
     pub errors: Vec<String>,
 }
 
-/// Generate new pieces via RLNC recombination for a specific segment.
+/// Generate a new RLNC piece that is **guaranteed linearly independent** from all
+/// existing pieces, using a retry loop with GF(256) Gaussian elimination.
+///
+/// Algorithm:
+///   1. Attempt `create_piece_from_existing` with fresh random GF(256) coefficients.
+///   2. Run `check_independence(existing_coefficients + new_coefficients)`.
+///   3. If the rank increased by 1 → the piece is orthogonal → return it.
+///   4. Otherwise retry, up to MAX_RETRIES times.
+///
+/// In GF(256) the probability that a random linear combination of k vectors is
+/// linearly dependent on them is at most k/256 ≈ 16% for k=40. With 32 retries
+/// the probability of failing is (k/256)^32 < 10^-33.
+fn create_orthogonal_piece_from_existing(
+    existing_pieces: &[craftec_erasure::CodedPiece],
+) -> Result<craftec_erasure::CodedPiece, String> {
+    const MAX_RETRIES: usize = 32;
+
+    // Pre-collect existing coefficient vectors for the independence check.
+    let mut existing_coeffs: Vec<Vec<u8>> = existing_pieces
+        .iter()
+        .map(|p| p.coefficients.clone())
+        .collect();
+
+    for attempt in 0..MAX_RETRIES {
+        let candidate = craftec_erasure::create_piece_from_existing(existing_pieces)
+            .map_err(|e| format!("recombination failed: {}", e))?;
+
+        // Temporarily add the candidate to check if it raises the rank.
+        existing_coeffs.push(candidate.coefficients.clone());
+        let new_rank = craftec_erasure::check_independence(&existing_coeffs);
+        let old_rank = new_rank.saturating_sub(1); // candidate was the last
+
+        // Check: did adding this piece increase the rank?
+        // (old_rank = rank without the candidate = existing_coeffs.len() - 1 vectors)
+        let base_rank = craftec_erasure::check_independence(
+            &existing_coeffs[..existing_coeffs.len() - 1],
+        );
+        existing_coeffs.pop();
+
+        if new_rank > base_rank {
+            // Independent! Add this coefficient to our tracking set and return.
+            existing_coeffs.push(candidate.coefficients.clone());
+            tracing::debug!(
+                "create_orthogonal_piece: found independent piece on attempt {}",
+                attempt + 1
+            );
+            return Ok(candidate);
+        }
+
+        tracing::debug!(
+            "create_orthogonal_piece: piece was dependent (attempt {}/{}), retrying",
+            attempt + 1,
+            MAX_RETRIES
+        );
+        let _ = old_rank; // suppress unused warning
+    }
+
+    Err(format!(
+        "could not generate a linearly independent piece after {} attempts \
+         (existing rank already at maximum for this piece set)",
+        MAX_RETRIES
+    ))
+}
+
+/// Generate new pieces via RLNC recombination for a specific segment,
+/// guaranteeing each new piece is linearly independent from existing ones.
 pub fn heal_segment(
     store: &FsStore,
     content_id: &ContentId,
@@ -199,19 +264,25 @@ pub fn heal_segment(
     }
 
     for _ in 0..pieces_needed {
-        match craftec_erasure::create_piece_from_existing(&existing_pieces) {
+        match create_orthogonal_piece_from_existing(&existing_pieces) {
             Ok(new_piece) => {
+                // Track the new piece in existing_pieces so the next iteration's
+                // independence check accounts for all previously generated pieces.
+                existing_pieces.push(craftec_erasure::CodedPiece {
+                    data: new_piece.data.clone(),
+                    coefficients: new_piece.coefficients.clone(),
+                });
                 let new_pid = craftobj_store::piece_id_from_coefficients(&new_piece.coefficients);
                 match store.store_piece(content_id, segment_index, &new_pid, &new_piece.data, &new_piece.coefficients) {
                     Ok(()) => {
-                        info!("Generated healing piece for {}/seg{}", content_id, segment_index);
+                        info!("Generated orthogonal healing piece for {}/seg{}", content_id, segment_index);
                         generated += 1;
                     }
                     Err(e) => errors.push(format!("store failed: {}", e)),
                 }
             }
             Err(e) => {
-                errors.push(format!("recombination failed: {}", e));
+                errors.push(e);
                 break;
             }
         }
@@ -255,22 +326,25 @@ pub fn heal_content(
             continue;
         }
 
-        // Generate new pieces via RLNC recombination.
-        // For extend() we may generate multiple pieces per segment.
+        // Generate new pieces via RLNC recombination — guaranteed independent.
         if generated >= pieces_needed {
             break;
         }
         let to_generate = pieces_needed - generated;
         for _ in 0..to_generate {
-            match craftec_erasure::create_piece_from_existing(&existing_pieces) {
+            match create_orthogonal_piece_from_existing(&existing_pieces) {
                 Ok(new_piece) => {
+                    existing_pieces.push(craftec_erasure::CodedPiece {
+                        data: new_piece.data.clone(),
+                        coefficients: new_piece.coefficients.clone(),
+                    });
                     let new_pid = craftobj_store::piece_id_from_coefficients(&new_piece.coefficients);
                     match store.store_piece(
                         &manifest.content_id, seg_idx, &new_pid,
                         &new_piece.data, &new_piece.coefficients,
                     ) {
                         Ok(()) => {
-                            info!("Generated healing piece for {}/seg{}", manifest.content_id, seg_idx);
+                            info!("Generated orthogonal healing piece for {}/seg{}", manifest.content_id, seg_idx);
                             generated += 1;
                         }
                         Err(e) => {
@@ -279,7 +353,7 @@ pub fn heal_content(
                     }
                 }
                 Err(e) => {
-                    errors.push(format!("recombination failed: {}", e));
+                    errors.push(e);
                     break;
                 }
             }

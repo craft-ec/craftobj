@@ -62,6 +62,9 @@ pub struct PeerScore {
     pub region: Option<String>,
     /// Root hash of the node's storage Merkle tree.
     pub storage_root: [u8; 32],
+    /// Consecutive PDP challenge failures (resets on success).
+    /// At ≥5 the peer is soft-banned from further PDP challenges until score recovers.
+    pub pdp_failures: u32,
 
     // ── Transfer statistics ─────────────────────────────────
     /// Total bytes sent to this peer.
@@ -92,6 +95,7 @@ impl PeerScore {
             storage_used_bytes: 0,
             region: None,
             storage_root: [0u8; 32],
+            pdp_failures: 0,
             bytes_sent: 0,
             bytes_received: 0,
             pieces_sent: 0,
@@ -183,6 +187,28 @@ impl PeerScorer {
         entry.apply_decay();
         entry.failures += 1.0;
         entry.last_interaction = Some(Instant::now());
+    }
+
+    /// Record a PDP challenge failure (escalating penalty).
+    /// Increments the dedicated `pdp_failures` counter which gates future challenges.
+    pub fn record_pdp_failure(&mut self, peer: &PeerId) {
+        self.record_failure(peer);
+        if let Some(entry) = self.scores.get_mut(peer) {
+            entry.pdp_failures += 1;
+        }
+    }
+
+    /// Record a PDP challenge success — resets the escalating failure counter.
+    pub fn record_pdp_success(&mut self, peer: &PeerId, latency: std::time::Duration) {
+        self.record_success(peer, latency);
+        if let Some(entry) = self.scores.get_mut(peer) {
+            entry.pdp_failures = 0;
+        }
+    }
+
+    /// Whether this peer is soft-banned from PDP challenges due to repeated failures.
+    pub fn is_pdp_banned(&self, peer: &PeerId) -> bool {
+        self.scores.get(peer).map(|s| s.pdp_failures >= 5).unwrap_or(false)
     }
 
     /// Record a timed-out interaction with a peer (weighted heavier than failure).

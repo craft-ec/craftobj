@@ -1,3 +1,13 @@
+> **⚠️ DEPRECATED** — This document described a gossipsub-based PieceMap propagation architecture that has been superseded.
+> The canonical piece tracking design is in [`CRAFTOBJ_DESIGN.md`](../CRAFTOBJ_DESIGN.md).
+> Key differences:
+> - No gossipsub. No PieceMap broadcast.
+> - Piece provider records live in the Kademlia DHT per CID (key: `/craftobj/providers/<cid_hex>`).
+> - Health is assessed via direct P2P `HealthQuery` (count-only) during periodic HealthScan.
+> - Merkle diff pulls are NOT used. This document's Merkle diff architecture is obsolete.
+>
+> **Do not implement anything from this document.** Retained for historical reference only.
+
 # Piece Tracking Design — DHT + Merkle Diff Pulls
 
 ## Overview

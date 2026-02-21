@@ -72,6 +72,10 @@ pub struct ContentState {
     /// Whether the initial 2-per-peer push has been completed.
     #[serde(default)]
     pub initial_push_done: bool,
+    /// Unix timestamp (secs) of the last successful pressure equalization for this CID.
+    /// Used to prevent re-equalizing the same CID every reannounce cycle.
+    #[serde(default)]
+    pub last_equalized: Option<u64>,
 }
 
 /// Persistent content lifecycle tracker.
@@ -125,6 +129,7 @@ impl ContentTracker {
             size: manifest.total_size,
             role: ContentRole::Publisher,
             initial_push_done: false,
+            last_equalized: None,
         };
 
         self.states.insert(content_id, state);
@@ -169,6 +174,7 @@ impl ContentTracker {
             size: manifest.total_size,
             role: ContentRole::StorageProvider,
             initial_push_done: true, // storage providers don't do initial push
+            last_equalized: None,
         };
 
         self.states.insert(content_id, state);
@@ -269,14 +275,37 @@ impl ContentTracker {
             .collect()
     }
 
-    /// CIDs where this node holds > 2 pieces and initial push is done.
+    /// CIDs where this node holds > 2 pieces, initial push is done,
+    /// AND the last equalization was more than EQUALIZATION_COOLDOWN_SECS ago.
     /// Used for pressure equalization (Distribution Function 2).
     pub fn needs_equalization(&self) -> Vec<ContentId> {
+        const EQUALIZATION_COOLDOWN_SECS: u64 = 600; // 10 minutes
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         self.states
             .values()
-            .filter(|s| s.initial_push_done && s.local_pieces > 2)
+            .filter(|s| {
+                s.initial_push_done
+                    && s.local_pieces > 2
+                    && s.last_equalized
+                        .map(|t| now.saturating_sub(t) >= EQUALIZATION_COOLDOWN_SECS)
+                        .unwrap_or(true) // never equalized → eligible
+            })
             .map(|s| s.content_id)
             .collect()
+    }
+
+    /// Mark a CID as equalized right now (sets last_equalized timestamp).
+    pub fn mark_equalized(&mut self, content_id: &ContentId) {
+        if let Some(state) = self.states.get_mut(content_id) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            state.last_equalized = Some(now);
+        }
     }
 
     pub fn import_from_store(&mut self, store: &FsStore) -> usize {
@@ -315,6 +344,7 @@ impl ContentTracker {
                         size: manifest.total_size,
                         role: ContentRole::Publisher,
                         initial_push_done: false,
+                        last_equalized: None,
                     };
                     self.states.insert(cid, state);
                     imported += 1;
@@ -466,14 +496,9 @@ mod tests {
 
     fn test_manifest(content_id: ContentId) -> ContentManifest {
         ContentManifest {
-            content_id: content_id,
+            content_id,
             total_size: 100_000,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 100_000,
-                segment_hashes: vec![],
-            },
+            vtags_cid: None,
         }
     }
 
