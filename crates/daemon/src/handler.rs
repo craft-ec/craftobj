@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::channel_store::ChannelStore;
+
 use crate::commands::CraftObjCommand;
 use crate::config::DaemonConfig;
 use crate::content_tracker::ContentTracker;
@@ -198,7 +198,7 @@ pub struct CraftObjHandler {
     command_tx: Option<mpsc::UnboundedSender<CraftObjCommand>>,
     peer_scorer: Option<SharedPeerScorer>,
     receipt_store: Option<Arc<Mutex<PersistentReceiptStore>>>,
-    channel_store: Option<Arc<Mutex<ChannelStore>>>,
+
     settlement_client: Option<Arc<Mutex<SolanaClient>>>,
     content_tracker: Option<Arc<Mutex<ContentTracker>>>,
     own_capabilities: Vec<CraftObjCapability>,
@@ -232,7 +232,6 @@ impl CraftObjHandler {
         command_tx: mpsc::UnboundedSender<CraftObjCommand>,
         peer_scorer: SharedPeerScorer,
         receipt_store: Arc<Mutex<PersistentReceiptStore>>,
-        channel_store: Arc<Mutex<ChannelStore>>,
     ) -> Self {
         Self { 
             client, 
@@ -240,7 +239,7 @@ impl CraftObjHandler {
             command_tx: Some(command_tx),
             peer_scorer: Some(peer_scorer),
             receipt_store: Some(receipt_store),
-            channel_store: Some(channel_store),
+
             settlement_client: None,
             content_tracker: None,
             own_capabilities: Vec::new(),
@@ -325,7 +324,7 @@ impl CraftObjHandler {
             command_tx: None,
             peer_scorer: None,
             receipt_store: None,
-            channel_store: None,
+
             settlement_client: None,
             content_tracker: None,
             own_capabilities: Vec::new(),
@@ -451,7 +450,7 @@ impl CraftObjHandler {
             let command = CraftObjCommand::AnnounceProvider {
                 content_id: result.content_id,
                 manifest,
-                verification_record: Some(result.verification_record.clone()),
+                
                 reply_tx,
             };
             
@@ -544,6 +543,11 @@ impl CraftObjHandler {
             .and_then(|v| v.as_str())
             .map(|s| hex::decode(s).unwrap_or_default());
 
+        // Optional byte-range: [range_start, range_end) — both in bytes, range_end exclusive.
+        // If only range_start is given, returns from that offset to end of file.
+        let range_start: Option<u64> = params.get("range_start").and_then(|v| v.as_u64());
+        let range_end: Option<u64> = params.get("range_end").and_then(|v| v.as_u64());
+
         let cid =
             craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
 
@@ -559,22 +563,8 @@ impl CraftObjHandler {
                 match client.store().get_record(&cid) {
                     Ok(m) => Some(m),
                     Err(_) => {
-                        // No manifest — try verification record and derive manifest from it
-                        if let Ok(vr) = client.store().get_verification_record(&cid) {
-                            info!("[handler.rs] No manifest but found verification record for {}, deriving manifest from file_size={}", cid, vr.file_size);
-                            let manifest = craftobj_core::ContentManifest {
-                                content_id: cid,
-                                total_size: vr.file_size,
-                                creator: String::new(),
-                                signature: vec![],
-                                verification: vr,
-                            };
-                            // Store synthetic manifest so reconstruct() can find it
-                            let _ = client.store().store_record(&manifest);
-                            Some(manifest)
-                        } else {
-                            None
-                        }
+                        // No manifest found — content may not be published here
+                        None
                     }
                 }
             };
@@ -675,33 +665,57 @@ impl CraftObjHandler {
                         Ok(Ok(providers)) if !providers.is_empty() => {
                             info!("[handler.rs] Found {} providers for {} via DHT", providers.len(), cid);
 
-                            let (manifest_tx, manifest_rx) = oneshot::channel();
-                            let command = CraftObjCommand::GetRecord {
-                                content_id: cid,
-                                reply_tx: manifest_tx,
-                            };
-
-                            if command_tx.send(command).is_ok() {
-                                match manifest_rx.await {
-                                    Ok(Ok(manifest)) => {
-                                        info!("[handler.rs] Retrieved manifest for {} from DHT", cid);
-                                        // Bug 2 fix: store manifest locally so reconstruct() can find it
-                                        {
-                                            let client = self.client.lock().await;
-                                            match client.store().store_record(&manifest) {
-                                                Ok(()) => info!("[handler.rs] Stored DHT manifest locally for {}", cid),
-                                                Err(e) => warn!("[handler.rs] Failed to store DHT manifest locally: {}", e),
+                            // Bootstrap manifest from first piece if we don't have one locally.
+                            // receive_pieces auto-creates the manifest from piece header fields.
+                            let manifest = {
+                                let client = self.client.lock().await;
+                                match client.store().get_record(&cid) {
+                                    Ok(m) => Some(m),
+                                    Err(_) => {
+                                        drop(client);
+                                        info!("[handler.rs] No local manifest for {}, bootstrapping from first piece", cid);
+                                        let mut bootstrapped = None;
+                                        for provider in &providers {
+                                            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+                                            let probe_cmd = CraftObjCommand::FetchPieces {
+                                                peer_id: *provider,
+                                                content_id: cid,
+                                                segment_index: 0,
+                                                have_pieces: vec![],
+                                                max_pieces: 1,
+                                                reply_tx: probe_tx,
+                                            };
+                                            if command_tx.send(probe_cmd).is_ok() {
+                                                if let Ok(Ok(Ok(pieces))) = tokio::time::timeout(
+                                                    std::time::Duration::from_secs(10), probe_rx
+                                                ).await {
+                                                    if !pieces.is_empty() {
+                                                        let client = self.client.lock().await;
+                                                        if let Ok(m) = client.store().get_record(&cid) {
+                                                            bootstrapped = Some(m);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
-                                        if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
-                                            info!("[handler.rs] DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
-                                        } else {
-                                            info!("[handler.rs] Successfully fetched pieces via DHT P2P path");
+                                        if bootstrapped.is_none() {
+                                            info!("[handler.rs] Bootstrap piece fetch failed/timed out for {} from all providers", cid);
                                         }
+                                        bootstrapped
                                     }
-                                    Ok(Err(e)) => debug!("Failed to get manifest from DHT: {}", e),
-                                    Err(e) => debug!("Manifest request channel error: {}", e),
                                 }
+                            };
+
+                            if let Some(manifest) = manifest {
+                                info!("[handler.rs] Have manifest for {} ({} segments)", cid, manifest.segment_count());
+                                if let Err(e) = self.fetch_missing_pieces_from_peers(&cid, &manifest, &providers, command_tx).await {
+                                    info!("[handler.rs] DHT P2P piece transfer failed: {}, falling back to local reconstruction", e);
+                                } else {
+                                    info!("[handler.rs] Successfully fetched pieces via DHT P2P path");
+                                }
+                            } else {
+                                info!("[handler.rs] No manifest available for {} — falling back to local reconstruction", cid);
                             }
                         }
                         Ok(Ok(_)) => debug!("No providers found for {} via DHT", cid),
@@ -716,6 +730,7 @@ impl CraftObjHandler {
         info!("[handler.rs] Using local reconstruction for {}", cid);
         let client = self.client.clone();
         let output_clone = output.clone();
+        let is_encrypted = key.is_some(); // capture before key is moved into closure
         tokio::task::spawn_blocking(move || {
             let client = client.blocking_lock();
             client
@@ -729,6 +744,85 @@ impl CraftObjHandler {
         if let Some(ref em) = self.eviction_manager {
             let mut mgr = em.lock().await;
             mgr.record_access(&cid);
+        }
+
+        // SHA-256 integrity check: ContentId == SHA-256(decoded_content).
+        // Detects silent decode corruption (rank-deficient recovery, bad coeff vectors, etc.)
+        // Skip for encrypted content (cid hashes ciphertext, not plaintext; key was applied).
+        if !is_encrypted {
+            let check_output = output.clone();
+            let check_cid = cid;
+            let integrity_ok = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                use sha2::{Digest, Sha256};
+                use std::io::Read;
+                let mut file = std::fs::File::open(&check_output)
+                    .map_err(|e| format!("open for sha256: {e}"))?;
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = file.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+                    if n == 0 { break; }
+                    hasher.update(&buf[..n]);
+                }
+                let hash: [u8; 32] = hasher.finalize().into();
+                Ok(hash == check_cid.0)
+            })
+            .await
+            .map_err(|e| format!("sha256 task panicked: {e}"))??;
+
+            if !integrity_ok {
+                return Err(format!(
+                    "SHA-256 integrity check FAILED for {} — decoded content does not match CID",
+                    cid
+                ));
+            }
+        }
+
+        // If a byte range was requested, slice the decoded output file and
+        // return both the full path and a range-extracted path.
+        if let Some(start) = range_start {
+            let full_path = output.clone();
+            let range_path = {
+                let mut rp = output.clone();
+                let ext = rp.extension()
+                    .map(|e| format!("{}.range", e.to_string_lossy()))
+                    .unwrap_or_else(|| "range".to_string());
+                rp.set_extension(ext);
+                rp
+            };
+            let range_path_inner = range_path.clone(); // clone before move into closure
+
+            let range_result = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+                use std::io::{Read, Seek, SeekFrom, Write};
+                let mut src = std::fs::File::open(&full_path)
+                    .map_err(|e| format!("open decoded file: {e}"))?;
+                let total_size = src.metadata().map(|m| m.len()).unwrap_or(0);
+                let end = range_end.unwrap_or(total_size).min(total_size);
+                if start >= end {
+                    return Err(format!("invalid range: start={start} >= end={end}"));
+                }
+                let len = end - start;
+                src.seek(SeekFrom::Start(start))
+                    .map_err(|e| format!("seek: {e}"))?;
+                let mut buf = vec![0u8; len as usize];
+                src.read_exact(&mut buf)
+                    .map_err(|e| format!("read range: {e}"))?;
+                let mut dst = std::fs::File::create(&range_path_inner)
+                    .map_err(|e| format!("create range file: {e}"))?;
+                dst.write_all(&buf)
+                    .map_err(|e| format!("write range: {e}"))?;
+                Ok(len)
+            })
+            .await
+            .map_err(|e| format!("range task panicked: {e}"))??;
+
+            return Ok(serde_json::json!({
+                "path": output.to_string_lossy(),
+                "range_path": range_path.to_string_lossy(),
+                "range_start": start,
+                "range_end": range_end,
+                "range_bytes": range_result,
+            }));
         }
 
         Ok(serde_json::json!({
@@ -764,7 +858,7 @@ impl CraftObjHandler {
                 let creator = {
                     let c = self.client.lock().await;
                     c.store().get_record(&item.content_id)
-                        .map(|m| m.creator.clone())
+                        .map(|_m| String::new())
                         .unwrap_or_default()
                 };
                 let mut obj = serde_json::json!({
@@ -1011,7 +1105,7 @@ impl CraftObjHandler {
                         }
                     }
                 }
-                map.track_segment(cid, seg);
+                map.track_segment(&cid, seg);
             }
         }
 
@@ -1021,7 +1115,7 @@ impl CraftObjHandler {
             command_tx.send(CraftObjCommand::AnnounceProvider {
                 content_id: cid,
                 manifest,
-                verification_record: None,
+                
                 reply_tx: tx,
             }).map_err(|e| e.to_string())?;
             let _ = rx.await;
@@ -1035,11 +1129,12 @@ impl CraftObjHandler {
         }))
     }
 
-    /// Fetch missing pieces from remote peers using parallel P2P transfer.
+    /// Fetch missing pieces from remote peers using ConnectionPool parallel transfer.
     ///
-    /// Design: opens concurrent piece requests (up to min(needed, providers, 20)),
-    /// checks linear independence of coefficient vectors before storing,
-    /// and discards dependent pieces.
+    /// Wraps `CraftObjCommand::FetchOnePieceRaw` in a `PieceRequester` adapter so that
+    /// `ConnectionPool::fetch_segments` can drive all the network concurrency, linear
+    /// independence checking, provider failure/replacement, and geo-scoring logic
+    /// that lives in `craftobj-client/src/fetch.rs`.
     async fn fetch_missing_pieces_from_peers(
         &self,
         content_id: &craftobj_core::ContentId,
@@ -1047,392 +1142,88 @@ impl CraftObjHandler {
         providers: &[libp2p::PeerId],
         command_tx: &tokio::sync::mpsc::UnboundedSender<CraftObjCommand>,
     ) -> Result<(), String> {
-        use tokio::task::JoinSet;
+        use craftobj_client::{ConnectionPool, FetchConfig, PieceRequester, ProviderId};
 
-        info!("[handler.rs] Fetching pieces for {} from {} providers", content_id, providers.len());
+        info!("[handler.rs] Fetching pieces for {} from {} providers (ConnectionPool)", content_id, providers.len());
 
-        let ranked_providers = if let Some(ref scorer) = self.peer_scorer {
+        // Build geo-scored provider list using peer scorer
+        let ranked_providers: Vec<libp2p::PeerId> = if let Some(ref scorer) = self.peer_scorer {
             let mut s = scorer.lock().await;
             s.rank_peers(providers)
         } else {
             providers.to_vec()
         };
 
-        // Load verification record for homomorphic hash verification of received pieces
-        let verification_record = {
-            let client = self.client.lock().await;
-            client.store().get_verification_record(content_id).ok()
-        };
-        let verification_record = std::sync::Arc::new(verification_record);
+        let provider_ids: Vec<ProviderId> = ranked_providers.iter()
+            .map(|p| ProviderId(p.to_string()))
+            .collect();
 
-        // Fetch all segments in parallel (Bug 3 fix: was sequential, seg0 consumed all time)
-        let mut segment_join_set: JoinSet<Result<(), String>> = JoinSet::new();
+        // Adapter: implements PieceRequester via FetchOnePieceRaw command
+        struct CommandChannelRequester {
+            command_tx: tokio::sync::mpsc::UnboundedSender<CraftObjCommand>,
+        }
 
-        for seg_idx in 0..manifest.segment_count() as u32 {
-            let k = manifest.k_for_segment(seg_idx as usize);
-            let client = self.client.clone();
-            let _peer_scorer = self.peer_scorer.clone();
-            let _merkle_tree = self.merkle_tree.clone();
-            let _piece_map = self.piece_map.clone();
-            let _signing_key = self.node_signing_key.clone();
-            let command_tx = command_tx.clone();
-            let cid = *content_id;
-            let ranked_providers = ranked_providers.clone();
-            let _vr = verification_record.clone();
-
-            segment_join_set.spawn(async move {
-            // Load existing pieces' piece IDs and coefficient vectors for independence checking
-            let (local_piece_ids, mut coeff_matrix) = {
-                let client = client.lock().await;
-                let piece_ids = client.store().list_pieces(&cid, seg_idx).unwrap_or_default();
-                let mut coeffs = Vec::with_capacity(piece_ids.len());
-                for pid in &piece_ids {
-                    if let Ok((_data, coeff)) = client.store().get_piece(&cid, seg_idx, pid) {
-                        coeffs.push(coeff);
-                    }
-                }
-                (piece_ids, coeffs)
-            };
-            info!("[handler.rs] Segment {}: have {} local pieces, {} coefficients", seg_idx, local_piece_ids.len(), coeff_matrix.len());
-
-            let mut current_rank = if coeff_matrix.is_empty() {
-                0
-            } else {
-                craftec_erasure::check_independence(&coeff_matrix)
-            };
-
-            if current_rank >= k {
-                return Ok(()); // Already have k independent pieces
-            }
-
-            let needed = k - current_rank;
-            info!("[handler.rs] Segment {} needs {} more independent pieces (have rank {}/{})", seg_idx, needed, current_rank, k);
-
-            let seg_start = std::time::Instant::now();
-
-            // Fetch from providers in order until we have k pieces.
-            // Each provider contributes what they have, we move to the next for the rest.
-            let mut have_pieces = local_piece_ids.clone();
-            let mut total_fetched = have_pieces.len();
-
-            for (attempt, &provider) in ranked_providers.iter().enumerate() {
-                if current_rank >= k {
-                    break;
-                }
-
-                let rank_deficit = (k - current_rank) as u16;
-                // Request extra pieces to account for possible linear dependence
-                let still_needed = rank_deficit.saturating_add(rank_deficit / 2).max(rank_deficit + 1);
-                info!("[fetch] seg{} attempt#{} to {} (have={}, rank={}/{}, requesting={})", 
-                    seg_idx, attempt, &provider.to_string()[..8], total_fetched, current_rank, k, still_needed);
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let command = CraftObjCommand::FetchPieces {
-                    peer_id: provider,
-                    content_id: cid,
-                    segment_index: seg_idx,
-                    have_pieces: have_pieces.clone(),
-                    max_pieces: still_needed,
+        #[async_trait::async_trait]
+        impl PieceRequester for CommandChannelRequester {
+            async fn request_piece(
+                &self,
+                provider: &ProviderId,
+                content_id: &craftobj_core::ContentId,
+                segment_index: u32,
+            ) -> craftobj_core::Result<(Vec<u8>, Vec<u8>)> {
+                let peer_id = provider.0.parse::<libp2p::PeerId>()
+                    .map_err(|_| craftobj_core::CraftObjError::StorageError("invalid peer id".into()))?;
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cmd = CraftObjCommand::FetchOnePieceRaw {
+                    peer_id,
+                    content_id: *content_id,
+                    segment_index,
                     reply_tx,
                 };
-                if command_tx.send(command).is_err() {
-                    return Err(format!("Segment {}: command channel closed", seg_idx));
-                }
-
-                match tokio::time::timeout(std::time::Duration::from_secs(60), reply_rx).await {
-                    Ok(Ok(Ok(piece_ids))) => {
-                        let got = piece_ids.len().saturating_sub(total_fetched);
-                        total_fetched = piece_ids.len();
-                        have_pieces = piece_ids;
-                        
-                        // Recompute rank with all current pieces to check independence
-                        {
-                            let client_guard = client.lock().await;
-                            coeff_matrix.clear();
-                            for pid in &have_pieces {
-                                if let Ok((_data, coeff)) = client_guard.store().get_piece(&cid, seg_idx, pid) {
-                                    coeff_matrix.push(coeff);
-                                }
-                            }
-                            current_rank = if coeff_matrix.is_empty() {
-                                0
-                            } else {
-                                craftec_erasure::check_independence(&coeff_matrix)
-                            };
-                        }
-                        
-                        info!("[fetch] seg{} got {} new pieces from {} (total: {}, rank: {}/{})", 
-                            seg_idx, got, &provider.to_string()[..8], total_fetched, current_rank, k);
-                    }
-                    Ok(Ok(Err(e))) => {
-                        warn!("[fetch] seg{} provider {} failed: {}", seg_idx, &provider.to_string()[..8], e);
-                    }
-                    Ok(Err(_)) => {
-                        warn!("[fetch] seg{} provider {} reply dropped", seg_idx, &provider.to_string()[..8]);
-                    }
-                    Err(_) => {
-                        warn!("[fetch] seg{} provider {} timeout", seg_idx, &provider.to_string()[..8]);
-                    }
+                self.command_tx.send(cmd)
+                    .map_err(|_| craftobj_core::CraftObjError::StorageError("command channel closed".into()))?;
+                match reply_rx.await {
+                    Ok(Ok(pair)) => Ok(pair),
+                    Ok(Err(e)) => Err(craftobj_core::CraftObjError::StorageError(e)),
+                    Err(_) => Err(craftobj_core::CraftObjError::StorageError("reply channel dropped".into())),
                 }
             }
-
-            if current_rank >= k {
-                info!("[fetch] seg{} COMPLETE: {} pieces (rank {}) in {:.1}s", seg_idx, total_fetched, current_rank, seg_start.elapsed().as_secs_f64());
-            } else {
-                warn!("[fetch] seg{} INCOMPLETE: rank {}/{} ({} pieces) after all providers, {:.1}s", seg_idx, current_rank, k, total_fetched, seg_start.elapsed().as_secs_f64());
-                return Err(format!("Segment {} incomplete: rank {}/{}", seg_idx, current_rank, k));
-            }
-
-            Ok(())
-            }); // end segment_join_set.spawn
         }
 
-        // Collect results from all segments
-        let mut errors = Vec::new();
-        while let Some(result) = segment_join_set.join_next().await {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => errors.push(e),
-                Err(e) => errors.push(format!("segment task panicked: {}", e)),
-            }
-        }
+        let requester = Arc::new(CommandChannelRequester { command_tx: command_tx.clone() });
+        let mut pool = ConnectionPool::new(requester, provider_ids, FetchConfig::default());
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
-    }
-
-    // -- Access control IPC handlers --
-
-    async fn handle_access_grant(&self, params: Option<Value>) -> Result<Value, String> {
-        let params = params.ok_or("missing params")?;
-        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
-        let creator_secret_hex = params.get("creator_secret").and_then(|v| v.as_str()).ok_or("missing 'creator_secret'")?;
-        let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
-        let content_key_hex = params.get("content_key").and_then(|v| v.as_str()).ok_or("missing 'content_key'")?;
-
-        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
-        let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
-        if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
-        let creator_key = ed25519_dalek::SigningKey::from_bytes(
-            creator_bytes.as_slice().try_into().unwrap()
-        );
-        let recipient_bytes = parse_pubkey(recipient_pubkey_hex)?;
-        let recipient_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&recipient_bytes)
-            .map_err(|e| format!("invalid recipient pubkey: {e}"))?;
-        let content_key = hex::decode(content_key_hex).map_err(|e| e.to_string())?;
-
-        // Generate re-key entry
-        let re_key = craftobj_core::pre::generate_re_key(&creator_key, &recipient_pubkey)
-            .map_err(|e| e.to_string())?;
-        let entry = craftobj_core::pre::ReKeyEntry {
-            recipient_did: recipient_bytes,
-            re_key,
-        };
-
-        // Also generate the re-encrypted key for the recipient
-        let re_encrypted = craftobj_core::pre::re_encrypt_with_content_key(&content_key, &entry.re_key)
+        let segment_indices: Vec<u32> = (0..manifest.segment_count() as u32).collect();
+        let pieces_by_segment = pool.fetch_segments(content_id, manifest, &segment_indices).await
             .map_err(|e| e.to_string())?;
 
-        // Store re-key in DHT
-        if let Some(ref command_tx) = self.command_tx {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftObjCommand::PutReKey {
-                content_id,
-                entry: entry.clone(),
-                reply_tx,
-            }).map_err(|e| e.to_string())?;
-            reply_rx.await.map_err(|e| e.to_string())??;
-        }
-
-        if let Some(ref tx) = self.event_sender {
-            let _ = tx.send(DaemonEvent::AccessGranted {
-                content_id: cid_hex.to_string(),
-                recipient: recipient_pubkey_hex.to_string(),
-            });
-        }
-
-        Ok(serde_json::json!({
-            "cid": cid_hex,
-            "recipient": recipient_pubkey_hex,
-            "re_encrypted_key": {
-                "ephemeral_public": hex::encode(re_encrypted.ephemeral_public),
-                "nonce": hex::encode(re_encrypted.nonce),
-                "ciphertext": hex::encode(&re_encrypted.ciphertext),
-            },
-        }))
-    }
-
-    async fn handle_access_revoke(&self, params: Option<Value>) -> Result<Value, String> {
-        let params = params.ok_or("missing params")?;
-        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
-        let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
-
-        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
-        let recipient_did = parse_pubkey(recipient_pubkey_hex)?;
-
-        if let Some(ref command_tx) = self.command_tx {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftObjCommand::RemoveReKey {
-                content_id,
-                recipient_did,
-                reply_tx,
-            }).map_err(|e| e.to_string())?;
-            reply_rx.await.map_err(|e| e.to_string())??;
-        }
-
-        if let Some(ref tx) = self.event_sender {
-            let _ = tx.send(DaemonEvent::AccessRevoked {
-                content_id: cid_hex.to_string(),
-                recipient: recipient_pubkey_hex.to_string(),
-            });
-        }
-
-        Ok(serde_json::json!({
-            "cid": cid_hex,
-            "recipient": recipient_pubkey_hex,
-            "revoked": true,
-        }))
-    }
-
-    async fn handle_access_list(&self, params: Option<Value>) -> Result<Value, String> {
-        let params = params.ok_or("missing params")?;
-        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
-
-        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
-
-        if let Some(ref command_tx) = self.command_tx {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftObjCommand::GetAccessList {
-                content_id,
-                reply_tx,
-            }).map_err(|e| e.to_string())?;
-
-            match reply_rx.await {
-                Ok(Ok(access_list)) => {
-                    let dids: Vec<String> = access_list.entries.iter()
-                        .map(|e| hex::encode(e.recipient_did))
-                        .collect();
-                    Ok(serde_json::json!({
-                        "cid": cid_hex,
-                        "creator": hex::encode(access_list.creator_did),
-                        "authorized": dids,
-                    }))
+        // Write fetched pieces to local FsStore
+        let client = self.client.lock().await;
+        for (seg_idx, pieces) in pieces_by_segment {
+            for piece in pieces {
+                use craftobj_store::piece_id_from_coefficients;
+                let pid = piece_id_from_coefficients(&piece.coefficients);
+                // Build a self-describing header from the manifest
+                let header = craftobj_core::PieceHeader {
+                    content_id: *content_id,
+                    total_size: manifest.total_size,
+                    segment_idx: seg_idx,
+                    segment_count: manifest.segment_count() as u32,
+                    k: manifest.k_for_segment(seg_idx as usize) as u32,
+                    vtags_cid: manifest.vtags_cid,
+                    coefficients: piece.coefficients.clone(),
+                };
+                if let Err(e) = client.store().store_piece_with_header(
+                    content_id, seg_idx, &pid, &piece.data, &piece.coefficients, &header,
+                ) {
+                    warn!("[handler.rs] Failed to store piece for seg {}: {}", seg_idx, e);
                 }
-                Ok(Err(e)) => Err(format!("DHT lookup failed: {e}")),
-                Err(e) => Err(format!("channel error: {e}")),
             }
-        } else {
-            Err("no network available".into())
         }
+
+        Ok(())
     }
 
-    /// Revoke access with key rotation: revoke user, rotate content key, re-grant remaining users.
-    async fn handle_access_revoke_rotate(&self, params: Option<Value>) -> Result<Value, String> {
-        let params = params.ok_or("missing params")?;
-        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
-        let creator_secret_hex = params.get("creator_secret").and_then(|v| v.as_str()).ok_or("missing 'creator_secret'")?;
-        let recipient_pubkey_hex = params.get("recipient_pubkey").and_then(|v| v.as_str()).ok_or("missing 'recipient_pubkey'")?;
-        let content_key_hex = params.get("content_key").and_then(|v| v.as_str()).ok_or("missing 'content_key'")?;
-
-        // Parse authorized users list
-        let authorized_arr = params.get("authorized").and_then(|v| v.as_array()).ok_or("missing 'authorized' array")?;
-        let mut all_authorized = Vec::new();
-        for val in authorized_arr {
-            let hex_str = val.as_str().ok_or("authorized entry must be hex string")?;
-            let bytes = parse_pubkey(hex_str)?;
-            let vk = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-                .map_err(|e| format!("invalid authorized pubkey: {e}"))?;
-            all_authorized.push(vk);
-        }
-
-        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
-        let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
-        if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
-        let creator_key = ed25519_dalek::SigningKey::from_bytes(
-            creator_bytes.as_slice().try_into().unwrap()
-        );
-        let revoked_bytes = parse_pubkey(recipient_pubkey_hex)?;
-        let revoked_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&revoked_bytes)
-            .map_err(|e| format!("invalid recipient pubkey: {e}"))?;
-        let content_key = hex::decode(content_key_hex).map_err(|e| e.to_string())?;
-
-        // 1. Revoke: tombstone the old re-key
-        if let Some(ref command_tx) = self.command_tx {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftObjCommand::RemoveReKey {
-                content_id,
-                recipient_did: revoked_bytes,
-                reply_tx,
-            }).map_err(|e| e.to_string())?;
-            reply_rx.await.map_err(|e| e.to_string())??;
-        }
-
-        // 2. Rotate key + re-encrypt content + re-grant remaining users
-        let revocation = {
-            let mut client = self.client.lock().await;
-            client.revoke_and_rotate(
-                &content_id,
-                &content_key,
-                &creator_key,
-                &revoked_pubkey,
-                &all_authorized,
-            ).map_err(|e| e.to_string())?
-        };
-
-        // 3. Store new re-keys in DHT and announce new CID
-        if let Some(ref command_tx) = self.command_tx {
-            // Store re-keys for remaining users
-            for (entry, _re_enc) in &revocation.re_grants {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                command_tx.send(CraftObjCommand::PutReKey {
-                    content_id: revocation.new_content_id,
-                    entry: entry.clone(),
-                    reply_tx,
-                }).map_err(|e| e.to_string())?;
-                reply_rx.await.map_err(|e| e.to_string())??;
-            }
-
-            // Announce new CID as provider
-            let manifest = {
-                let client = self.client.lock().await;
-                client.store().get_record(&revocation.new_content_id)
-                    .map_err(|e| e.to_string())?
-            };
-            let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftObjCommand::AnnounceProvider {
-                content_id: revocation.new_content_id,
-                manifest,
-                verification_record: None,
-                reply_tx,
-            }).map_err(|e| e.to_string())?;
-            let _ = reply_rx.await;
-        }
-
-        // Build response with re-grant info
-        let re_grants_json: Vec<Value> = revocation.re_grants.iter().map(|(entry, re_enc)| {
-            serde_json::json!({
-                "recipient": hex::encode(entry.recipient_did),
-                "re_encrypted_key": {
-                    "ephemeral_public": hex::encode(re_enc.ephemeral_public),
-                    "nonce": hex::encode(re_enc.nonce),
-                    "ciphertext": hex::encode(&re_enc.ciphertext),
-                },
-            })
-        }).collect();
-
-        Ok(serde_json::json!({
-            "old_cid": cid_hex,
-            "new_cid": revocation.new_content_id.to_hex(),
-            "new_key": hex::encode(&revocation.new_encryption_key),
-            "new_size": revocation.new_total_size,
-            "new_segments": revocation.new_segment_count as u64,
-            "revoked": recipient_pubkey_hex,
-            "re_grants": re_grants_json,
-        }))
-    }
 
     // -- Content removal IPC handler --
 
@@ -1483,192 +1274,6 @@ impl CraftObjHandler {
         Ok(serde_json::json!({ "deleted": true }))
     }
 
-    async fn handle_data_remove(&self, params: Option<Value>) -> Result<Value, String> {
-        let params = params.ok_or("missing params")?;
-        let cid_hex = params.get("cid").and_then(|v| v.as_str()).ok_or("missing 'cid'")?;
-        let creator_secret_hex = params.get("creator_secret").and_then(|v| v.as_str())
-            .ok_or("missing 'creator_secret'")?;
-        let reason = params.get("reason").and_then(|v| v.as_str()).map(String::from);
-
-        let content_id = craftobj_core::ContentId::from_hex(cid_hex).map_err(|e| e.to_string())?;
-        let creator_bytes = hex::decode(creator_secret_hex).map_err(|e| e.to_string())?;
-        if creator_bytes.len() != 32 { return Err("creator_secret must be 32 bytes hex".into()); }
-        let creator_key = ed25519_dalek::SigningKey::from_bytes(
-            creator_bytes.as_slice().try_into().unwrap()
-        );
-
-        // Verify creator matches manifest (if we have it locally)
-        {
-            let client = self.client.lock().await;
-            if let Ok(manifest) = client.store().get_record(&content_id) {
-                if !manifest.creator.is_empty() {
-                    let expected_did = craftobj_core::did_from_pubkey(&creator_key.verifying_key());
-                    if manifest.creator != expected_did {
-                        return Err("creator key does not match manifest creator".into());
-                    }
-                }
-            }
-        }
-
-        // Create removal notice via client
-        let notice = {
-            let mut client = self.client.lock().await;
-            client.remove_content(&creator_key, &content_id, reason)
-                .map_err(|e| e.to_string())?
-        };
-
-        // Publish to DHT
-        if let Some(ref command_tx) = self.command_tx {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            command_tx.send(CraftObjCommand::PublishRemoval {
-                content_id,
-                notice: notice.clone(),
-                reply_tx,
-            }).map_err(|e| e.to_string())?;
-
-            match reply_rx.await {
-                Ok(Ok(())) => {
-                    debug!("Successfully published removal notice for {}", content_id);
-                }
-                Ok(Err(e)) => {
-                    warn!("[handler.rs] Failed to publish removal notice: {}", e);
-                }
-                Err(e) => {
-                    warn!("[handler.rs] Removal notice channel closed: {}", e);
-                }
-            }
-        }
-
-        if let Some(ref tx) = self.event_sender {
-            let _ = tx.send(DaemonEvent::RemovalPublished {
-                content_id: cid_hex.to_string(),
-            });
-        }
-
-        Ok(serde_json::json!({
-            "cid": cid_hex,
-            "removed": true,
-            "creator": notice.creator,
-            "timestamp": notice.timestamp,
-        }))
-    }
-
-    // -- Payment channel IPC handlers --
-
-    async fn handle_channel_open(&self, params: Option<Value>) -> Result<Value, String> {
-        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
-        let params = params.ok_or("missing params")?;
-        let sender_hex = params.get("sender").and_then(|v| v.as_str()).ok_or("missing 'sender'")?;
-        let receiver_hex = params.get("receiver").and_then(|v| v.as_str()).ok_or("missing 'receiver'")?;
-        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
-
-        let sender = parse_pubkey(sender_hex)?;
-        let receiver = parse_pubkey(receiver_hex)?;
-
-        // Generate channel ID from hash of (sender, receiver, timestamp)
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut id_data = Vec::new();
-        id_data.extend_from_slice(&sender);
-        id_data.extend_from_slice(&receiver);
-        id_data.extend_from_slice(&timestamp.to_le_bytes());
-        let channel_id: [u8; 32] = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(&id_data);
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&hash);
-            id
-        };
-
-        let channel = craftobj_core::payment_channel::PaymentChannel::new(
-            channel_id, sender, receiver, amount,
-        );
-
-        // Persist via ChannelStore
-        let cs = store.lock().await;
-        cs.open_channel(channel.clone()).map_err(|e| e.to_string())?;
-
-        debug!("Opened payment channel {}", hex::encode(channel_id));
-
-        if let Some(ref tx) = self.event_sender {
-            let _ = tx.send(DaemonEvent::ChannelOpened {
-                channel_id: hex::encode(channel.channel_id),
-                receiver: hex::encode(channel.receiver),
-                amount: channel.locked_amount,
-            });
-        }
-
-        Ok(serde_json::json!({
-            "channel_id": hex::encode(channel.channel_id),
-            "sender": hex::encode(channel.sender),
-            "receiver": hex::encode(channel.receiver),
-            "locked_amount": channel.locked_amount,
-        }))
-    }
-
-    async fn handle_channel_voucher(&self, params: Option<Value>) -> Result<Value, String> {
-        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
-        let params = params.ok_or("missing params")?;
-        let channel_id_hex = params.get("channel_id").and_then(|v| v.as_str()).ok_or("missing 'channel_id'")?;
-        let amount = params.get("amount").and_then(|v| v.as_u64()).ok_or("missing 'amount'")?;
-        let nonce = params.get("nonce").and_then(|v| v.as_u64()).ok_or("missing 'nonce'")?;
-        let signature_hex = params.get("signature").and_then(|v| v.as_str()).unwrap_or("");
-
-        let channel_id = parse_pubkey(channel_id_hex)?;
-        let signature = if signature_hex.is_empty() {
-            vec![]
-        } else {
-            hex::decode(signature_hex).map_err(|e| e.to_string())?
-        };
-
-        let voucher = craftobj_core::payment_channel::PaymentVoucher {
-            channel_id,
-            cumulative_amount: amount,
-            nonce,
-            signature,
-        };
-
-        // Validate + persist via ChannelStore (includes sig verification)
-        let cs = store.lock().await;
-        cs.apply_voucher(&channel_id, voucher.clone()).map_err(|e| e.to_string())?;
-
-        debug!("Applied voucher for channel {} amount={} nonce={}", hex::encode(channel_id), amount, nonce);
-
-        Ok(serde_json::json!({
-            "channel_id": hex::encode(channel_id),
-            "cumulative_amount": amount,
-            "nonce": nonce,
-            "valid": true,
-        }))
-    }
-
-    async fn handle_channel_close(&self, params: Option<Value>) -> Result<Value, String> {
-        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
-        let params = params.ok_or("missing params")?;
-        let channel_id_hex = params.get("channel_id").and_then(|v| v.as_str()).ok_or("missing 'channel_id'")?;
-        let channel_id = parse_pubkey(channel_id_hex)?;
-
-        let cs = store.lock().await;
-        let final_state = cs.close_channel(&channel_id).map_err(|e| e.to_string())?;
-
-        debug!("Closed payment channel {}", channel_id_hex);
-
-        if let Some(ref tx) = self.event_sender {
-            let _ = tx.send(DaemonEvent::ChannelClosed {
-                channel_id: channel_id_hex.to_string(),
-            });
-        }
-
-        Ok(serde_json::json!({
-            "channel_id": channel_id_hex,
-            "status": "closed",
-            "final_spent": final_state.spent,
-            "locked_amount": final_state.locked_amount,
-            "remaining": final_state.remaining(),
-        }))
-    }
 
     // -- Settlement IPC handlers --
 
@@ -1823,35 +1428,7 @@ impl CraftObjHandler {
         }))
     }
 
-    async fn handle_channel_list(&self, params: Option<Value>) -> Result<Value, String> {
-        let store = self.channel_store.as_ref().ok_or("channel store not available")?;
-        let cs = store.lock().await;
 
-        let channels = if let Some(params) = params {
-            if let Some(peer_hex) = params.get("peer").and_then(|v| v.as_str()) {
-                let peer = parse_pubkey(peer_hex)?;
-                cs.list_channels_by_peer(&peer)
-            } else {
-                cs.list_channels()
-            }
-        } else {
-            cs.list_channels()
-        };
-
-        let items: Vec<Value> = channels.iter().map(|ch| {
-            serde_json::json!({
-                "channel_id": hex::encode(ch.channel_id),
-                "sender": hex::encode(ch.sender),
-                "receiver": hex::encode(ch.receiver),
-                "locked_amount": ch.locked_amount,
-                "spent": ch.spent,
-                "remaining": ch.remaining(),
-                "nonce": ch.nonce,
-            })
-        }).collect();
-
-        Ok(serde_json::json!({ "channels": items }))
-    }
 
     async fn handle_get_config(&self) -> Result<Value, String> {
         let config = self.daemon_config.as_ref().ok_or("daemon config not available")?;
@@ -2156,7 +1733,7 @@ impl CraftObjHandler {
             let map = pm.lock().await;
             let mut cid_pieces = std::collections::HashMap::new();
             for cid in map.all_cids() {
-                let total = map.total_pieces(&cid);
+                let total = map.providers(&cid).len();
                 if total > 0 {
                     cid_pieces.insert(cid.to_hex(), total);
                 }
@@ -2370,6 +1947,85 @@ impl CraftObjHandler {
             "next_epoch_secs": 0
         }))
     }
+
+    // ── KV Store (file-based, in data_dir/kv/) ──────────────────────────
+
+    fn kv_dir(&self) -> std::result::Result<PathBuf, String> {
+        let dir = self.data_dir.as_ref()
+            .ok_or("data_dir not configured")?
+            .join("kv");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        Ok(dir)
+    }
+
+    fn kv_path(&self, key: &str) -> std::result::Result<PathBuf, String> {
+        // Sanitize key to filesystem-safe name
+        let safe: String = key.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':' { c } else { '_' })
+            .collect();
+        if safe.is_empty() {
+            return Err("empty key".into());
+        }
+        Ok(self.kv_dir()?.join(safe))
+    }
+
+    /// `kv.put` — Store a key-value pair. Params: `{"key": "...", "value": "..."}`
+    async fn handle_kv_put(&self, params: Option<Value>) -> std::result::Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let key = params.get("key").and_then(|v| v.as_str()).ok_or("missing 'key'")?;
+        let value = params.get("value").and_then(|v| v.as_str()).ok_or("missing 'value'")?;
+        let path = self.kv_path(key)?;
+        std::fs::write(&path, value).map_err(|e| e.to_string())?;
+        debug!("kv.put: {} = {} ({} bytes)", key, &value[..value.len().min(32)], value.len());
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    /// `kv.get` — Retrieve a value by key. Params: `{"key": "..."}`
+    async fn handle_kv_get(&self, params: Option<Value>) -> std::result::Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let key = params.get("key").and_then(|v| v.as_str()).ok_or("missing 'key'")?;
+        let path = self.kv_path(key)?;
+        match std::fs::read_to_string(&path) {
+            Ok(value) => Ok(serde_json::json!({"key": key, "value": value})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(serde_json::json!({"key": key, "value": null}))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// `kv.delete` — Delete a key. Params: `{"key": "..."}`
+    async fn handle_kv_delete(&self, params: Option<Value>) -> std::result::Result<Value, String> {
+        let params = params.ok_or("missing params")?;
+        let key = params.get("key").and_then(|v| v.as_str()).ok_or("missing 'key'")?;
+        let path = self.kv_path(key)?;
+        let existed = path.exists();
+        if existed {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        Ok(serde_json::json!({"deleted": existed}))
+    }
+
+    /// `kv.list` — List keys, optionally filtered by prefix. Params: `{"prefix": "..."}`
+    async fn handle_kv_list(&self, params: Option<Value>) -> std::result::Result<Value, String> {
+        let prefix = params.as_ref()
+            .and_then(|p| p.get("prefix"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let dir = self.kv_dir()?;
+        let mut keys = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(prefix) {
+                        keys.push(name.to_string());
+                    }
+                }
+            }
+        }
+        keys.sort();
+        Ok(serde_json::json!({"keys": keys}))
+    }
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
@@ -2407,16 +2063,7 @@ impl IpcHandler for CraftObjHandler {
                 "receipts.query" => self.handle_receipts_query(params).await,
                 "receipt.storage.list" => self.handle_storage_receipt_list(params).await,
                 "data.providers" => self.handle_data_providers(params).await,
-                "data.remove" => self.handle_data_remove(params).await,
                 "data.delete_local" => self.handle_data_delete_local(params).await,
-                "access.grant" => self.handle_access_grant(params).await,
-                "access.revoke" => self.handle_access_revoke(params).await,
-                "access.revoke_rotate" => self.handle_access_revoke_rotate(params).await,
-                "access.list" => self.handle_access_list(params).await,
-                "channel.open" => self.handle_channel_open(params).await,
-                "channel.voucher" => self.handle_channel_voucher(params).await,
-                "channel.close" => self.handle_channel_close(params).await,
-                "channel.list" => self.handle_channel_list(params).await,
                 "settlement.create_pool" => self.handle_settlement_create_pool(params).await,
                 "settlement.fund_pool" => self.handle_settlement_fund_pool(params).await,
                 "settlement.claim" => self.handle_settlement_claim(params).await,
@@ -2431,6 +2078,10 @@ impl IpcHandler for CraftObjHandler {
                 "network.health" => self.handle_network_health().await,
                 "node.stats" => self.handle_node_stats().await,
                 "aggregator.status" => self.handle_aggregator_status().await,
+                "kv.put" => self.handle_kv_put(params).await,
+                "kv.get" => self.handle_kv_get(params).await,
+                "kv.delete" => self.handle_kv_delete(params).await,
+                "kv.list" => self.handle_kv_list(params).await,
                 "shutdown" => {
                     info!("[handler.rs] Shutdown requested via RPC");
                     // Emit event
