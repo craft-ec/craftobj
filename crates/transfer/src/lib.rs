@@ -45,16 +45,18 @@ pub enum CraftObjRequest {
         coefficients: Vec<u8>,
         data: Vec<u8>,
     },
-    /// Push a manifest to a storage peer. Must arrive before pieces.
-    ManifestPush {
-        content_id: ContentId,
-        record_json: Vec<u8>,
-    },
+    // NOTE: ManifestPush removed — piece headers are self-describing and carry
+    // all manifest metadata (content_id, total_size, segment_count, k, vtags_cid).
+    // Manifest is auto-created from the first received piece header.
+
     /// Query how many pieces a peer holds for a segment.
-    /// Lightweight health check — no piece data or coefficients exchanged.
+    /// Commit-then-challenge: nonce prevents replay attacks.
     HealthQuery {
         content_id: ContentId,
         segment_index: u32,
+        /// Nonce for commit-then-challenge: provider commits piece list first,
+        /// verifier picks spot-check AFTER seeing committed list.
+        nonce: [u8; 32],
     },
     /// PEX: peer exchange — share known peers
     PexExchange {
@@ -77,13 +79,25 @@ pub enum CraftObjRequest {
     },
 }
 
-/// A piece within a PieceBatch response.
+/// A piece payload with self-describing header fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiecePayload {
     pub segment_index: u32,
+    /// Total segments in the content.
+    pub segment_count: u32,
+    /// Original content size in bytes — needed for manifest auto-creation.
+    pub total_size: u64,
+    /// Source pieces per segment (determines redundancy via `2.0 + 16/k`).
+    pub k: u32,
+    /// Strategy discriminator: `Some` = erasure+vtag, `None` = replicate+hash.
+    pub vtags_cid: Option<[u8; 32]>,
     pub piece_id: [u8; 32],
     pub coefficients: Vec<u8>,
     pub data: Vec<u8>,
+    /// Homomorphic verification tag blob. Sent with the first piece in a batch
+    /// (`Some(blob)`) so receivers can verify all future pieces. Subsequent
+    /// pieces in the same batch set this to `None`.
+    pub vtag_blob: Option<Vec<u8>>,
 }
 
 /// A response in the CraftObj transfer protocol.
@@ -93,8 +107,11 @@ pub enum CraftObjResponse {
     PieceBatch { pieces: Vec<PiecePayload> },
     /// Ack for PiecePush or ManifestPush.
     Ack { status: WireStatus },
-    /// Response to HealthQuery: number of pieces the peer holds for the queried segment.
-    HealthResponse { piece_count: u32 },
+    /// Response to HealthQuery: committed list of pieces held for the segment.
+    /// Verifier uses this to select spot-check targets AFTER seeing the commitment.
+    HealthResponse {
+        pieces: Vec<HealthPiece>,
+    },
     /// Response to PexExchange: return our own peer list
     PexExchangeResponse {
         payload: Vec<u8>, // serialized PexMessage
@@ -120,6 +137,13 @@ pub enum CraftObjResponse {
     },
 }
 
+/// A piece commitment in a HealthResponse (piece_id + coefficients, no data).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthPiece {
+    pub piece_id: [u8; 32],
+    pub coefficients: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,13 +164,10 @@ mod tests {
             coefficients: vec![],
             data: vec![],
         };
-        let _manifest = CraftObjRequest::ManifestPush {
-            content_id: ContentId::from_bytes(b"test"),
-            record_json: vec![],
-        };
         let _health_query = CraftObjRequest::HealthQuery {
             content_id: ContentId::from_bytes(b"test"),
             segment_index: 0,
+            nonce: [0; 32],
         };
     }
 
@@ -154,6 +175,6 @@ mod tests {
     fn test_response_variants() {
         let _batch = CraftObjResponse::PieceBatch { pieces: vec![] };
         let _ack = CraftObjResponse::Ack { status: WireStatus::Ok };
-        let _health = CraftObjResponse::HealthResponse { piece_count: 5 };
+        let _health = CraftObjResponse::HealthResponse { pieces: vec![] };
     }
 }

@@ -16,7 +16,7 @@ use craftec_network::wire::{read_raw_frame, write_raw_frame};
 // Type discriminants
 const TYPE_PIECE_SYNC: u8 = 0x01;
 const TYPE_PIECE_PUSH: u8 = 0x02;
-const TYPE_MANIFEST_PUSH: u8 = 0x03;
+const TYPE_MANIFEST_PUSH: u8 = 0x03; // reserved — removed, kept for backward compat
 const TYPE_HEALTH_QUERY: u8 = 0x04;
 const TYPE_PDP_CHALLENGE: u8 = 0x07;
 const TYPE_PEX_EXCHANGE: u8 = 0x08;
@@ -110,18 +110,12 @@ fn serialize_request(request: &CraftObjRequest) -> io::Result<(u8, Vec<u8>)> {
             let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_PIECE_PUSH, payload))
         }
-        CraftObjRequest::ManifestPush { content_id, record_json } => {
-            let inner = RecordPushWire {
-                content_id: *content_id,
-                record_json: record_json.clone(),
-            };
-            let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
-            Ok((TYPE_MANIFEST_PUSH, payload))
-        }
-        CraftObjRequest::HealthQuery { content_id, segment_index } => {
+        // NOTE: ManifestPush (0x03) removed — piece headers are self-describing
+        CraftObjRequest::HealthQuery { content_id, segment_index, nonce } => {
             let inner = HealthQueryWire {
                 content_id: *content_id,
                 segment_index: *segment_index,
+                nonce: *nonce,
             };
             let payload = bincode::serialize(&inner).map_err(io::Error::other)?;
             Ok((TYPE_HEALTH_QUERY, payload))
@@ -179,12 +173,8 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
             })
         }
         TYPE_MANIFEST_PUSH => {
-            let inner: RecordPushWire = bincode::deserialize(payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjRequest::ManifestPush {
-                content_id: inner.content_id,
-                record_json: inner.record_json,
-            })
+            // Legacy: ignore ManifestPush from old peers
+            Err(io::Error::new(io::ErrorKind::Unsupported, "ManifestPush deprecated"))
         }
         TYPE_HEALTH_QUERY => {
             let inner: HealthQueryWire = bincode::deserialize(payload)
@@ -192,6 +182,7 @@ fn deserialize_request(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjReque
             Ok(CraftObjRequest::HealthQuery {
                 content_id: inner.content_id,
                 segment_index: inner.segment_index,
+                nonce: inner.nonce,
             })
         }
         TYPE_PDP_CHALLENGE => {
@@ -236,8 +227,8 @@ fn serialize_response(response: &CraftObjResponse) -> io::Result<(u8, Vec<u8>)> 
             let payload = bincode::serialize(status).map_err(io::Error::other)?;
             Ok((TYPE_ACK, payload))
         }
-        CraftObjResponse::HealthResponse { piece_count } => {
-            let payload = bincode::serialize(piece_count).map_err(io::Error::other)?;
+        CraftObjResponse::HealthResponse { pieces } => {
+            let payload = bincode::serialize(pieces).map_err(io::Error::other)?;
             Ok((TYPE_HEALTH_RESPONSE, payload))
         }
         CraftObjResponse::PdpProof { piece_id, coefficients, challenged_bytes, proof_hash } => {
@@ -286,9 +277,9 @@ fn deserialize_response(msg_type: u8, payload: &[u8]) -> io::Result<CraftObjResp
             Ok(CraftObjResponse::Ack { status })
         }
         TYPE_HEALTH_RESPONSE => {
-            let piece_count: u32 = bincode::deserialize(payload)
+            let pieces: Vec<crate::HealthPiece> = bincode::deserialize(payload)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(CraftObjResponse::HealthResponse { piece_count })
+            Ok(CraftObjResponse::HealthResponse { pieces })
         }
         TYPE_PDP_PROOF => {
             let inner: PdpProofWire = bincode::deserialize(payload)
@@ -351,16 +342,13 @@ struct PiecePushWire {
     data: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct RecordPushWire {
-    content_id: ContentId,
-    record_json: Vec<u8>,
-}
+// NOTE: RecordPushWire removed — ManifestPush deprecated
 
 #[derive(Serialize, Deserialize)]
 struct HealthQueryWire {
     content_id: ContentId,
     segment_index: u32,
+    nonce: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -456,6 +444,7 @@ mod tests {
         let req = CraftObjRequest::HealthQuery {
             content_id: ContentId::from_bytes(b"health-test"),
             segment_index: 2,
+            nonce: [42u8; 32],
         };
 
         let mut buf = Vec::new();
@@ -468,8 +457,9 @@ mod tests {
             StreamFrame::Request { seq_id, request } => {
                 assert_eq!(seq_id, 77);
                 match request {
-                    CraftObjRequest::HealthQuery { content_id: _, segment_index } => {
+                    CraftObjRequest::HealthQuery { content_id: _, segment_index, nonce } => {
                         assert_eq!(segment_index, 2);
+                        assert_eq!(nonce, [42u8; 32]);
                     }
                     _ => panic!("wrong variant"),
                 }
@@ -480,7 +470,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_response_roundtrip() {
-        let resp = CraftObjResponse::HealthResponse { piece_count: 17 };
+        let resp = CraftObjResponse::HealthResponse {
+            pieces: vec![
+                crate::HealthPiece { piece_id: [1u8; 32], coefficients: vec![1, 2, 3] },
+                crate::HealthPiece { piece_id: [2u8; 32], coefficients: vec![4, 5, 6] },
+            ],
+        };
 
         let mut buf = Vec::new();
         write_response_frame(&mut futures::io::Cursor::new(&mut buf), 88, &resp)
@@ -492,8 +487,10 @@ mod tests {
             StreamFrame::Response { seq_id, response } => {
                 assert_eq!(seq_id, 88);
                 match response {
-                    CraftObjResponse::HealthResponse { piece_count } => {
-                        assert_eq!(piece_count, 17);
+                    CraftObjResponse::HealthResponse { pieces } => {
+                        assert_eq!(pieces.len(), 2);
+                        assert_eq!(pieces[0].piece_id, [1u8; 32]);
+                        assert_eq!(pieces[1].coefficients, vec![4, 5, 6]);
                     }
                     _ => panic!("wrong variant"),
                 }

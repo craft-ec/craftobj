@@ -7,6 +7,7 @@
 //! <data_dir>/
 //!   pieces/<cid_hex>/<segment_idx>/<piece_id_hex>.data
 //!   pieces/<cid_hex>/<segment_idx>/<piece_id_hex>.coeff
+//!   pieces/<cid_hex>/<segment_idx>/<piece_id_hex>.header   ← self-describing piece metadata
 //!   manifests/<cid_hex>.json
 //!   pins.json
 //! ```
@@ -15,8 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use craftec_erasure::ContentVerificationRecord;
-use craftobj_core::{ContentId, ContentManifest, CraftObjError, Result};
+use craftobj_core::{ContentId, ContentManifest, CraftObjError, PieceHeader, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -51,7 +51,7 @@ impl FsStore {
         &self.data_dir
     }
 
-    /// Store a coded piece (data + coefficient vector) on disk.
+    /// Store a coded piece (data + coefficient vector + header) on disk.
     ///
     /// `piece_id` is SHA-256 of the coefficient vector.
     pub fn store_piece(
@@ -76,6 +76,62 @@ impl FsStore {
             coefficients.len()
         );
         Ok(())
+    }
+
+    /// Store a piece with a self-describing header.
+    pub fn store_piece_with_header(
+        &self,
+        content_id: &ContentId,
+        segment_index: u32,
+        piece_id: &[u8; 32],
+        data: &[u8],
+        coefficients: &[u8],
+        header: &PieceHeader,
+    ) -> Result<()> {
+        self.store_piece(content_id, segment_index, piece_id, data, coefficients)?;
+        let dir = self.piece_dir(content_id, segment_index);
+        let id_hex = hex::encode(piece_id);
+        let header_bytes = bincode::serialize(header)
+            .map_err(|e| CraftObjError::StorageError(format!("serialize header: {e}")))?;
+        std::fs::write(dir.join(format!("{id_hex}.header")), header_bytes)?;
+        Ok(())
+    }
+
+    /// Read a piece header without loading data (cheap metadata lookup).
+    pub fn get_piece_header(
+        &self,
+        content_id: &ContentId,
+        segment_index: u32,
+        piece_id: &[u8; 32],
+    ) -> Result<PieceHeader> {
+        let dir = self.piece_dir(content_id, segment_index);
+        let id_hex = hex::encode(piece_id);
+        let header_path = dir.join(format!("{id_hex}.header"));
+        if !header_path.exists() {
+            return Err(CraftObjError::ContentNotFound(format!(
+                "piece header {}/{}/{}", content_id, segment_index, &id_hex[..8]
+            )));
+        }
+        let bytes = std::fs::read(&header_path)?;
+        bincode::deserialize(&bytes)
+            .map_err(|e| CraftObjError::StorageError(format!("deserialize header: {e}")))
+    }
+
+    /// Read any piece header for a CID (first piece found across any segment).
+    ///
+    /// Used by HealthScan to get k and vtags_cid without needing a manifest.
+    pub fn get_any_piece_header(&self, content_id: &ContentId) -> Result<Option<PieceHeader>> {
+        let segments = self.list_segments(content_id)?;
+        for seg in segments {
+            let pieces = self.list_pieces(content_id, seg)?;
+            if let Some(pid) = pieces.first() {
+                match self.get_piece_header(content_id, seg, pid) {
+                    Ok(header) => return Ok(Some(header)),
+                    Err(_) => continue, // no header file — legacy piece
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Read a piece (data + coefficient vector) from disk.
@@ -195,37 +251,27 @@ impl FsStore {
             .map_err(|e| CraftObjError::ManifestError(e.to_string()))
     }
 
-    /// Store a content verification record (homomorphic hashes).
-    pub fn store_verification_record(&self, content_id: &ContentId, record: &ContentVerificationRecord) -> Result<()> {
-        let dir = self.data_dir.join("verification");
+    /// Store a vtag blob (homomorphic verification tags) by its content-addressed CID.
+    /// Stored under `vtags/<hex>.bin`. The CID is SHA-256(blob).
+    pub fn store_vtag_blob(&self, vtag_cid: &[u8; 32], data: &[u8]) -> Result<()> {
+        let dir = self.data_dir.join("vtags");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.json", content_id.to_hex()));
-        let json = serde_json::to_string(record)
-            .map_err(|e| CraftObjError::StorageError(e.to_string()))?;
-        std::fs::write(&path, json)?;
-        debug!("Stored verification record for {}", content_id);
+        let path = dir.join(format!("{}.bin", hex::encode(vtag_cid)));
+        std::fs::write(&path, data)?;
+        debug!("Stored vtag blob {} ({} bytes)", hex::encode(&vtag_cid[..4]), data.len());
         Ok(())
     }
 
-    /// Retrieve a content verification record.
-    pub fn get_verification_record(&self, content_id: &ContentId) -> Result<ContentVerificationRecord> {
-        let path = self.data_dir.join("verification").join(format!("{}.json", content_id.to_hex()));
+    /// Retrieve a vtag blob by its CID.
+    pub fn get_vtag_blob(&self, vtag_cid: &[u8; 32]) -> Result<Vec<u8>> {
+        let path = self.data_dir.join("vtags").join(format!("{}.bin", hex::encode(vtag_cid)));
         if !path.exists() {
-            return Err(CraftObjError::ContentNotFound(format!(
-                "verification record for {}", content_id
+            return Err(CraftObjError::StorageError(format!(
+                "vtag blob {} not found",
+                hex::encode(&vtag_cid[..4])
             )));
         }
-        let json = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&json)
-            .map_err(|e| CraftObjError::StorageError(e.to_string()))
-    }
-
-    /// Check if a verification record exists.
-    pub fn has_verification_record(&self, content_id: &ContentId) -> bool {
-        self.data_dir
-            .join("verification")
-            .join(format!("{}.json", content_id.to_hex()))
-            .exists()
+        Ok(std::fs::read(&path)?)
     }
 
     /// Check if a manifest exists.
@@ -301,7 +347,7 @@ impl FsStore {
         Ok(result)
     }
 
-    /// Delete a single piece from disk.
+    /// Delete a single piece from disk (including header).
     pub fn delete_piece(
         &self,
         content_id: &ContentId,
@@ -310,13 +356,11 @@ impl FsStore {
     ) -> Result<()> {
         let dir = self.piece_dir(content_id, segment_index);
         let id_hex = hex::encode(piece_id);
-        let data_path = dir.join(format!("{id_hex}.data"));
-        let coeff_path = dir.join(format!("{id_hex}.coeff"));
-        if data_path.exists() {
-            std::fs::remove_file(&data_path)?;
-        }
-        if coeff_path.exists() {
-            std::fs::remove_file(&coeff_path)?;
+        for ext in &["data", "coeff", "header"] {
+            let path = dir.join(format!("{id_hex}.{ext}"));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
         }
         debug!("Deleted piece {}/{}/{}", content_id, segment_index, &id_hex[..8]);
         Ok(())
@@ -588,12 +632,7 @@ mod tests {
         ContentManifest {
             content_id: cid,
             total_size: 1000,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: 1000,
-                segment_hashes: vec![],
-            },
+            vtags_cid: None,
         }
     }
 
