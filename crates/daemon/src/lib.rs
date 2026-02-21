@@ -38,4 +38,5 @@ pub mod settlement;
 pub mod stream_manager;
 pub mod behaviour;
 pub mod settlement_cycle;
-pub mod ws_server;
+
+pub use service::{DaemonHandle, init_daemon};

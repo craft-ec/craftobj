@@ -3,9 +3,11 @@
 //! Manages the libp2p swarm, IPC server, and content operations.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use craftec_ipc::IpcServer;
+use craftec_ipc::server::IpcHandler;
 use craftec_network::NetworkConfig;
 use craftobj_client::CraftObjClient;
 use craftobj_core::{ContentId, ContentManifest, CraftObjCapability, WireStatus};
@@ -25,6 +27,22 @@ use crate::events::{self, DaemonEvent, EventSender};
 use crate::handler::CraftObjHandler;
 use crate::peer_reconnect::PeerReconnector;
 use crate::protocol::{CraftObjProtocol, CraftObjEvent};
+
+/// Handle returned by [`init_daemon`]. Contains everything needed to run the
+/// daemon except the IPC/WebSocket transport layer, which the caller provides.
+pub struct DaemonHandle {
+    /// The IPC request handler (implements `craftec_ipc::server::IpcHandler`).
+    pub handler: Arc<dyn IpcHandler>,
+    /// Broadcast sender for `DaemonEvent`s — subscribe to push events to clients.
+    pub event_tx: EventSender,
+    /// The local libp2p PeerId.
+    pub local_peer_id: libp2p::PeerId,
+    /// API key for WebSocket authentication.
+    pub api_key: String,
+    /// All daemon loops (swarm, maintenance, health, etc.). Must be `.await`ed
+    /// concurrently with the IPC transport to keep the daemon alive.
+    pub loops: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
 
 /// Default socket path for the CraftObj daemon.
 pub fn default_socket_path() -> String {
@@ -171,19 +189,21 @@ pub async fn run_daemon_with_config(
     run_daemon_with_config_struct(keypair, data_dir, socket_path, network_config, ws_port, daemon_config, node_signing_key, craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx).await
 }
 
-async fn run_daemon_inner(
+/// Initialize the daemon: build swarm, handler, and all maintenance loops,
+/// but do NOT start IPC or WebSocket servers.
+///
+/// Returns a [`DaemonHandle`] that the caller can combine with their own
+/// transport layer (e.g. `IpcServer`, `ServerBuilder`).
+pub async fn init_daemon(
     keypair: Keypair,
     data_dir: std::path::PathBuf,
-    socket_path: String,
     network_config: NetworkConfig,
-    ws_port: u16,
     daemon_config: crate::config::DaemonConfig,
     node_signing_key: Option<ed25519_dalek::SigningKey>,
-    mut craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
     craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
     craftnet_stream_tx: Option<tokio::sync::oneshot::Sender<(libp2p_stream::Control, tokio::sync::mpsc::Receiver<(libp2p::PeerId, libp2p::Stream)>)>>,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
+) -> std::result::Result<DaemonHandle, Box<dyn std::error::Error + Send + Sync>> {
 
     // Create broadcast channel for daemon events (WS push)
     let (event_tx, _): (tokio::sync::broadcast::Sender<DaemonEvent>, _) = events::event_channel(256);
@@ -249,10 +269,10 @@ async fn run_daemon_inner(
     }
 
     // Create event channel for protocol communication
-    let (protocol_event_tx, mut protocol_event_rx) = mpsc::unbounded_channel::<CraftObjEvent>();
+    let (protocol_event_tx, protocol_event_rx) = mpsc::unbounded_channel::<CraftObjEvent>();
     
     // Create command channel for IPC → swarm communication
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<CraftObjCommand>();
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<CraftObjCommand>();
     let command_tx_for_caps = command_tx.clone();
     let command_tx_for_maintenance = command_tx.clone();
     let command_tx_for_events = command_tx.clone();
@@ -266,8 +286,6 @@ async fn run_daemon_inner(
     // Peer scorer — tracks capabilities and reliability
     let peer_scorer: SharedPeerScorer = Arc::new(Mutex::new(crate::peer_scorer::PeerScorer::new()));
 
-    // Start IPC server with enhanced handler
-    let ipc_server = IpcServer::new(&socket_path);
     // Persistent receipt store
     let receipts_path = std::env::var("HOME")
         .map(std::path::PathBuf::from)
@@ -378,8 +396,6 @@ async fn run_daemon_inner(
     if let Some(key) = node_signing_key {
         handler.set_node_signing_key(key);
     }
-    info!("[service.rs] Starting IPC server on {}", socket_path);
-
     // Create challenger manager
     let local_pubkey = crate::pdp::peer_id_to_local_pubkey(&local_peer_id);
     let mut challenger_mgr = crate::challenger::ChallengerManager::new(
@@ -410,26 +426,12 @@ async fn run_daemon_inner(
     handler.set_local_peer_id(local_peer_id);
     handler.set_demand_tracker(demand_tracker.clone());
 
-    let handler = Arc::new(handler);
+    let handler: Arc<dyn IpcHandler> = Arc::new(handler);
 
     // Load or generate API key for WebSocket authentication
     let api_key = crate::api_key::load_or_generate(&data_dir)
         .map_err(|e| format!("Failed to load/generate API key: {}", e))?;
     info!("[service.rs] API key loaded for WebSocket authentication");
-
-    // Start WebSocket server if enabled
-    let ws_handler = handler.clone();
-    let ws_event_tx = event_tx.clone();
-    let ws_future = async {
-        if ws_port > 0 {
-            if let Err(e) = crate::ws_server::run_ws_server(ws_port, ws_handler, api_key, ws_event_tx).await {
-                error!("WebSocket server error: {}", e);
-            }
-        } else {
-            // WS disabled — park forever so select! doesn't short-circuit
-            std::future::pending::<()>().await;
-        }
-    };
 
     let _ = event_tx.send(DaemonEvent::DaemonStarted { listen_addresses: vec![] });
 
@@ -439,12 +441,6 @@ async fn run_daemon_inner(
         storage_peers: 0,
         action: "Starting mDNS discovery and Kademlia bootstrap".to_string(),
     });
-
-    if ws_port > 0 {
-        let _ = event_tx.send(DaemonEvent::ListeningOn {
-            address: format!("ws://0.0.0.0:{}", ws_port),
-        });
-    }
 
     // HealthScan — periodic scan of owned segments for repair/degradation
     let health_scan_command_tx = command_tx.clone();
@@ -456,12 +452,11 @@ async fn run_daemon_inner(
     );
     health_scan.set_scan_interval(std::time::Duration::from_secs(daemon_config.health_scan_interval_secs));
     health_scan.set_event_tx(event_tx.clone());
-    // set_tier_target removed — tier multipliers are COM layer concern
     let health_scan: Arc<Mutex<crate::health_scan::HealthScan>> = Arc::new(Mutex::new(health_scan));
 
     // Repair queue: TriggerRepair commands from PDP failures bypass the scheduled
     // HealthScan cycle and call scan_segment immediately for the affected CID.
-    let (repair_queue_tx, mut repair_queue_rx) = tokio::sync::mpsc::unbounded_channel::<(craftobj_core::ContentId, Option<u32>)>();
+    let (repair_queue_tx, repair_queue_rx) = tokio::sync::mpsc::unbounded_channel::<(craftobj_core::ContentId, Option<u32>)>();
 
     // Derive ed25519 signing key for capability announcement signing
     let swarm_signing_key = keypair.clone().try_into_ed25519().ok().map(|ed25519_kp| {
@@ -482,7 +477,6 @@ async fn run_daemon_inner(
             .unwrap_or([0u8; 32]),
     };
 
-
     // PieceMap for event-sourced piece location tracking
     let piece_map = {
         let mut pm = crate::piece_map::PieceMap::new();
@@ -490,79 +484,160 @@ async fn run_daemon_inner(
         Arc::new(Mutex::new(pm))
     };
 
-    // Run all components concurrently
+    // Package all daemon loops (except IPC/WS) into a boxed future
+    let loops = {
+        // Clone/move everything the loops need
+        let event_tx_loops = event_tx.clone();
+        let challenger_interval = daemon_config.challenger_interval_secs;
+        let reannounce_interval = daemon_config.reannounce_interval_secs;
+        let gc_interval = daemon_config.gc_interval_secs;
+        let health_check_interval = daemon_config.health_check_interval_secs;
+        let max_storage_bytes = daemon_config.max_storage_bytes;
+        let region = daemon_config.region.clone();
+
+        Box::pin(async move {
+            let mut swarm = swarm;
+            let mut command_rx = command_rx;
+            let mut craftnet_cmd_rx = craftnet_cmd_rx;
+            let mut protocol_event_rx = protocol_event_rx;
+            let mut repair_queue_rx = repair_queue_rx;
+
+            tokio::select! {
+                _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx_loops.clone(), content_tracker.clone(), client.clone(), max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), region, swarm_signing_key, receipt_store.clone(), daemon_config_for_swarm.clone(), piece_map.clone(), &mut craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx, repair_queue_tx) => {
+                    info!("[service.rs] Swarm event loop ended");
+                }
+                _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
+                    info!("[service.rs] HealthScan loop ended");
+                }
+                _ = async {
+                    while let Some((cid, seg_hint)) = repair_queue_rx.recv().await {
+                        info!("[service.rs] TriggerRepair: immediate scan for {} (seg={:?})", cid, seg_hint);
+                        let mut hs = health_scan.lock().await;
+                        hs.run_scan_for_cid(&cid).await;
+                    }
+                } => {
+                    info!("[service.rs] Repair queue loop ended");
+                }
+                _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx_loops.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone(), eviction_manager_for_events.clone()) => {
+                    info!("[service.rs] Protocol events handler ended");
+                }
+                _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx_loops.clone(), challenger_interval) => {
+                    info!("[service.rs] Challenger loop ended");
+                }
+                _ = crate::reannounce::content_maintenance_loop(
+                    content_tracker.clone(),
+                    command_tx_for_maintenance.clone(),
+                    client.clone(),
+                    reannounce_interval,
+                    event_tx_loops.clone(),
+                    peer_scorer.clone(),
+                    demand_tracker.clone(),
+                ) => {
+                    info!("[service.rs] Content maintenance loop ended");
+                }
+                _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx_loops.clone(), pdp_ranks.clone(), merkle_tree.clone(), command_tx.clone(), content_tracker.clone(), piece_map.clone()) => {
+                    info!("[service.rs] Eviction maintenance loop ended");
+                }
+                _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx_loops.clone(), aggregator_config) => {
+                    info!("[service.rs] Aggregation loop ended");
+                }
+                _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx_loops.clone(), gc_interval, max_storage_bytes, command_tx.clone()) => {
+                    info!("[service.rs] GC loop ended");
+                }
+                _ = content_health_loop(content_tracker.clone(), store.clone(), event_tx_loops.clone(), health_check_interval) => {
+                    info!("[service.rs] Content health loop ended");
+                }
+                _ = disk_monitor_loop(data_dir.clone(), event_tx_loops.clone(), health_check_interval) => {
+                    info!("[service.rs] Disk monitor loop ended");
+                }
+                _ = data_retention_loop(receipt_store.clone()) => {
+                    info!("[service.rs] Data retention loop ended");
+                }
+                _ = crate::scaling::run_local_scaling_loop(
+                    demand_tracker.clone(),
+                    store.clone(),
+                    piece_map.clone(),
+                    Some(peer_scorer.clone()),
+                    command_tx.clone(),
+                    local_peer_id,
+                ) => {
+                    info!("[service.rs] Local scaling loop ended");
+                }
+                _ = shutdown_notify.notified() => {
+                    info!("[service.rs] Shutdown requested via RPC notify");
+                }
+            }
+        }) as Pin<Box<dyn Future<Output = ()> + Send>>
+    };
+
+    Ok(DaemonHandle {
+        handler,
+        event_tx,
+        local_peer_id,
+        api_key,
+        loops,
+    })
+}
+
+/// Internal entry point that calls [`init_daemon`] then runs IPC + WS + loops.
+async fn run_daemon_inner(
+    keypair: Keypair,
+    data_dir: std::path::PathBuf,
+    socket_path: String,
+    network_config: NetworkConfig,
+    ws_port: u16,
+    daemon_config: crate::config::DaemonConfig,
+    node_signing_key: Option<ed25519_dalek::SigningKey>,
+    craftnet_cmd_rx: Option<tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>>,
+    craftnet_evt_tx: Option<tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>>,
+    craftnet_stream_tx: Option<tokio::sync::oneshot::Sender<(libp2p_stream::Control, tokio::sync::mpsc::Receiver<(libp2p::PeerId, libp2p::Stream)>)>>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
+    let handle = init_daemon(
+        keypair, data_dir, network_config, daemon_config,
+        node_signing_key, craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx,
+    ).await?;
+
+    info!("[service.rs] Starting IPC server on {}", socket_path);
+
+    // Build unified IPC server (Unix socket + optional WebSocket)
+    let mut ipc = craftec_ipc::ServerBuilder::new(&socket_path)
+        .default_handler(handle.handler.clone());
+
+    if ws_port > 0 {
+        ipc = ipc
+            .with_websocket(ws_port)
+            .with_api_key(handle.api_key.clone());
+        let _ = handle.event_tx.send(DaemonEvent::ListeningOn {
+            address: format!("ws://0.0.0.0:{}", ws_port),
+        });
+    }
+
+    // Bridge DaemonEvent → String for IPC event transport
+    let ipc_event_tx = ipc.event_sender();
+    let mut daemon_event_rx = handle.event_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match daemon_event_rx.recv().await {
+                Ok(event) => {
+                    let notification: String = event.into();
+                    let _ = ipc_event_tx.send(notification);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Run IPC + daemon loops concurrently
     tokio::select! {
-        result = ipc_server.run(handler) => {
+        result = ipc.run() => {
             if let Err(e) = result {
                 error!("IPC server error: {}", e);
             }
         }
-        _ = ws_future => {
-            info!("[service.rs] WebSocket server ended");
-        }
-        _ = drive_swarm(&mut swarm, protocol.clone(), &mut command_rx, pending_requests.clone(), peer_scorer.clone(), command_tx_for_caps.clone(), event_tx.clone(), content_tracker.clone(), client.clone(), daemon_config.max_storage_bytes, store.clone(), demand_tracker.clone(), merkle_tree.clone(), daemon_config.region.clone(), swarm_signing_key, receipt_store.clone(), daemon_config_for_swarm.clone(), piece_map.clone(), &mut craftnet_cmd_rx, craftnet_evt_tx, craftnet_stream_tx, repair_queue_tx) => {
-            info!("[service.rs] Swarm event loop ended");
-        }
-        _ = crate::health_scan::run_health_scan_loop(health_scan.clone()) => {
-            info!("[service.rs] HealthScan loop ended");
-        }
-        _ = async {
-            // Repair queue drain: immediately scan CIDs flagged by PDP failures.
-            while let Some((cid, seg_hint)) = repair_queue_rx.recv().await {
-                info!("[service.rs] TriggerRepair: immediate scan for {} (seg={:?})", cid, seg_hint);
-                let mut hs = health_scan.lock().await;
-                hs.run_scan_for_cid(&cid).await;
-            }
-        } => {
-            info!("[service.rs] Repair queue loop ended");
-        }
-        _ = handle_protocol_events(&mut protocol_event_rx, pending_requests.clone(), event_tx.clone(), content_tracker.clone(), command_tx_for_events, challenger_mgr.clone(), eviction_manager_for_events.clone()) => {
-            info!("[service.rs] Protocol events handler ended");
-        }
-        _ = run_challenger_loop(challenger_mgr, store.clone(), event_tx.clone(), daemon_config.challenger_interval_secs) => {
-            info!("[service.rs] Challenger loop ended");
-        }
-        _ = crate::reannounce::content_maintenance_loop(
-            content_tracker.clone(),
-            command_tx_for_maintenance.clone(),
-            client.clone(),
-            daemon_config.reannounce_interval_secs,
-            event_tx.clone(),
-            peer_scorer.clone(),
-            demand_tracker.clone(),
-        ) => {
-            info!("[service.rs] Content maintenance loop ended");
-        }
-        _ = eviction_maintenance_loop(eviction_manager, store.clone(), event_tx.clone(), pdp_ranks.clone(), merkle_tree.clone(), command_tx.clone(), content_tracker.clone(), piece_map.clone()) => {
-            info!("[service.rs] Eviction maintenance loop ended");
-        }
-        _ = crate::aggregator::run_aggregation_loop(receipt_store.clone(), event_tx.clone(), aggregator_config) => {
-            info!("[service.rs] Aggregation loop ended");
-        }
-        _ = gc_loop(store.clone(), content_tracker.clone(), client.clone(), merkle_tree.clone(), event_tx.clone(), daemon_config.gc_interval_secs, daemon_config.max_storage_bytes, command_tx.clone()) => {
-            info!("[service.rs] GC loop ended");
-        }
-        _ = content_health_loop(content_tracker.clone(), store.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
-            info!("[service.rs] Content health loop ended");
-        }
-        _ = disk_monitor_loop(data_dir.clone(), event_tx.clone(), daemon_config.health_check_interval_secs) => {
-            info!("[service.rs] Disk monitor loop ended");
-        }
-        _ = data_retention_loop(receipt_store.clone()) => {
-            info!("[service.rs] Data retention loop ended");
-        }
-        _ = crate::scaling::run_local_scaling_loop(
-            demand_tracker.clone(),
-            store.clone(),
-            piece_map.clone(),
-            Some(peer_scorer.clone()),
-            command_tx.clone(),
-            local_peer_id,
-        ) => {
-            info!("[service.rs] Local scaling loop ended");
-        }
-        _ = shutdown_notify.notified() => {
-            info!("[service.rs] Shutdown requested via RPC notify");
+        _ = handle.loops => {
+            info!("[service.rs] Daemon loops ended");
         }
     }
 
@@ -1189,6 +1264,11 @@ async fn drive_swarm(
                     }
                     craftec_network::SharedSwarmCommand::IsConnected(peer_id, tx) => {
                         let _ = tx.send(swarm.is_connected(&peer_id));
+                    }
+                    craftec_network::SharedSwarmCommand::ListenOn(addr) => {
+                        if let Err(e) = swarm.listen_on(addr) {
+                            warn!("[drive_swarm] ListenOn failed: {:?}", e);
+                        }
                     }
                 }
             }

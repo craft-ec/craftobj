@@ -99,6 +99,24 @@ pub enum DaemonEvent {
     RepairCompleted { content_id: String, segment: u32, pieces_generated: usize, success: bool },
 }
 
+/// Convert a `DaemonEvent` to a JSON-RPC notification string.
+///
+/// Uses the serde `tag = "type"` field as the notification method name
+/// and `content = "data"` as the params. This centralizes the conversion
+/// so callers can simply do `let s: String = event.into();`.
+impl From<DaemonEvent> for String {
+    fn from(event: DaemonEvent) -> String {
+        let event_value = serde_json::to_value(&event).unwrap_or_default();
+        let method = event_value.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("event")
+            .to_string();
+        let params = event_value.get("data").cloned()
+            .unwrap_or(serde_json::Value::Null);
+        craftec_ipc::event_to_notification(&method, &params)
+    }
+}
+
 pub type EventSender = broadcast::Sender<DaemonEvent>;
 pub type EventReceiver = broadcast::Receiver<DaemonEvent>;
 

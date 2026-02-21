@@ -14,7 +14,7 @@ craftobj-transfer = { workspace = true }
 craftec-app = { workspace = true }
 craftec-core = { workspace = true }
 craftec-erasure = { workspace = true }
-craftec-ipc = { workspace = true }
+craftec-ipc = { workspace = true, features = ["websocket"] }
 craftec-logging = { workspace = true }
 craftec-keystore = { workspace = true }
 craftec-network = { workspace = true }
@@ -36,7 +36,6 @@ craftec-prover = { workspace = true }
 craftec-prover-guest-types = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
-tokio-tungstenite = "0.24"
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
 spl-token = { workspace = true }
