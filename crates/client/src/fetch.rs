@@ -755,12 +755,7 @@ mod tests {
         ContentManifest {
             content_id: ContentId::from_bytes(&[0u8; 32]),
             total_size,
-            creator: String::new(),
-            signature: vec![],
-            verification: craftec_erasure::ContentVerificationRecord {
-                file_size: total_size,
-                segment_hashes: vec![],
-            },
+            vtags_cid: None,
         }
     }
 

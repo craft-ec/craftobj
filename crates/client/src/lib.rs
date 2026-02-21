@@ -10,18 +10,19 @@
 
 pub mod fetch;
 
+// Re-export connection pool types for use by the daemon handler.
+pub use fetch::{ConnectionPool, FetchConfig, PieceRequester, ProviderId};
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use craftec_erasure::{
-    check_independence, homomorphic, segmenter, CodedPiece, ContentVerificationRecord,
-    ErasureConfig,
+    check_independence, segmenter, CodedPiece,
+    ErasureConfig, generate_segment_hashes, ContentVerificationRecord,
 };
 use craftobj_core::{
-    ContentId, ContentManifest, CraftObjError, PIECE_SIZE, PublishOptions, RemovalNotice, Result,
+    ContentId, ContentManifest, CraftObjError, PIECE_SIZE, PublishOptions, Result,
     SEGMENT_SIZE,
-    access::{self, AccessEntry},
-    pre::{self, EncryptedContentKey, ReEncryptedKey, ReKeyEntry},
 };
 use craftobj_store::{piece_id_from_coefficients, FsStore, PinManager};
 use tracing::info;
@@ -37,10 +38,8 @@ pub struct PublishResult {
     pub total_size: u64,
     /// Number of segments.
     pub segment_count: usize,
-    /// The manifest (for daemon to announce).
+    /// Cached content record (for daemon to announce).
     pub manifest: ContentManifest,
-    /// Verification record with homomorphic hashes for piece verification.
-    pub verification_record: ContentVerificationRecord,
 }
 
 /// Content info returned by list().
@@ -61,22 +60,7 @@ pub struct NodeStatus {
     pub pinned_count: usize,
 }
 
-/// Result of a revoke-and-rotate operation.
-#[derive(Debug, Clone)]
-pub struct RevocationResult {
-    /// New content ID (hash of re-encrypted content).
-    pub new_content_id: ContentId,
-    /// New encryption key.
-    pub new_encryption_key: Vec<u8>,
-    /// Total size of re-encrypted content.
-    pub new_total_size: u64,
-    /// Number of segments.
-    pub new_segment_count: usize,
-    /// Content key encrypted to creator (for DHT AccessList).
-    pub encrypted_content_key: pre::EncryptedContentKey,
-    /// Re-key entries + re-encrypted keys for remaining authorized users.
-    pub re_grants: Vec<(pre::ReKeyEntry, pre::ReEncryptedKey)>,
-}
+// NOTE: RevocationResult removed — revoke/rotate is COM layer concern.
 
 /// CraftObj client for local operations (publish, fetch, pin/unpin).
 ///
@@ -138,40 +122,97 @@ impl CraftObjClient {
             content_id, total_size, segment_count, config.piece_size,
         );
 
-        // Store all pieces
+        // ── Compute vtags (homomorphic verification tags) ──────────────────
+        // For each segment, the first k pieces have identity coefficient vectors
+        // (source pieces). We compute homomorphic hashes from these, enabling
+        // any coded piece to be verified without decoding.
+        let mut all_segment_hashes = Vec::with_capacity(segment_count);
         for (seg_idx, pieces) in &encoded_segments {
+            let k = config.k_for_segment(
+                if (*seg_idx as usize + 1) < segment_count {
+                    config.segment_size
+                } else {
+                    content_bytes.len() - *seg_idx as usize * config.segment_size
+                },
+            );
+            let source_pieces = &pieces[..k];
+            // Deterministic seed: SHA-256(content_id || segment_index)
+            let seed = {
+                use sha2::{Sha256, Digest};
+                let mut hasher = Sha256::new();
+                hasher.update(&content_id.0);
+                hasher.update(&(*seg_idx as u32).to_le_bytes());
+                let hash = hasher.finalize();
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&hash);
+                s
+            };
+            all_segment_hashes.push(generate_segment_hashes(seed, source_pieces));
+        }
+
+        let vtag_record = ContentVerificationRecord {
+            file_size: total_size,
+            segment_hashes: all_segment_hashes,
+        };
+        let vtag_blob = serde_json::to_vec(&vtag_record)
+            .map_err(|e| CraftObjError::StorageError(format!("vtag serialization: {}", e)))?;
+        let vtags_cid_bytes = {
+            use sha2::{Sha256, Digest};
+            let hash = Sha256::digest(&vtag_blob);
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(&hash);
+            cid
+        };
+
+        // Store vtag blob locally — transferred as a raw blob (not pieces)
+        // alongside content. Nodes fetch it by vtags_cid when they receive
+        // pieces and need to verify them.
+        self.store.store_vtag_blob(&vtags_cid_bytes, &vtag_blob)?;
+        info!("Vtag blob {} ({} bytes)", hex::encode(&vtags_cid_bytes[..4]), vtag_blob.len());
+
+        // Store all pieces with self-describing headers (vtags_cid set)
+        for (seg_idx, pieces) in &encoded_segments {
+            let k = config.k_for_segment(
+                if (*seg_idx as usize + 1) < segment_count {
+                    config.segment_size
+                } else {
+                    content_bytes.len() - *seg_idx as usize * config.segment_size
+                },
+            );
             for piece in pieces {
                 let pid = piece_id_from_coefficients(&piece.coefficients);
-                self.store.store_piece(
+                let header = craftobj_core::PieceHeader {
+                    content_id,
+                    total_size,
+                    segment_idx: *seg_idx,
+                    segment_count: segment_count as u32,
+                    k: k as u32,
+                    vtags_cid: Some(vtags_cid_bytes),
+                    coefficients: piece.coefficients.clone(),
+                };
+                self.store.store_piece_with_header(
                     &content_id,
                     *seg_idx,
                     &pid,
                     &piece.data,
                     &piece.coefficients,
+                    &header,
                 )?;
             }
         }
 
-        // Empty verification record — homomorphic hashes no longer in metadata
-        let verification_record = ContentVerificationRecord {
-            file_size: total_size,
-            segment_hashes: vec![],
-        };
-
-        // Build and store content record
+        // Build and store content record (cached summary)
         let manifest = ContentManifest {
             content_id,
             total_size,
-            creator: String::new(),
-            signature: vec![],
-            verification: verification_record.clone(),
+            vtags_cid: Some(vtags_cid_bytes),
         };
         self.store.store_record(&manifest)?;
 
         // Auto-pin published content
         self.pin_manager.pin(&content_id)?;
 
-        info!("Published {} successfully", content_id);
+        info!("Published {} (vtags={})", content_id, hex::encode(&vtags_cid_bytes[..4]));
 
         Ok(PublishResult {
             content_id,
@@ -179,7 +220,6 @@ impl CraftObjClient {
             total_size,
             segment_count,
             manifest,
-            verification_record,
         })
     }
 
@@ -194,52 +234,66 @@ impl CraftObjClient {
         &mut self,
         path: &Path,
         options: &PublishOptions,
-        keypair: &ed25519_dalek::SigningKey,
+        _keypair: &ed25519_dalek::SigningKey,
     ) -> Result<PublishResult> {
-        let mut result = self.publish(path, options)?;
-
-        let mut manifest = self.store.get_record(&result.content_id)?;
-        manifest.sign(keypair);
-        self.store.store_record(&manifest)?;
-        result.manifest = manifest;
-
-        Ok(result)
+        // Creator signing has been moved to the application layer (COM/SQL).
+        self.publish(path, options)
     }
 
-    /// Create a removal notice for content, signed by the creator.
-    pub fn remove_content(
-        &mut self,
-        keypair: &ed25519_dalek::SigningKey,
-        content_id: &ContentId,
-        reason: Option<String>,
-    ) -> Result<RemovalNotice> {
-        let notice = RemovalNotice::sign(keypair, *content_id, reason);
+    /// Unpin content — kernel-level removal signal.
+    ///
+    /// This does NOT immediately delete pieces. It unpins the content so that
+    /// HealthScan will not repair it. Over time, pieces naturally degrade.
+    /// For explicit force-delete, see `delete_all_pieces()`.
+    pub fn unpin_content(&mut self, content_id: &ContentId) -> Result<()> {
         let _ = self.pin_manager.unpin(content_id);
-        info!("Created removal notice for {}", content_id);
-        Ok(notice)
+        info!("Unpinned {}", content_id);
+        Ok(())
     }
 
     /// Reconstruct content from locally stored pieces using RLNC decoding.
     ///
-    /// For each segment, collects pieces from store, checks linear independence,
-    /// and decodes once k independent pieces are available.
+    /// Reads piece headers for metadata (total_size, segment_count, k).
+    /// Falls back to manifest if no piece headers exist (legacy content).
     pub fn reconstruct(
         &self,
         content_id: &ContentId,
         dest: &Path,
         encryption_key: Option<&[u8]>,
     ) -> Result<()> {
-        let manifest = self.store.get_record(content_id)?;
+        // Try piece header first (manifest-free path)
+        let (total_size, segment_count, _default_k) =
+            if let Ok(Some(header)) = self.store.get_any_piece_header(content_id) {
+                (
+                    header.total_size as usize,
+                    header.segment_count as usize,
+                    header.k as usize,
+                )
+            } else {
+                // Legacy fallback: use manifest
+                let manifest = self.store.get_record(content_id)?;
+                (
+                    manifest.total_size as usize,
+                    manifest.segment_count(),
+                    manifest.k(),
+                )
+            };
+
         let config = ErasureConfig {
-            piece_size: manifest.piece_size(),
-            segment_size: manifest.segment_size(),
+            piece_size: PIECE_SIZE,
+            segment_size: SEGMENT_SIZE,
             ..Default::default()
         };
 
         let mut segments: BTreeMap<u32, Vec<CodedPiece>> = BTreeMap::new();
 
-        for seg_idx in 0..manifest.segment_count() as u32 {
-            let k = manifest.k_for_segment(seg_idx as usize);
+        for seg_idx in 0..segment_count as u32 {
+            let seg_size = if (seg_idx as usize + 1) < segment_count {
+                SEGMENT_SIZE
+            } else {
+                total_size - seg_idx as usize * SEGMENT_SIZE
+            };
+            let k = config.k_for_segment(seg_size);
             let piece_ids = self.store.list_pieces(content_id, seg_idx)?;
 
             let mut collected: Vec<CodedPiece> = Vec::new();
@@ -261,9 +315,9 @@ impl CraftObjClient {
 
         let reconstructed = segmenter::decode_and_reassemble(
             &segments,
-            manifest.segment_count() as u32,
+            segment_count as u32,
             &config,
-            manifest.total_size as usize,
+            total_size,
         )
         .map_err(|e| CraftObjError::ErasureError(e.to_string()))?;
 
@@ -344,195 +398,10 @@ impl CraftObjClient {
         })
     }
 
-    /// Publish with PRE: encrypts content and stores encrypted content key for the creator.
-    pub fn publish_with_pre(
-        &mut self,
-        path: &Path,
-        options: &PublishOptions,
-        creator_keypair: &ed25519_dalek::SigningKey,
-    ) -> Result<(PublishResult, EncryptedContentKey)> {
-        let mut opts = options.clone();
-        opts.encrypted = true;
+    // NOTE: publish_with_pre, grant_access, grant_access_direct,
+    // reconstruct_with_pre, and revoke_and_rotate removed.
+    // Access control and PRE are COM/SQL layer concerns.
 
-        let result = self.publish_signed(path, &opts, creator_keypair)?;
-        let content_key = result
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| CraftObjError::EncryptionError("no encryption key".into()))?;
-
-        let encrypted_ck = pre::encrypt_content_key(creator_keypair, content_key)?;
-        Ok((result, encrypted_ck))
-    }
-
-    /// Grant access to a recipient: generates a re-encryption key and
-    /// re-encrypted content key that the recipient can decrypt.
-    pub fn grant_access(
-        &self,
-        creator_keypair: &ed25519_dalek::SigningKey,
-        recipient_pubkey: &ed25519_dalek::VerifyingKey,
-        content_key: &[u8],
-    ) -> Result<(ReKeyEntry, ReEncryptedKey)> {
-        let re_key = pre::generate_re_key(creator_keypair, recipient_pubkey)?;
-        let re_encrypted = pre::re_encrypt_with_content_key(content_key, &re_key)?;
-        let entry = ReKeyEntry {
-            recipient_did: recipient_pubkey.to_bytes(),
-            re_key,
-        };
-        Ok((entry, re_encrypted))
-    }
-
-    /// Grant access via AccessList (direct key encryption, not PRE).
-    pub fn grant_access_direct(
-        &self,
-        content_id: &ContentId,
-        creator_keypair: &ed25519_dalek::SigningKey,
-        recipient_pubkey: &ed25519_dalek::VerifyingKey,
-        content_key: &[u8],
-    ) -> Result<AccessEntry> {
-        access::grant_access(content_id, creator_keypair, recipient_pubkey, content_key)
-    }
-
-    /// Reconstruct content using a re-encrypted content key (PRE flow).
-    pub fn reconstruct_with_pre(
-        &self,
-        content_id: &ContentId,
-        dest: &Path,
-        re_encrypted_key: &ReEncryptedKey,
-        recipient_keypair: &ed25519_dalek::SigningKey,
-        creator_pubkey: &ed25519_dalek::VerifyingKey,
-    ) -> Result<()> {
-        let content_key =
-            pre::decrypt_re_encrypted(re_encrypted_key, recipient_keypair, creator_pubkey)?;
-        self.reconstruct(content_id, dest, Some(&content_key))
-    }
-
-    /// Revoke a user's access and rotate the content key.
-    pub fn revoke_and_rotate(
-        &mut self,
-        old_content_id: &ContentId,
-        old_content_key: &[u8],
-        creator_keypair: &ed25519_dalek::SigningKey,
-        revoked_pubkey: &ed25519_dalek::VerifyingKey,
-        all_authorized: &[ed25519_dalek::VerifyingKey],
-    ) -> Result<RevocationResult> {
-        // 1. Reconstruct original ciphertext from pieces
-        let manifest = self.store.get_record(old_content_id)?;
-        let config = ErasureConfig {
-            piece_size: manifest.piece_size(),
-            segment_size: manifest.segment_size(),
-            ..Default::default()
-        };
-
-        let mut segments: BTreeMap<u32, Vec<CodedPiece>> = BTreeMap::new();
-        for seg_idx in 0..manifest.segment_count() as u32 {
-            let piece_ids = self.store.list_pieces(old_content_id, seg_idx)?;
-            let mut collected: Vec<CodedPiece> = Vec::new();
-            for pid in &piece_ids {
-                let (data, coefficients) =
-                    self.store.get_piece(old_content_id, seg_idx, pid)?;
-                collected.push(CodedPiece { data, coefficients });
-            }
-            segments.insert(seg_idx, collected);
-        }
-
-        let ciphertext = segmenter::decode_and_reassemble(
-            &segments,
-            manifest.segment_count() as u32,
-            &config,
-            manifest.total_size as usize,
-        )
-        .map_err(|e| CraftObjError::ErasureError(e.to_string()))?;
-
-        // Decrypt to get plaintext
-        let plaintext = decrypt_content(&ciphertext, old_content_key)?;
-
-        // 2. Re-encrypt with new key and publish
-        let new_key = generate_content_key();
-        let new_ciphertext = encrypt_content(&plaintext, &new_key)?;
-        let new_content_id = ContentId::from_bytes(&new_ciphertext);
-        let total_size = new_ciphertext.len() as u64;
-
-        let encoded_segments = segmenter::segment_and_encode(&new_ciphertext, &config)
-            .map_err(|e| CraftObjError::ErasureError(e.to_string()))?;
-        let segment_count = encoded_segments.len();
-
-        let mut new_segment_hashes = Vec::with_capacity(encoded_segments.len());
-        for (seg_idx, pieces) in &encoded_segments {
-            let k = config.k_for_segment(
-                if (*seg_idx as usize + 1) < segment_count {
-                    config.segment_size
-                } else {
-                    new_ciphertext.len() - *seg_idx as usize * config.segment_size
-                },
-            );
-            let source_pieces: Vec<CodedPiece> = pieces.iter().take(k).cloned().collect();
-            let seed = {
-                let mut s = [0u8; 32];
-                use sha2::Digest;
-                let hash = sha2::Sha256::digest(
-                    [&new_content_id.0[..], &seg_idx.to_le_bytes()[..]].concat(),
-                );
-                s.copy_from_slice(&hash);
-                s
-            };
-            new_segment_hashes.push(homomorphic::generate_segment_hashes(seed, &source_pieces));
-
-            for piece in pieces {
-                let pid = piece_id_from_coefficients(&piece.coefficients);
-                self.store.store_piece(
-                    &new_content_id,
-                    *seg_idx,
-                    &pid,
-                    &piece.data,
-                    &piece.coefficients,
-                )?;
-            }
-        }
-
-        let new_verification_record = ContentVerificationRecord {
-            file_size: total_size,
-            segment_hashes: new_segment_hashes,
-        };
-        self.store.store_verification_record(&new_content_id, &new_verification_record)?;
-
-        let new_manifest = ContentManifest {
-            content_id: new_content_id,
-            total_size,
-            creator: String::new(),
-            signature: vec![],
-            verification: new_verification_record.clone(),
-        };
-        self.store.store_record(&new_manifest)?;
-        self.pin_manager.pin(&new_content_id)?;
-
-        // 3. Encrypt content key to creator
-        let encrypted_ck = pre::encrypt_content_key(creator_keypair, &new_key)?;
-
-        // 4. Re-grant access to remaining users
-        let revoked_bytes = revoked_pubkey.to_bytes();
-        let mut re_grants = Vec::new();
-        for pubkey in all_authorized {
-            if pubkey.to_bytes() == revoked_bytes {
-                continue;
-            }
-            let (entry, re_encrypted) = self.grant_access(creator_keypair, pubkey, &new_key)?;
-            re_grants.push((entry, re_encrypted));
-        }
-
-        info!(
-            "Revoked access and rotated key: {} -> {} ({} remaining users)",
-            old_content_id, new_content_id, re_grants.len()
-        );
-
-        Ok(RevocationResult {
-            new_content_id,
-            new_encryption_key: new_key,
-            new_total_size: total_size,
-            new_segment_count: segment_count,
-            encrypted_content_key: encrypted_ck,
-            re_grants,
-        })
-    }
 
     /// Access the underlying store.
     pub fn store(&self) -> &FsStore {
@@ -737,152 +606,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn test_publish_with_pre_and_grant_access() {
-        use ed25519_dalek::SigningKey;
-
-        let dir = test_dir();
-        let mut client = CraftObjClient::new(&dir).unwrap();
-
-        let creator = SigningKey::generate(&mut rand::thread_rng());
-        let recipient = SigningKey::generate(&mut rand::thread_rng());
-
-        let file_path = dir.join("pre_test.txt");
-        let content = b"pre-encrypted content for access control testing";
-        std::fs::write(&file_path, content).unwrap();
-
-        let (result, _encrypted_ck) = client
-            .publish_with_pre(&file_path, &PublishOptions::default(), &creator)
-            .unwrap();
-
-        let content_key = result.encryption_key.as_ref().unwrap();
-
-        let (_re_key_entry, re_encrypted) = client
-            .grant_access(&creator, &recipient.verifying_key(), content_key)
-            .unwrap();
-
-        let output = dir.join("pre_output.txt");
-        client
-            .reconstruct_with_pre(
-                &result.content_id,
-                &output,
-                &re_encrypted,
-                &recipient,
-                &creator.verifying_key(),
-            )
-            .unwrap();
-
-        assert_eq!(std::fs::read(&output).unwrap(), content);
-
-        let wrong = SigningKey::generate(&mut rand::thread_rng());
-        let output2 = dir.join("pre_output_wrong.txt");
-        let err = client.reconstruct_with_pre(
-            &result.content_id,
-            &output2,
-            &re_encrypted,
-            &wrong,
-            &creator.verifying_key(),
-        );
-        assert!(err.is_err());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_revoke_and_rotate_full_round_trip() {
-        use ed25519_dalek::SigningKey;
-
-        let dir = test_dir();
-        let mut client = CraftObjClient::new(&dir).unwrap();
-
-        let creator = SigningKey::generate(&mut rand::thread_rng());
-        let user_a = SigningKey::generate(&mut rand::thread_rng());
-        let user_b = SigningKey::generate(&mut rand::thread_rng());
-        let user_c = SigningKey::generate(&mut rand::thread_rng());
-
-        let file_path = dir.join("revoke_test.txt");
-        let content = b"secret content for revocation testing with key rotation";
-        std::fs::write(&file_path, content).unwrap();
-
-        let (result, _encrypted_ck) = client
-            .publish_with_pre(&file_path, &PublishOptions::default(), &creator)
-            .unwrap();
-        let content_key = result.encryption_key.as_ref().unwrap().clone();
-
-        let all_users = vec![
-            user_a.verifying_key(),
-            user_b.verifying_key(),
-            user_c.verifying_key(),
-        ];
-        let mut re_encrypted_keys = Vec::new();
-        for user in &all_users {
-            let (_entry, re_enc) = client
-                .grant_access(&creator, user, &content_key)
-                .unwrap();
-            re_encrypted_keys.push(re_enc);
-        }
-
-        for (i, user) in [&user_a, &user_b, &user_c].iter().enumerate() {
-            let out = dir.join(format!("pre_revoke_{}.txt", i));
-            client
-                .reconstruct_with_pre(
-                    &result.content_id,
-                    &out,
-                    &re_encrypted_keys[i],
-                    user,
-                    &creator.verifying_key(),
-                )
-                .unwrap();
-            assert_eq!(std::fs::read(&out).unwrap(), content);
-        }
-
-        let revocation = client
-            .revoke_and_rotate(
-                &result.content_id,
-                &content_key,
-                &creator,
-                &user_b.verifying_key(),
-                &all_users,
-            )
-            .unwrap();
-
-        assert_eq!(revocation.re_grants.len(), 2);
-
-        for (entry, re_enc) in &revocation.re_grants {
-            let recipient_key = if entry.recipient_did == user_a.verifying_key().to_bytes() {
-                &user_a
-            } else {
-                &user_c
-            };
-            let out = dir.join(format!(
-                "post_revoke_{}.txt",
-                hex::encode(&entry.recipient_did[..4])
-            ));
-            client
-                .reconstruct_with_pre(
-                    &revocation.new_content_id,
-                    &out,
-                    re_enc,
-                    recipient_key,
-                    &creator.verifying_key(),
-                )
-                .unwrap();
-            assert_eq!(std::fs::read(&out).unwrap(), content);
-        }
-
-        let out_revoked = dir.join("post_revoke_b.txt");
-        let err = client.reconstruct_with_pre(
-            &revocation.new_content_id,
-            &out_revoked,
-            &re_encrypted_keys[1],
-            &user_b,
-            &creator.verifying_key(),
-        );
-        assert!(err.is_err());
-        assert_ne!(result.content_id, revocation.new_content_id);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // NOTE: test_publish_with_pre_and_grant_access and
+    // test_revoke_and_rotate_full_round_trip removed — PRE/access is COM layer.
 
     #[test]
     fn test_list_and_status() {
@@ -923,39 +648,28 @@ mod tests {
             .publish_signed(&file_path, &PublishOptions::default(), &keypair)
             .unwrap();
 
+        // publish_signed now delegates to publish (signing is COM layer)
         let manifest = client.store().get_record(&result.content_id).unwrap();
-        assert!(!manifest.creator.is_empty());
-        assert!(manifest.verify_creator());
-        assert_eq!(
-            manifest.creator_pubkey().unwrap(),
-            keypair.verifying_key().to_bytes()
-        );
+        assert_eq!(manifest.content_id, result.content_id);
+        assert_eq!(manifest.total_size, result.total_size);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_remove_content_creates_valid_notice() {
-        use ed25519_dalek::SigningKey;
-
+    fn test_unpin_content() {
         let dir = test_dir();
         let mut client = CraftObjClient::new(&dir).unwrap();
-        let keypair = SigningKey::generate(&mut rand::thread_rng());
 
-        let file_path = dir.join("to_remove.txt");
-        std::fs::write(&file_path, b"content to remove").unwrap();
+        let file_path = dir.join("to_unpin.txt");
+        std::fs::write(&file_path, b"content to unpin").unwrap();
 
         let result = client
-            .publish_signed(&file_path, &PublishOptions::default(), &keypair)
+            .publish(&file_path, &PublishOptions::default())
             .unwrap();
         assert!(client.is_pinned(&result.content_id));
 
-        let notice = client
-            .remove_content(&keypair, &result.content_id, Some("testing".into()))
-            .unwrap();
-
-        assert!(notice.verify());
-        assert_eq!(notice.cid, result.content_id);
+        client.unpin_content(&result.content_id).unwrap();
         assert!(!client.is_pinned(&result.content_id));
 
         std::fs::remove_dir_all(&dir).ok();

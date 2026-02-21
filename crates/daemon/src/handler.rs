@@ -1191,7 +1191,23 @@ impl CraftObjHandler {
         }
 
         let requester = Arc::new(CommandChannelRequester { command_tx: command_tx.clone() });
-        let mut pool = ConnectionPool::new(requester, provider_ids, FetchConfig::default());
+
+        // Build provider-to-region map and local region from PeerScorer for geo preference
+        let (provider_regions, local_region) = if let Some(ref scorer_arc) = self.peer_scorer {
+            let scorer = scorer_arc.lock().await;
+            let regions: std::collections::HashMap<craftobj_client::ProviderId, String> = ranked_providers.iter()
+                .filter_map(|p| scorer.get_region(p).map(|r| (ProviderId(p.to_string()), r.to_string())))
+                .collect();
+            let my_region = self.local_peer_id
+                .as_ref()
+                .and_then(|pid| scorer.get_region(pid))
+                .map(|s| s.to_string());
+            (regions, my_region)
+        } else {
+            (std::collections::HashMap::new(), None)
+        };
+
+        let mut pool = ConnectionPool::with_geo_preference(requester, provider_ids, FetchConfig::default(), provider_regions, local_region);
 
         let segment_indices: Vec<u32> = (0..manifest.segment_count() as u32).collect();
         let pieces_by_segment = pool.fetch_segments(content_id, manifest, &segment_indices).await
