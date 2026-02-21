@@ -135,6 +135,7 @@ impl TestNode {
                 .map_err(|e| format!("Failed to parse listen address: {}", e))?],
             bootstrap_peers: vec![], // Will be handled via daemon_config.boot_peers
             protocol_prefix: "craftobj".to_string(),
+            secondary_protocol_prefix: None,
             enable_mdns: false,
         };
         
@@ -160,6 +161,9 @@ impl TestNode {
                         network_config,
                         daemon_ws_port,
                         daemon_config,
+                        None,
+                        None,
+                        None,
                         None,
                     ).await.map_err(|e| e.to_string())
                 } => {
@@ -251,7 +255,7 @@ impl TestNode {
         self.rpc("list", None).await
     }
     
-    /// Get list of connected peers (from peer_scorer / gossipsub)
+    /// Get list of connected peers (from peer_scorer — scored via direct P2P interactions)
     #[allow(dead_code)]
     async fn peers(&self) -> Result<Vec<Value>, String> {
         let response = self.rpc("peers", None).await?;
@@ -1590,7 +1594,8 @@ async fn test_degradation() -> Result<(), String> {
         // Phase 1: Artificially over-replicate B via extend().
         // extend() generates 1 piece per call, so call multiple times.
         info!("Phase 1: Over-replicating B via extend()...");
-        for i in 0..10 {
+        // For k=4, target_piece_count is 24 (4 * (2.0 + 16/4)). We need to exceed 24.
+        for i in 0..25 {
             match node_b.extend(&cid, None).await {
                 Ok(r) => info!("Extend #{}: {}", i + 1, r),
                 Err(e) => info!("Extend #{} failed: {}", i + 1, e),
@@ -1602,10 +1607,10 @@ async fn test_degradation() -> Result<(), String> {
             .and_then(|h| h["segments"].as_array().map(|segs| 
                 segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum()))
             .unwrap_or(0);
-        info!("B pieces after extend: {} (target=6)", pieces_after_extend);
+        info!("B pieces after extend: {} (target=24)", pieces_after_extend);
         
-        if pieces_after_extend <= 6 {
-            return Err(format!("Extend did not push above target(6): got {} pieces", pieces_after_extend));
+        if pieces_after_extend <= 24 {
+            return Err(format!("Extend did not push above target(24): got {} pieces", pieces_after_extend));
         }
         
         let peak_pieces = pieces_after_extend;
@@ -1710,7 +1715,8 @@ async fn test_degradation_skipped_with_demand() -> Result<(), String> {
 
         // Over-replicate B via extend() (1 piece per call)
         info!("Over-replicating B via extend()...");
-        for i in 0..10 {
+        // For k=4, target_piece_count is 24. Exceed 24 to trigger HealthScan degradation logic.
+        for i in 0..25 {
             match node_b.extend(&cid, None).await {
                 Ok(r) => info!("Extend #{}: {}", i + 1, r),
                 Err(e) => info!("Extend #{} failed: {}", i + 1, e),
@@ -1722,10 +1728,10 @@ async fn test_degradation_skipped_with_demand() -> Result<(), String> {
             .and_then(|h| h["segments"].as_array().map(|segs|
                 segs.iter().map(|s| s["local_pieces"].as_u64().unwrap_or(0) as usize).sum()))
             .unwrap_or(0);
-        info!("B pieces after extend: {} (target=6)", pieces_after_extend);
+        info!("B pieces after extend: {} (target=24)", pieces_after_extend);
 
-        if pieces_after_extend <= 6 {
-            return Err(format!("Extend did not push above target(6): got {} pieces", pieces_after_extend));
+        if pieces_after_extend <= 24 {
+            return Err(format!("Extend did not push above target(24): got {} pieces", pieces_after_extend));
         }
         let peak_pieces = pieces_after_extend;
 

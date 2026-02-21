@@ -41,6 +41,7 @@ async fn simulate_piece_sync(
     };
 
     // "Server" handles the request locally — no actual network needed for e2e test
+    let manifest = store.get_record(content_id).unwrap();
     let piece_ids = store.list_pieces(content_id, segment_index).unwrap_or_default();
     let have_set: std::collections::HashSet<[u8; 32]> = have_pieces.into_iter().collect();
     let mut pieces = Vec::new();
@@ -54,9 +55,14 @@ async fn simulate_piece_sync(
         if let Ok((data, coefficients)) = store.get_piece(content_id, segment_index, &pid) {
             pieces.push(PiecePayload {
                 segment_index,
+                segment_count: manifest.segment_count() as u32,
+                total_size: manifest.total_size,
+                k: manifest.k_for_segment(segment_index as usize) as u32,
+                vtags_cid: None,
                 piece_id: pid,
                 coefficients,
                 data,
+                vtag_blob: None,
             });
         }
     }

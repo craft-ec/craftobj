@@ -1281,6 +1281,7 @@ dependencies = [
 name = "craftobj-store"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "craftec-erasure",
  "craftobj-core",
  "hex",
